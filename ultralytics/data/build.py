@@ -186,7 +186,7 @@ def check_source(source):
 
 
 
-def load_inference_source(source=None, batch=1, vid_stride=1, buffer=False,use_simotm="SimOTMBBS",imgsz=640,pairs_rgb_ir= ['visible', 'infrared']):
+def load_inference_source(source=None, batch=1, vid_stride=1, buffer=False,use_simotm="SimOTMBBS",imgsz=640,pairs_rgb_ir= ['visible', 'infrared'], depth_shift_x=-22, depth_shift_y=0):
     """
     Loads an inference source for object detection and applies necessary transformations.
 
@@ -214,7 +214,7 @@ def load_inference_source(source=None, batch=1, vid_stride=1, buffer=False,use_s
     elif from_img:
         dataset = LoadPilAndNumpy(source)
     else:
-        dataset = LoadImagesAndVideos(source, batch=batch, vid_stride=vid_stride,use_simotm=use_simotm,imgsz=imgsz,pairs_rgb_ir=pairs_rgb_ir)
+        dataset = LoadImagesAndVideos(source, batch=batch, vid_stride=vid_stride,use_simotm=use_simotm,imgsz=imgsz,pairs_rgb_ir=pairs_rgb_ir, depth_shift_x=depth_shift_x, depth_shift_y=depth_shift_y)
 
     # Attach source types to the dataset
     setattr(dataset, "source_type", source_type)

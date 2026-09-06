@@ -74,6 +74,33 @@ def transfer_layers(src_state, dst_state, src_indices, dst_indices, transferred=
     return total
 
 
+def transfer_tail_semantic(src_model, dst_model, src_state, dst_state, transferred=None):
+    """按模块类型语义对齐迁移尾部(head)：SPPF→Detect。
+
+    不依赖"层数相同"的隐式假设：先提取两边从 SPPF 到末尾的模块类型序列并逐位
+    比较，类型完全一致才逐层迁移；若结构不同构，则拒绝迁移尾部并打印差异，
+    避免权重被错误放进语义不对应的层(静默错位)。
+    """
+    src_sppf = find_sppf_index(src_model)
+    dst_sppf = find_sppf_index(dst_model)
+    src_tail = list(range(src_sppf, len(src_model.model)))
+    dst_tail = list(range(dst_sppf, len(dst_model.model)))
+    src_types = [getattr(m, "type", "") for m in src_model.model[src_sppf:]]
+    dst_types = [getattr(m, "type", "") for m in dst_model.model[dst_sppf:]]
+
+    if src_types != dst_types:
+        print("[错误] 尾部(head)结构不同构，已拒绝迁移尾部，避免权重语义错位：")
+        print(f"  官方({len(src_tail)} 层): {src_types}")
+        print(f"  RGBTD({len(dst_tail)} 层): {dst_types}")
+        print("  请检查 RGBTD 的 head 是否与官方 YOLO11 逐层同构后再迁移。")
+        return 0
+
+    total = 0
+    for si, di in zip(src_tail, dst_tail):
+        total += transfer_layer(src_state, dst_state, si, di, transferred)
+    return total
+
+
 def main():
     parser = argparse.ArgumentParser(description="迁移 COCO 预训练权重到 RGBTD 三模态模型")
     parser.add_argument("--src", default="yolo11x.pt", help="官方 COCO 预训练权重路径")
@@ -86,19 +113,14 @@ def main():
     ckpt = torch.load(args.src, map_location="cpu")
     src_model = (ckpt.get("ema") or ckpt["model"]).float()
     src_state = src_model.state_dict()
-    src_n_layers = len(src_model.model)
 
     # 2) 构建三模态模型
     dst_model = YOLO(args.dst).model
     dst_state = dst_model.state_dict()
-    dst_n_layers = len(dst_model.model)
 
-    # 3) 定位三条分支与尾部(head)对齐起点
+    # 3) 定位三条分支
     branches = find_branch_layers(dst_model)
     assert len(branches) == 3, f"预期 3 条分支，实际 {len(branches)} 条"
-
-    src_sppf = find_sppf_index(src_model)
-    dst_sppf = find_sppf_index(dst_model)
 
     # 4) 迁移 backbone：官方 model.0~8 -> 三条分支
     transferred = set()  # 记录已成功迁移的 dst key，用于报告"保持随机初始化的层"
@@ -108,14 +130,8 @@ def main():
     # 深度分支复用红外分支迁移后的权重（性质最接近）
     n_dp = transfer_layers(dst_state, dst_state, branches[1], branches[2], transferred)
 
-    # 5) 迁移尾部(head)：官方 SPPF 起逐层对齐到末尾（含 SPPF/C2PSA/head/Detect 回归）
-    src_tail = list(range(src_sppf, src_n_layers))
-    dst_tail = list(range(dst_sppf, dst_n_layers))
-    # 防御性校验：若尾部层数不一致，zip 会静默截断导致语义错位，必须显式告警
-    if len(src_tail) != len(dst_tail):
-        print(f"[警告] 尾部(head)层数不一致：官方 {len(src_tail)} 层 vs RGBTD {len(dst_tail)} 层，"
-              f"zip 将静默截断，请检查 RGBTD 的 head 是否与官方 YOLO11 同构！")
-    n_tail = transfer_layers(src_state, dst_state, src_tail, dst_tail, transferred)
+    # 5) 迁移尾部(head)：按模块类型语义对齐 SPPF→Detect，避免连续层号错位
+    n_tail = transfer_tail_semantic(src_model, dst_model, src_state, dst_state, transferred)
 
     # 6) 写回并保存
     dst_model.load_state_dict(dst_state, strict=False)

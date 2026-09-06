@@ -256,6 +256,8 @@ class BasePredictor:
             use_simotm=self.args.use_simotm,
             imgsz=self.args.imgsz,
             pairs_rgb_ir=self.args.pairs_rgb_ir,
+            depth_shift_x=getattr(self.args, "depth_shift_x", -22),
+            depth_shift_y=getattr(self.args, "depth_shift_y", 0),
         )
         self.source_type = self.dataset.source_type
         if not getattr(self, "stream", True) and (
