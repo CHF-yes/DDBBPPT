@@ -38,6 +38,16 @@ pip install -r requirements.txt   # torch 建议按 CUDA 版本单独装（requi
 | `use_simotm` | `"RGBTD"` | 新增的输入模态类型：可见光 + 红外 + 深度三模态 |
 | `channels` | `9` | 输入通道数 = BGR(3) + IR(3) + Depth(3) |
 | `pairs_rgb_ir` | `["visible", "infrared", "depth"]` | 三个**同级目录名**（原为二目录，现扩展支持三目录），加载时按字符串替换自动定位三模态文件 |
+| `depth_shift_x` | `-22` | 深度图相对 RGB 的系统性水平偏移修正（<0 左移，实测约 −22px@1920×1080），训练/验证都做 |
+| `depth_shift_y` | `0` | 深度图垂直偏移修正 |
+| `rgb_drop_prob` | `0.2` | RGB 整图随机失效概率（仅训练），防网络只依赖 RGB、提升鲁棒性 |
+| `rgb_drop_mode` | `"zero"` | RGB 失效模式：`zero` 全黑 / `gray` 灰度保结构 / `noise` 压暗+噪声 |
+| `ir_gain` | `0.15` | 红外灰度增益抖动幅度（乘性，仅训练） |
+| `ir_bias` | `5.0` | 红外灰度偏置抖动幅度（加性，0~255，仅训练） |
+| `depth_noise` | `0.02` | 深度有效区乘性噪声比例（模拟测距抖动，仅训练） |
+| `depth_jitter_x` | `[-25, 5]` | 深度水平随机平移区间（模拟对齐残差，仅训练） |
+| `depth_jitter_y` | `[-5, 5]` | 深度垂直随机平移区间（仅训练） |
+| `depth_jitter_prob` | `1.0` | 深度随机平移触发概率（仅训练） |
 
 ### 2.2 模型结构（新增 YAML）
 
@@ -61,6 +71,22 @@ pip install -r requirements.txt   # torch 建议按 CUDA 版本单独装（requi
 - 无效深度值（0 或过小）置 0；
 - 深度单通道 replicate 成 3 通道；红外单通道文件也兼容转 3 通道；
 - **兼容混入的 8bit 3 通道深度可视化图**（样例中 `depth/00000008.jpg`），自动转单通道灰度后再归一化，避免崩溃。
+
+### 2.5 三模态对齐修正与一致性增强（新增）
+
+为最大化**准确度 / 泛化 / 鲁棒性**，本次在数据层新增了三项关键处理（策略借鉴同赛题另一实现 `feature/multimodal-detection-framework` 的一致性口径）：
+
+1. **深度对齐修正（配准，训练/验证都做）**：三模态虽已空间对齐，但深度相对 RGB 存在**系统性偏移**（实测约右偏 22px@1920×1080）。加载时用最近邻平移 `depth_shift_x=-22` 修正，标签不跟随（标签锚定 RGB 坐标系）。这是数据级硬伤，不修则深度分支学到错位特征。
+
+2. **深度最近邻插值（防伪值）**：深度图 resize 用 `INTER_NEAREST` 而非线性插值，避免在"0=无效"与"有效深度"边界处引入插值伪值。
+
+3. **三模态鲁棒性增强（仅训练期）**：
+   - **RGB 随机失效**（`rgb_drop_prob`）：以一定概率让 RGB 整图全黑/灰度/噪声，迫使网络学会在 RGB 不可用时依赖 IR/Depth；
+   - **红外增益/偏置抖动**（`ir_gain`/`ir_bias`）：模拟传感器响应差异；
+   - **深度值噪声 + 随机平移**（`depth_noise`/`depth_jitter_*`）：模拟测距抖动与未对齐残差。
+   - 几何操作（flip / mosaic / letterbox）由 ultralytics 内建 pipeline 在 9 通道拼接后统一执行，**三模态天然几何同步**。
+
+4. **9 通道 HSV 增强 `RandomHSV9C`**（`ultralytics/data/augment.py`）：前 3 通道 BGR 做 HSV 抖动，后 6 通道（IR+Depth）只做亮度抖动，既不报错也不伪造温度/深度语义。
 
 ---
 
@@ -124,6 +150,33 @@ names: ["person", "boat", "animal", "seat", "sign", "bicycle",
 ```
 
 > **赛题仅提供 train / test，无独立 val**。本地调参请从 train 切分出一部分作为 val（如 `visible/val`），否则验证指标虚高、无法反映真实泛化。
+
+### 3.3 数据工程脚本（新增：自动配对 + 分层切分）
+
+新增两个自包含脚本，放在项目根目录，用于赛题数据（2000 组、默认不分 train/val）的落地准备：
+
+**① 布局探测 + 生成 data.yaml**（`scan_data.py`）
+
+```bash
+python scan_data.py --root /path/to/dataset --out data.yaml
+```
+
+- 自动探测 `visible/ infrared/ depth/ labels/` 四个同级目录（支持别名 rgb/ir/d 等）；
+- 按 base name 自动配对三模态 + 标签，打印缺失统计（缺红外/深度、缺标签的样本数）；
+- 兼容 `train/val/test` 分组布局（`--split-dirs train,val` 指定）。
+
+**② 类别近似分层切分**（`split_data.py`）
+
+```bash
+python split_data.py --root /path/to/dataset --ratios 0.8,0.1,0.1 --seed 42 --out splits
+```
+
+- 把样本按 `8:1:1`（可调）切分为 train/val/test，**按类别近似分层**（稀有类优先落桶，避免某类全落进 test）；
+- `--seed` 可复现（同数据 + 同种子 = 同划分）；`--no-stratify` 退化为纯随机；
+- 只写 `train.txt/val.txt/test.txt` 图片清单 + `data.yaml`，**不移动/复制原文件**，原始数据保持只读；
+- 生成的 `data.yaml` 的 `train/val` 指向同名 txt 清单（每行一个可见光图绝对路径），加载器会自动按目录名替换定位红外/深度。
+
+> 建议流程：`scan_data.py` 确认布局可识别 → `split_data.py` 切分 → 把生成的 `data.yaml` 路径填进 `train_RGBTD.py` 的 `data=`。
 
 ---
 
@@ -228,8 +281,10 @@ results = model.predict(
 
 | 文件 | 改动 |
 |---|---|
-| `ultralytics/data/base.py` | 新增 `RGBTD` 加载分支、三目录支持、深度归一化、9 通道合并 |
+| `ultralytics/data/base.py` | 新增 `RGBTD` 加载分支、三目录支持、深度归一化、9 通道合并、深度对齐修正、三模态鲁棒性增强 |
+| `ultralytics/data/augment.py` | 新增 `RandomHSV9C`（9 通道 HSV 增强）+ `v8_transforms` 挂接 |
 | `ultralytics/data/loaders.py` | 推理加载新增 `RGBTD` 分支、三目录支持 |
+| `ultralytics/cfg/default.yaml` | 新增 `depth_shift_*` / `rgb_drop_*` / `ir_*` / `depth_*` 对齐与增强参数 |
 | `ultralytics/nn/modules/conv.py` | 新增 `ModalConcat` 三路融合模块 |
 | `ultralytics/nn/modules/__init__.py` | 导出 `ModalConcat` |
 | `ultralytics/nn/tasks.py` | 导入并注册 `ModalConcat`（parse_model） |
@@ -237,7 +292,8 @@ results = model.predict(
 | `ultralytics/cfg/models/11-RGBT/yolo11-RGBTD-midfusion.yaml` | 新增三模态模型结构 |
 | `ultralytics/cfg/datasets/coco8-rgbtd.yaml` | 新增数据集格式示例 |
 | `transfer_pretrained.py` | 新增预训练权重迁移脚本 |
-| `train_RGBTD.py` / `val_RGBTD.py` | 新增训练 / 测试脚本 |
+| `train_RGBTD.py` / `val_RGBTD.py` | 新增训练 / 测试脚本（含对齐与增强参数） |
+| `scan_data.py` / `split_data.py` | 新增数据布局探测 + 类别近似分层切分脚本 |
 | 本教程 | 新增使用说明 |
 
 ---
@@ -264,3 +320,15 @@ results = model.predict(
 
 **Q7：样例深度里混了一张 8bit 3 通道的 jpg 可视化图，会不会报错？**
 不会。深度预处理已兼容 3 通道输入（自动转单通道灰度后再归一化）。正式训练集的深度请统一为 16bit 单通道 PNG，效果最佳。
+
+**Q8：`depth_shift_x=-22` 这个值怎么来的？要不要改？**
+这是同赛题实现实测得到的深度相对 RGB 的系统性偏移量（1920×1080 分辨率下约右偏 22px）。如果你的数据对齐做得很好、或分辨率不同，可先用可视化工具叠加 RGB 与深度边缘确认，再调整该值；设为 0 即关闭修正。
+
+**Q9：赛题数据没有 train/val 划分，怎么准备训练？**
+用新增的 `split_data.py`：`python split_data.py --root 数据根 --ratios 0.8,0.1,0.1 --seed 42 --out splits`，会按类别近似分层切分并生成 `train.txt/val.txt/test.txt` + `data.yaml`，把该 yaml 填进 `train_RGBTD.py` 的 `data=` 即可。
+
+**Q10：为什么加了 RGB dropout、深度噪声这些增强？会不会反而降精度？**
+这是针对竞赛"泛化 + 鲁棒性"要求的定向增强：RGB dropout 防网络只依赖可见光（单模态过拟合）、红外/深度抖动模拟传感器差异、深度噪声/平移模拟测距抖动与对齐残差。在 2000 组小样本上能有效压低过拟合、提升跨场景鲁棒性。若数据质量极高、场景单一，可把 `rgb_drop_prob` 调低（如 0.1）或 `depth_jitter_prob` 设为 0。
+
+**Q11：RGBTD 训练能不能开 `cache=True`？**
+不建议。三模态鲁棒性增强（RGB dropout / 红外抖动 / 深度噪声平移）在**图像加载阶段**执行，`cache=True` 会把某一次增强结果缓存固定、丧失随机性；且 9 通道 cache 的内存/磁盘占用约为 RGB 的 3 倍，本身不划算。`train_RGBTD.py` 默认 `cache=False`，请保持。

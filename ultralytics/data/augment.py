@@ -3700,6 +3700,48 @@ class RandomHSV6C:
         return labels
 
 
+class RandomHSV9C:
+    """9 通道三模态(RGB+IR+Depth) HSV 增强。
+
+    前 3 通道(BGR)做 HSV 抖动，后 6 通道(IR 3ch + Depth 3ch)做亮度抖动，
+    避免直接对 9 通道图做 cvtColor 报错，同时不伪造红外温度/深度语义。
+    """
+
+    def __init__(self, hgain=0.5, sgain=0.5, vgain=0.5) -> None:
+        self.hgain = hgain
+        self.sgain = sgain
+        self.vgain = vgain
+
+    def __call__(self, labels):
+        """Applies image HSV augmentation on 9-channel RGBTD image."""
+        img = labels['img']
+        bgr = img[:, :, :3]   # 可见光 BGR
+        aux = img[:, :, 3:]   # IR(3) + Depth(3)
+        if self.hgain or self.sgain or self.vgain:
+            # 前 3 通道：HSV 抖动
+            r = np.random.uniform(-1, 1, 3) * [self.hgain, self.sgain, self.vgain] + 1
+            hue, sat, val = cv2.split(cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV))
+            dtype = bgr.dtype  # uint8
+
+            x = np.arange(0, 256, dtype=r.dtype)
+            lut_hue = ((x * r[0]) % 180).astype(dtype)
+            lut_sat = np.clip(x * r[1], 0, 255).astype(dtype)
+            lut_val = np.clip(x * r[2], 0, 255).astype(dtype)
+
+            im_hsv = cv2.merge((cv2.LUT(hue, lut_hue), cv2.LUT(sat, lut_sat), cv2.LUT(val, lut_val)))
+            bgr = cv2.cvtColor(im_hsv, cv2.COLOR_HSV2BGR)
+
+            # 后 6 通道：亮度抖动(乘性 gain，不改色)
+            r2 = np.random.uniform(-1, 1) * self.vgain + 1
+            lut2 = np.clip(np.arange(0, 256, dtype=dtype) * r2, 0, 255).astype(dtype)
+            aux = lut2[aux]  # numpy 索引做 LUT，规避 cv2.LUT 对多通道的限制
+
+            img[:, :, :3] = bgr
+            img[:, :, 3:] = aux
+            labels['img'] = img
+        return labels
+
+
 class Albumentations4C:
     """Albumentations transformations. Optional, uninstall package to disable.
     Applies Blur, Median Blur, convert to grayscale, Contrast Limited Adaptive Histogram Equalization,
@@ -3782,6 +3824,9 @@ def v8_transforms(dataset, imgsz, hyp,stretch=False):
     if  hyp.channels == 6:
         alb=Albumentations4C(p=1.0)
         random_hsv = RandomHSV6C(hgain=hyp.hsv_h, sgain=hyp.hsv_s, vgain=hyp.hsv_v)
+    if  hyp.channels == 9:
+        alb=Albumentations4C(p=1.0)
+        random_hsv = RandomHSV9C(hgain=hyp.hsv_h, sgain=hyp.hsv_s, vgain=hyp.hsv_v)
     return Compose([
         pre_transform,
         MixUp(dataset, pre_transform=pre_transform, p=hyp.mixup, dtype=dtype),

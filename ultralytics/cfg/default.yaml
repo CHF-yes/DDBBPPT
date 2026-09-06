@@ -132,3 +132,14 @@ channels: 1 # (int) channels of model
 use_simotm: SimOTMBBS # (str) Pretreatment method
 brightness: 0.2 # (float) image brightness (probability)
 pairs_rgb_ir: ['visible','infrared']
+# ---- RGBTD 三模态(RGB+红外+深度) 对齐与增强参数 ----
+depth_shift_x: -22 # (int) depth 相对 RGB 的对齐平移(<0 内容左移, 实测约 -22px@1920x1080)
+depth_shift_y: 0 # (int) depth 垂直对齐平移
+rgb_drop_prob: 0.2 # (float) RGB 整图随机失效概率(仅训练, 防网络只依赖 RGB)
+rgb_drop_mode: zero # (str) RGB 失效模式: zero|gray|noise
+ir_gain: 0.15 # (float) 红外增益抖动幅度(乘性, 仅训练)
+ir_bias: 5.0 # (float) 红外偏置抖动幅度(加性, 0~255, 仅训练)
+depth_noise: 0.02 # (float) 深度有效区乘性噪声比例(仅训练)
+depth_jitter_x: [-25, 5] # (list) 深度水平随机平移区间(模拟对齐残差, 仅训练)
+depth_jitter_y: [-5, 5] # (list) 深度垂直随机平移区间(仅训练)
+depth_jitter_prob: 1.0 # (float) 深度随机平移触发概率(仅训练)

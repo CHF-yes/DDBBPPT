@@ -94,6 +94,19 @@ class BaseDataset(Dataset):
                 all(isinstance(x, str) for x in self.pairs_rgb_ir)):
             self.pairs_rgb_ir = ['visible', 'infrared', 'depth']
 
+        # ---- RGBTD 三模态对齐与增强参数(从 hyp/args 读取, 带默认值兜底) ----
+        # RGBTD modality alignment & augmentation params (read from hyp/args with defaults)
+        self.depth_shift_x = int(getattr(hyp, "depth_shift_x", -22))
+        self.depth_shift_y = int(getattr(hyp, "depth_shift_y", 0))
+        self.rgb_drop_prob = float(getattr(hyp, "rgb_drop_prob", 0.2))
+        self.rgb_drop_mode = str(getattr(hyp, "rgb_drop_mode", "zero"))
+        self.ir_gain = float(getattr(hyp, "ir_gain", 0.15))
+        self.ir_bias = float(getattr(hyp, "ir_bias", 5.0))
+        self.depth_noise = float(getattr(hyp, "depth_noise", 0.02))
+        self.depth_jitter_x = tuple(int(v) for v in getattr(hyp, "depth_jitter_x", (-25, 5)))
+        self.depth_jitter_y = tuple(int(v) for v in getattr(hyp, "depth_jitter_y", (-5, 5)))
+        self.depth_jitter_prob = float(getattr(hyp, "depth_jitter_prob", 1.0))
+
         # Buffer thread for mosaic images
         self.buffer = []  # buffer size = batch size
         self.max_buffer_length = min((self.ni, self.batch_size * 8, 1000)) if self.augment else 0
@@ -232,6 +245,13 @@ class BaseDataset(Dataset):
             elif im_infrared.ndim == 3 and im_infrared.shape[2] == 4:
                 im_infrared = im_infrared[:, :, :3]
 
+            # 深度对齐修正(配准, 训练/验证都做): depth 相对 RGB 系统性偏移的固定平移
+            im_depth = self._align_depth(im_depth)
+
+            # 训练期三模态一致性增强(仅 self.augment): RGB dropout/HSV, IR 抖动, Depth 噪声+随机平移
+            if self.augment:
+                im_visible, im_infrared, im_depth = self._rgbtd_augment(im_visible, im_infrared, im_depth)
+
             # 深度：16bit → 归一化 → 8bit 单通道 → 复制成 3 通道
             im_depth = self._preprocess_depth(im_depth)
             im_depth = cv2.cvtColor(im_depth, cv2.COLOR_GRAY2BGR)
@@ -298,14 +318,21 @@ class BaseDataset(Dataset):
         return im_depth.astype(np.uint8)
 
     def _resize_images_3(self, im_visible, im_infrared, im_depth):
-        """对齐三模态图像尺寸（长边缩放到 imgsz）。"""
+        """对齐三模态图像尺寸（长边缩放到 imgsz）。
+
+        深度图用 INTER_NEAREST(最近邻)缩放，防止在"0=无效"与"有效深度"边界处
+        因线性插值引入伪深度值；可见光/红外保持原插值策略。
+        """
         h_ref, w_ref = im_visible.shape[:2]
         out = []
-        for im in (im_visible, im_infrared, im_depth):
+        for idx, im in enumerate((im_visible, im_infrared, im_depth)):
             h, w = im.shape[:2]
             if h != h_ref or w != w_ref:
                 r = self.imgsz / max(h, w)
-                interp = cv2.INTER_LINEAR if (self.augment or r > 1) else cv2.INTER_AREA
+                if idx == 2:  # depth 通道用最近邻，避免边界伪值
+                    interp = cv2.INTER_NEAREST
+                else:
+                    interp = cv2.INTER_LINEAR if (self.augment or r > 1) else cv2.INTER_AREA
                 im = cv2.resize(im, (min(math.ceil(w * r), self.imgsz), min(math.ceil(h * r), self.imgsz)),
                                 interpolation=interp)
             out.append(im)
@@ -318,6 +345,88 @@ class BaseDataset(Dataset):
         db, dg, dr = cv2.split(im_depth)
         im = cv2.merge((b, g, r, ib, ig, ir, db, dg, dr))
         return im
+
+    # ------------------------------------------------------------------
+    # RGBTD 三模态对齐与增强（借鉴 feature/multimodal-detection-framework 一致性策略）
+    # ------------------------------------------------------------------
+
+    def _align_depth(self, im_depth):
+        """深度图固定平移对齐(配准, 训练/验证都做)。
+
+        depth 相对 RGB 存在系统性偏移(实测约右偏 22px@1920x1080)，用最近邻 + 填 0(无效)
+        平移修正；标签框不跟随(标签锚定 RGB 坐标系，谁偏谁修)。
+        """
+        if self.depth_shift_x == 0 and self.depth_shift_y == 0:
+            return im_depth
+        h, w = im_depth.shape[:2]
+        M = np.float32([[1, 0, float(self.depth_shift_x)], [0, 1, float(self.depth_shift_y)]])
+        return cv2.warpAffine(im_depth, M, (w, h), flags=cv2.INTER_NEAREST,
+                              borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+    def _rgbtd_augment(self, im_visible, im_infrared, im_depth):
+        """训练期三模态一致性增强(仅 self.augment 时调用)。
+
+        只做"模态级"增强，几何操作(flip/letterbox/mosaic)交给 ultralytics 内建 pipeline
+        在 9 通道拼接后统一执行(几何天然同步)。HSV 由内建 RandomHSV9C 处理。
+        - RGB: 随机整图失效(dropout)，防网络只依赖 RGB
+        - IR : 灰度增益/偏置抖动(模拟传感器差异)
+        - Depth: 有效区乘性噪声(16bit 域) + 随机平移(模拟对齐残差)
+        """
+        # (1) RGB 随机失效(防主导模态垄断；仅训练)
+        if self.rgb_drop_prob > 0 and random.random() < self.rgb_drop_prob:
+            im_visible = self._rgb_dropout(im_visible, self.rgb_drop_mode)
+        # (2) IR 增益/偏置抖动
+        im_infrared = self._ir_gain_jitter(im_infrared)
+        # (3) Depth 有效区乘性噪声(16bit 域，无效区 0 保持)
+        im_depth = self._depth_value_noise(im_depth)
+        # (4) Depth 随机平移(模拟对齐残差，标签不跟随)
+        im_depth = self._depth_random_jitter(im_depth)
+        return im_visible, im_infrared, im_depth
+
+    def _rgb_dropout(self, rgb, mode):
+        """RGB 整图失效。mode: zero(全黑)/gray(灰度保结构)/noise(压暗+噪声)。"""
+        if mode == "gray":
+            g = cv2.cvtColor(rgb, cv2.COLOR_BGR2GRAY)
+            return np.stack([g, g, g], axis=-1)
+        if mode == "noise":
+            out = rgb.astype(np.float32) * random.uniform(0.2, 0.6)
+            noise = np.asarray([random.gauss(0.0, 15.0) for _ in range(3)], dtype=np.float32)
+            out = out + noise[None, None, :]
+            return np.clip(out, 0, 255).astype(np.uint8)
+        return np.zeros_like(rgb)  # zero（默认）
+
+    def _ir_gain_jitter(self, ir):
+        """红外灰度增益(乘性) + 偏置(加性)抖动，模拟传感器响应差异。"""
+        if self.ir_gain <= 0 and self.ir_bias <= 0:
+            return ir
+        g = 1.0 + random.uniform(-self.ir_gain, self.ir_gain)
+        b = random.uniform(-self.ir_bias, self.ir_bias)
+        return np.clip(ir.astype(np.float32) * g + b, 0, 255).astype(np.uint8)
+
+    def _depth_value_noise(self, depth):
+        """深度有效区(>1)乘性噪声，模拟测距抖动；无效区(0)保持原样。"""
+        if self.depth_noise <= 0:
+            return depth
+        d = depth.astype(np.float32)
+        valid = d > 1
+        if not bool(valid.any()):
+            return depth
+        scale = 1.0 + random.uniform(-self.depth_noise, self.depth_noise)
+        d[valid] = d[valid] * scale
+        return d.astype(depth.dtype)
+
+    def _depth_random_jitter(self, depth):
+        """深度随机平移(模拟未对齐残差)，仅训练；最近邻 + 填 0。"""
+        if random.random() >= self.depth_jitter_prob:
+            return depth
+        sx = random.randint(self.depth_jitter_x[0], self.depth_jitter_x[1])
+        sy = random.randint(self.depth_jitter_y[0], self.depth_jitter_y[1])
+        if sx == 0 and sy == 0:
+            return depth
+        h, w = depth.shape[:2]
+        M = np.float32([[1, 0, float(sx)], [0, 1, float(sy)]])
+        return cv2.warpAffine(depth, M, (w, h), flags=cv2.INTER_NEAREST,
+                              borderMode=cv2.BORDER_CONSTANT, borderValue=0)
 
     def load_image(self, i, rect_mode=True):
         """Loads 1 image from dataset index 'i', returns (im, resized hw)."""

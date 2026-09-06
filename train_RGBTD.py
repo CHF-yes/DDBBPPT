@@ -33,6 +33,18 @@ if __name__ == "__main__":
         use_simotm="RGBTD",
         channels=9,  # BGR(3) + IR(3) + Depth(3)
         pairs_rgb_ir=["visible", "infrared", "depth"],  # 三个同级目录名，按实际数据目录改
+        # ---- 深度对齐修正(配准, 训练/验证都做) ----
+        depth_shift_x=-22,  # depth 相对 RGB 系统性偏移(<0 左移), 实测约 -22px@1920x1080
+        depth_shift_y=0,
+        # ---- 三模态鲁棒性增强(仅训练) ----
+        rgb_drop_prob=0.2,   # RGB 整图随机失效概率, 防网络只依赖 RGB
+        rgb_drop_mode="zero",  # zero | gray | noise
+        ir_gain=0.15,        # 红外增益抖动幅度
+        ir_bias=5.0,         # 红外偏置抖动幅度
+        depth_noise=0.02,    # 深度有效区乘性噪声比例
+        depth_jitter_x=[-25, 5],  # 深度水平随机平移区间(模拟对齐残差)
+        depth_jitter_y=[-5, 5],
+        depth_jitter_prob=1.0,
         # ---- 输出 ----
         project="runs/RGBTD",
         name="RGBTD-yolo11x-midfusion",
