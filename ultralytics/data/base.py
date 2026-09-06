@@ -298,43 +298,64 @@ class BaseDataset(Dataset):
         return im
 
     def _preprocess_depth(self, im_depth):
-        """深度图预处理：16bit 毫米 → 8bit [0,255]，逐帧 min-max 归一化，无效值(0/过小)置 0。
+        """深度图预处理：16bit 毫米 → 8bit [0,255]，有效区逐帧 min-max 归一化，无效值保持 0。
 
         兼容两种深度输入：
         - 16bit 单通道 PNG（正式深度图）
         - 8bit 3 通道 JPG（深度可视化/伪彩色图，样例中混入），先转单通道灰度
+
+        归一化只对有效像素(≥1e-3)统计 min/max：无效空洞(<1e-3)不参与统计并强制保持 0，
+        避免"无效区的 0"拉低 d_min 使 min-max 退化成"除以 max"，同时防止有效/无效边界被
+        线性拉伸出伪值；最后 clip 到 [0,255] 保证无越界。
         """
         if im_depth.ndim == 3:
             # 3 通道深度可视化图 → 转单通道灰度（近似深度），避免 cvtColor(GRAY2BGR) 崩溃
             im_depth = cv2.cvtColor(im_depth, cv2.COLOR_BGR2GRAY)
         im_depth = im_depth.astype(np.float32)
-        im_depth[im_depth < 1e-3] = 0.0  # 无效深度值置 0
-        d_min = float(im_depth.min())
-        d_max = float(im_depth.max())
-        if d_max - d_min > 1e-6:
-            im_depth = (im_depth - d_min) / (d_max - d_min) * 255.0
+        mask_invalid = im_depth < 1e-3  # 无效深度空洞
+        valid = im_depth[~mask_invalid]
+        if valid.size > 0:
+            d_min = float(valid.min())
+            d_max = float(valid.max())
+            if d_max - d_min > 1e-6:
+                im_depth = (im_depth - d_min) / (d_max - d_min) * 255.0
+            else:
+                im_depth = np.zeros_like(im_depth)
         else:
             im_depth = np.zeros_like(im_depth)
-        return im_depth.astype(np.uint8)
+        im_depth[mask_invalid] = 0.0  # 无效区保持 0
+        return np.clip(im_depth, 0, 255).astype(np.uint8)
 
     def _resize_images_3(self, im_visible, im_infrared, im_depth):
-        """对齐三模态图像尺寸（长边缩放到 imgsz）。
+        """对齐三模态图像尺寸，确保三者最终 (H, W) 完全一致（以可见光目标尺寸为基准）。
 
+        三路各自原始尺寸/宽高比可能不同，若各自按自己的长边独立缩放，缩放后尺寸仍可能
+        不一致，导致后续 cv2.merge 报错。这里统一以可见光缩放后的尺寸为准，把红外/深度
+        强制 resize 到同一 (W, H)。
         深度图用 INTER_NEAREST(最近邻)缩放，防止在"0=无效"与"有效深度"边界处
         因线性插值引入伪深度值；可见光/红外保持原插值策略。
         """
         h_ref, w_ref = im_visible.shape[:2]
+
+        def _target_size(h, w):
+            """按长边缩放到 imgsz，返回 (W, H)；与官方 letterbox 前置逻辑一致。"""
+            r = self.imgsz / max(h, w)
+            if r == 1:
+                return w, h
+            return min(math.ceil(w * r), self.imgsz), min(math.ceil(h * r), self.imgsz)
+
+        w_t, h_t = _target_size(h_ref, w_ref)  # 以可见光目标尺寸为基准
+
         out = []
         for idx, im in enumerate((im_visible, im_infrared, im_depth)):
             h, w = im.shape[:2]
-            if h != h_ref or w != w_ref:
+            if idx == 2:  # depth 通道用最近邻，避免边界伪值
+                interp = cv2.INTER_NEAREST
+            else:
                 r = self.imgsz / max(h, w)
-                if idx == 2:  # depth 通道用最近邻，避免边界伪值
-                    interp = cv2.INTER_NEAREST
-                else:
-                    interp = cv2.INTER_LINEAR if (self.augment or r > 1) else cv2.INTER_AREA
-                im = cv2.resize(im, (min(math.ceil(w * r), self.imgsz), min(math.ceil(h * r), self.imgsz)),
-                                interpolation=interp)
+                interp = cv2.INTER_LINEAR if (self.augment or r > 1) else cv2.INTER_AREA
+            if (w, h) != (w_t, h_t):
+                im = cv2.resize(im, (w_t, h_t), interpolation=interp)
             out.append(im)
         return out[0], out[1], out[2]
 

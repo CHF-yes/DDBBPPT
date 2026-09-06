@@ -17,6 +17,8 @@ if __name__ == "__main__":
     model = YOLO("yolo11x-RGBTD-pretrained.pt")  # 由 transfer_pretrained.py 生成
 
     # 方式二（不推荐）：从零训练
+    # 注：yolo11x-RGBTD-midfusion.yaml 是 scale 命名约定(非真实文件)，会自动解析到
+    #     yolo11-RGBTD-midfusion.yaml 并应用 scale='x'；不要写成 yolo11-RGBTD-midfusion.yaml(会退化到 'n')
     # model = YOLO("ultralytics/cfg/models/11-RGBT/yolo11x-RGBTD-midfusion.yaml")
 
     model.train(

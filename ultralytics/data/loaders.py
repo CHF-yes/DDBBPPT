@@ -320,12 +320,14 @@ class LoadImagesAndVideos:
         - Can read from a text file containing paths to images and videos.
     """
 
-    def __init__(self, path, batch=1, vid_stride=1,use_simotm="SimOTMBBS",imgsz=640,pairs_rgb_ir= ['visible', 'infrared']):
+    def __init__(self, path, batch=1, vid_stride=1,use_simotm="SimOTMBBS",imgsz=640,pairs_rgb_ir= ['visible', 'infrared'], depth_shift_x=-22, depth_shift_y=0):
         """Initialize dataloader for images and videos, supporting various input formats."""
         parent = None
         self.use_simotm = use_simotm
         self.imgsz=imgsz
         self.pairs_rgb_ir = pairs_rgb_ir
+        self.depth_shift_x = depth_shift_x
+        self.depth_shift_y = depth_shift_y
         # 支持二目录(RGBT/RGBRGB6C)或三目录(RGBTD)；长度非法则重置为默认三目录
         if not (isinstance(self.pairs_rgb_ir, list) and
                 len(self.pairs_rgb_ir) in (2, 3) and
@@ -616,25 +618,44 @@ class LoadImagesAndVideos:
                     elif im_infrared.ndim == 3 and im_infrared.shape[2] == 4:
                         im_infrared = im_infrared[:, :, :3]
 
+                    # 深度固定平移对齐(配准)：与训练路径 _align_depth 保持一致，保证训练/推理输入分布一致
+                    if self.depth_shift_x != 0 or self.depth_shift_y != 0:
+                        M = np.float32([[1, 0, float(self.depth_shift_x)], [0, 1, float(self.depth_shift_y)]])
+                        im_depth = cv2.warpAffine(im_depth, M, (im_depth.shape[1], im_depth.shape[0]),
+                                                  flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+                    # 深度预处理：与训练路径 _preprocess_depth 保持一致（3 通道兼容 + 有效区统计归一化 + 无效区保持 0）
+                    if im_depth.ndim == 3:
+                        im_depth = cv2.cvtColor(im_depth, cv2.COLOR_BGR2GRAY)
                     im_depth = im_depth.astype(np.float32)
-                    im_depth[im_depth < 1e-3] = 0.0
-                    d_min, d_max = float(im_depth.min()), float(im_depth.max())
-                    if d_max - d_min > 1e-6:
-                        im_depth = (im_depth - d_min) / (d_max - d_min) * 255.0
+                    mask_invalid = im_depth < 1e-3
+                    valid = im_depth[~mask_invalid]
+                    if valid.size > 0:
+                        d_min, d_max = float(valid.min()), float(valid.max())
+                        if d_max - d_min > 1e-6:
+                            im_depth = (im_depth - d_min) / (d_max - d_min) * 255.0
+                        else:
+                            im_depth = np.zeros_like(im_depth)
                     else:
                         im_depth = np.zeros_like(im_depth)
-                    im_depth = im_depth.astype(np.uint8)
+                    im_depth[mask_invalid] = 0.0
+                    im_depth = np.clip(im_depth, 0, 255).astype(np.uint8)
                     im_depth = cv2.cvtColor(im_depth, cv2.COLOR_GRAY2BGR)
 
-                    h_vis, w_vis = im_visible.shape[:2]
+                    # 三路统一尺寸：以可见光目标尺寸为基准，强制红外/深度 resize 到同一 (W, H)
+                    h_ref, w_ref = im_visible.shape[:2]
+                    r_ref = self.imgsz / max(h_ref, w_ref)
+                    if r_ref == 1:
+                        w_t, h_t = w_ref, h_ref
+                    else:
+                        w_t = min(math.ceil(w_ref * r_ref), self.imgsz)
+                        h_t = min(math.ceil(h_ref * r_ref), self.imgsz)
                     ims = [im_visible, im_infrared, im_depth]
                     for idx, im_ in enumerate(ims):
                         h_, w_ = im_.shape[:2]
-                        if h_ != h_vis or w_ != w_vis:
-                            r_ = self.imgsz / max(h_, w_)
-                            interp = cv2.INTER_LINEAR if (self.augment or r_ > 1) else cv2.INTER_AREA
-                            ims[idx] = cv2.resize(im_, (min(math.ceil(w_ * r_), self.imgsz), min(math.ceil(h_ * r_), self.imgsz)),
-                                                  interpolation=interp)
+                        if (w_, h_) != (w_t, h_t):
+                            interp = cv2.INTER_NEAREST if idx == 2 else (cv2.INTER_LINEAR if (self.augment or r_ref > 1) else cv2.INTER_AREA)
+                            ims[idx] = cv2.resize(im_, (w_t, h_t), interpolation=interp)
                     im_visible, im_infrared, im_depth = ims
 
                     b, g, r = cv2.split(im_visible)

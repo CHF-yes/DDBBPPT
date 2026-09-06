@@ -15,6 +15,10 @@
     python transfer_pretrained.py --src yolo11x.pt \
         --dst ultralytics/cfg/models/11-RGBT/yolo11x-RGBTD-midfusion.yaml \
         --out yolo11x-RGBTD-pretrained.pt
+
+说明：--dst 的 `yolo11x-RGBTD-midfusion.yaml` 是 Ultralytics 的 scale 命名约定（并非真实
+存在的文件）。Ultralytics 的 yaml_model_load 会把它归一化为 `yolo11-RGBTD-midfusion.yaml`
+并自动应用 scale='x'；若改写成 `yolo11-RGBTD-midfusion.yaml`，scale 会退化为默认 'n'。
 """
 
 import argparse
@@ -47,7 +51,7 @@ def find_sppf_index(model):
     raise RuntimeError("未找到 SPPF 层")
 
 
-def transfer_layer(src_state, dst_state, si, di):
+def transfer_layer(src_state, dst_state, si, di, transferred=None):
     """把 src 第 si 层的参数按 key 复制到 dst 第 di 层（shape 不一致自动跳过）。"""
     ps, pd = f"model.{si}.", f"model.{di}."
     n = 0
@@ -56,15 +60,17 @@ def transfer_layer(src_state, dst_state, si, di):
             sk = ps + k[len(pd):]
             if sk in src_state and src_state[sk].shape == dst_state[k].shape:
                 dst_state[k] = src_state[sk]
+                if transferred is not None:
+                    transferred.add(k)
                 n += 1
     return n
 
 
-def transfer_layers(src_state, dst_state, src_indices, dst_indices):
+def transfer_layers(src_state, dst_state, src_indices, dst_indices, transferred=None):
     """批量逐层迁移。"""
     total = 0
     for si, di in zip(src_indices, dst_indices):
-        total += transfer_layer(src_state, dst_state, si, di)
+        total += transfer_layer(src_state, dst_state, si, di, transferred)
     return total
 
 
@@ -72,7 +78,7 @@ def main():
     parser = argparse.ArgumentParser(description="迁移 COCO 预训练权重到 RGBTD 三模态模型")
     parser.add_argument("--src", default="yolo11x.pt", help="官方 COCO 预训练权重路径")
     parser.add_argument("--dst", default="ultralytics/cfg/models/11-RGBT/yolo11x-RGBTD-midfusion.yaml",
-                        help="三模态模型 YAML 路径")
+                        help="三模态模型 YAML 路径(scale 后缀命名，会自动解析到 yolo11-RGBTD-midfusion.yaml + scale x)")
     parser.add_argument("--out", default="yolo11x-RGBTD-pretrained.pt", help="输出迁移后权重路径")
     args = parser.parse_args()
 
@@ -95,19 +101,35 @@ def main():
     dst_sppf = find_sppf_index(dst_model)
 
     # 4) 迁移 backbone：官方 model.0~8 -> 三条分支
+    transferred = set()  # 记录已成功迁移的 dst key，用于报告"保持随机初始化的层"
     src_backbone = list(range(9))  # 官方 backbone 的 9 个 Conv/C3k2 层
-    n_vis = transfer_layers(src_state, dst_state, src_backbone, branches[0])
-    n_ir = transfer_layers(src_state, dst_state, src_backbone, branches[1])
+    n_vis = transfer_layers(src_state, dst_state, src_backbone, branches[0], transferred)
+    n_ir = transfer_layers(src_state, dst_state, src_backbone, branches[1], transferred)
     # 深度分支复用红外分支迁移后的权重（性质最接近）
-    n_dp = transfer_layers(dst_state, dst_state, branches[1], branches[2])
+    n_dp = transfer_layers(dst_state, dst_state, branches[1], branches[2], transferred)
 
     # 5) 迁移尾部(head)：官方 SPPF 起逐层对齐到末尾（含 SPPF/C2PSA/head/Detect 回归）
     src_tail = list(range(src_sppf, src_n_layers))
     dst_tail = list(range(dst_sppf, dst_n_layers))
-    n_tail = transfer_layers(src_state, dst_state, src_tail, dst_tail)
+    # 防御性校验：若尾部层数不一致，zip 会静默截断导致语义错位，必须显式告警
+    if len(src_tail) != len(dst_tail):
+        print(f"[警告] 尾部(head)层数不一致：官方 {len(src_tail)} 层 vs RGBTD {len(dst_tail)} 层，"
+              f"zip 将静默截断，请检查 RGBTD 的 head 是否与官方 YOLO11 同构！")
+    n_tail = transfer_layers(src_state, dst_state, src_tail, dst_tail, transferred)
 
     # 6) 写回并保存
     dst_model.load_state_dict(dst_state, strict=False)
+
+    # 6.5) 报告保持随机初始化的层（新增层/形状不匹配层，无法从官方权重迁移）
+    unmigrated = []
+    for i, m in enumerate(dst_model.model):
+        t = getattr(m, "type", "")
+        keys = [k for k in dst_state if k.startswith(f"model.{i}.")]
+        if keys and all(k not in transferred for k in keys):
+            unmigrated.append(f"{i}:{t}")
+    if unmigrated:
+        print(f"[注意] 以下层保持随机初始化(新增层或形状不匹配，无法迁移，需在训练中学习): {unmigrated}")
+
     ckpt["model"] = dst_model
     ckpt.pop("ema", None)  # 移除旧 ema，训练时会重建
     torch.save(ckpt, args.out)
