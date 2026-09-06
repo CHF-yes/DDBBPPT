@@ -70,6 +70,7 @@ class FusionScheme(Enum):
     """融合阶段标注（用于文档/说明，代码上体现在首层卷积与数据加载通道数）。"""
     NONE_EARLY = "none_early"        # 无融合（单模态）
     EARLY = "early"                  # 前期融合：通道拼接一并进网络
+    MIDFUSION = "midfusion"          # 中间融合：主干特征层（P3/P4/P5）分级融合
 
 
 # ============================================================
@@ -224,7 +225,7 @@ EXPERIMENT1 = ModelConfig(
                  "注意力融合/门控、模态 dropout 等。本次仅登记占位，不生成实例代码。"),
     in_channels=5,
     modality=Modality.RGB_IR_DEPTH,
-    fusion=FusionScheme.EARLY,          # 占位；真做中间融合时改此值并新增说明
+    fusion=FusionScheme.MIDFUSION,      # 实际为主干 P3/P4/P5 分级中间融合（见 model_builder）
     enabled=False,                      # 占位，不落地可运行实例
     hyper=HyperParams(pretrained_weights="yolo11s.pt"),
     notes=("设计稿占位。字段结构与前两者对齐，待方案确定后在 `实验模型1/README.md` 更新并落地。"),

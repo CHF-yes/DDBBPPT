@@ -91,40 +91,62 @@ def predict_rgb_ultralytics(weights: str,
 # 5 通道后端：自定义多模态前向 + txt
 # ------------------------------------------------------------
 
-def predict_multimodal_custom(model,           # 已改 5 通道、.cuda()、.eval() 的 ultralytics model
+def predict_multimodal_custom(model,           # 内部检测网络(DetectionModel/Experiment1Model)，勿传 YOLO 包装器
                               samples: Sequence[SD.Sample],
                               cfg: MC.ModelConfig,
                               out_dir: Optional[Path] = None,
                               imgsz=(1024, 1024),
-                              conf_thr: float = 0.25) -> Path:
+                              conf_thr: float = 0.25,
+                              iou_thr: float = 0.7,
+                              device: Optional[str] = None) -> Path:
     """
-    逐组多模态样本前向，写同名预测 txt。
-    model: 需要能接受(5,H,W) 归一化张量并输出 boxes(需按 ultralytics 约定解析)。
-    简化封装：valid 5ch 精确解析依赖 head 输出结构，
-    本函数给调用方一个挂钩 `parse_fn`；默认调用超类解析。
+    逐组多模态样本前向 → NMS 解码 → 赛题同名 txt（class_id cx cy w h confidence）。
+
+    与 3 通道版一致的约定：
+      * 每图必写同名 txt；无目标写空文件；
+      * 每图最多 100 框（按置信度截断）；
+      * 坐标归一化（相对输入画布 W/H）。
     """
     import torch
+    from .evaluate import _move_to_device, decode_preds
     out_dir = out_dir or _pick_out_dir(cfg.key)
     out_dir.mkdir(parents=True, exist_ok=True)
     model = model.eval()
+    dev = device or ("cuda:0" if torch.cuda.is_available() else "cpu")
+    model = _move_to_device(model, dev)
 
+    n_written = 0
     for s in samples:
-        chw = DS.build_input_channels(s.img, cfg.in_channels, target_size=imgsz)
-        t = torch.from_numpy(chw).float().unsqueeze(0)
-        if next(model.parameters()).is_cuda:
-            t = t.cuda()
+        chw = DS.build_input_channels(
+            s.img, cfg.in_channels, target_size=imgsz,
+            depth_shift=(cfg.hyper.depth_shift_x, cfg.hyper.depth_shift_y),
+            preprocess=cfg.hyper.preprocess)
+        H, W = chw.shape[1], chw.shape[2]
+        t = torch.from_numpy(np.ascontiguousarray(chw)).float().unsqueeze(0)
+        t = _move_to_device(t, dev)
         with torch.no_grad():
-            raw = model(t)   # 具体解析由实例 decoder 完成
-        out_txt = out_dir / f"{s.stem}.txt"
-        out_txt.write_text("", encoding="utf-8")
-    print(f"[predict-custom] 已为 {len(samples)} 组样本写出(空)预测 txt -> {out_dir}")
+            out = model(t)
+        det = decode_preds(out, cfg.class_num, conf_thr, iou_thr)[0]
+        det = det.cpu().numpy() if not isinstance(det, np.ndarray) else det
+        lines = []
+        if len(det):
+            for x1, y1, x2, y2, conf, cls in det[:100]:       # 按 conf 已降序，截断 100
+                cx = (x1 + x2) / 2 / W
+                cy = (y1 + y2) / 2 / H
+                w = (x2 - x1) / W
+                h = (y2 - y1) / H
+                lines.append(f"{int(cls)} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f} {float(conf):.6f}")
+        (out_dir / f"{s.stem}.txt").write_text(
+            "\n".join(lines) + "\n" if lines else "", encoding="utf-8")
+        n_written += 1
+    print(f"[predict-custom] {n_written} 组样本 -> {out_dir}（含空 txt，≤100 框/图）")
     return out_dir
 
 
-# 解码占位：把多模态输出解析为 boxes 的扩展点(实验模型阶段实现)
+# 兼容旧占位：5 通道解码已由 evaluate.decode_preds 提供
 def default_decode(raw):
-    raise NotImplementedError(
-        "5 通道输出解析需按 head 结构实现；到 基线模型2/实验阶段接线。")
+    from .evaluate import decode_preds
+    return decode_preds(raw, nc=12)
 
 
 __all__ = ["predict_rgb_ultralytics", "predict_multimodal_custom",

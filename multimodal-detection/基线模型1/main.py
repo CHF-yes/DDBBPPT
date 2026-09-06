@@ -25,7 +25,7 @@ from common import trainer as TR                # noqa: E402
 from common import inference as INF             # noqa: E402
 
 
-def cmd_config():
+def cmd_config(args):
     print(MC.summarize())
     print(TR.train_config_prints(MC.BASELINE1_3CH))
 
@@ -34,26 +34,28 @@ def cmd_train(args):
     from ultralytics import YOLO
     cfg = MC.BASELINE1_3CH
     kw = TR.build_train_kwargs(cfg)
-    kw["data"] = args.data_yaml or str(MC.DATA_ROOT / "data.yaml")
+    data_root = Path(args.data_root) if args.data_root else MC.DATA_ROOT
+    kw["data"] = args.data_yaml or str(data_root / "data.yaml")
     kw["model"] = cfg.hyper.pretrained_weights
-    # ultralytics .train(classes=nc) 或由 data.yaml nc 决定类数
-    kw["model"] = kw["model"]
     model = YOLO(kw.pop("model"))
     # 注意：YOLO.train 的 device / data 等来自 kw；此处拆分以远离副作用
     train_kwargs = {k: kw[k] for k in
                     ("data", "epochs", "imgsz", "batch", "device", "workers",
                      "optimizer", "lr0", "amp", "seed", "patience",
                      "project", "name", "exist_ok")}
-    print("[baseline1 train] 参数如下（正式跑前请核对 DATA_ROOT/data.yaml 是否正确）：")
+    print("[baseline1 train] 参数如下：")
     print(train_kwargs)
-    # 实际训练一行：model.train(**train_kwargs)  —— 等数据+服务器就绪手动放开
-    # model.train(**train_kwargs)
+    if not Path(train_kwargs["data"]).exists():
+        raise SystemExit(f"[baseline1] data.yaml 不存在: {train_kwargs['data']}（先运行 scan_data/split_data）")
+    print("[baseline1] 开始训练（ultralytics 内建，3 通道 RGB）...")
+    model.train(**train_kwargs)
 
 
 def cmd_predict(args):
     from ultralytics import YOLO
     cfg = MC.BASELINE1_3CH
-    images = args.images or str(MC.DATA_ROOT)
+    data_root = Path(args.data_root) if args.data_root else MC.DATA_ROOT
+    images = args.images or str(data_root / "visible")   # 只对可见光目录预测，避免多模态根混跑
     INF.predict_rgb_ultralytics(args.weights, images, cfg=cfg, imgsz=cfg.hyper.imgsz)
 
 
@@ -63,6 +65,7 @@ def main():
     ap.add_argument("--weights", default=None)
     ap.add_argument("--images", default=None)
     ap.add_argument("--data-yaml", default=None)
+    ap.add_argument("--data-root", default=None, help="数据根目录（默认 MC.DATA_ROOT / $MULTIMODAL_DATA_ROOT）")
     args = ap.parse_args()
     {"config": cmd_config, "train": cmd_train, "predict": cmd_predict}[args.task](args)
 

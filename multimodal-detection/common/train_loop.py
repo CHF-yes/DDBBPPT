@@ -68,6 +68,17 @@ def make_batch_dict(chw_list: List[np.ndarray], boxes_list: List[Optional[np.nda
     }
 
 
+def move_to_device(x, device):
+    """递归把 dict/tensor 迁移到 device（inputs 与 batch 通用）。"""
+    if isinstance(x, dict):
+        return {k: move_to_device(v, device) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return type(x)(move_to_device(v, device) for v in x)
+    if isinstance(x, torch.Tensor):
+        return x.to(device, non_blocking=True)
+    return x
+
+
 # ------------------------------------------------------------
 # 训练主循环
 # ------------------------------------------------------------
@@ -127,7 +138,9 @@ def train_custom(
         for i in range(0, len(order), h.batch):
             chunk = order[i:i + h.batch]
             inputs, batch = build_batch(chunk, rng)
-            batch["img"] = batch["img"].to(device)
+            inputs = move_to_device(inputs, device)          # rgb/ir/depth 等统一迁 GPU
+            batch = {k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v)
+                     for k, v in batch.items()}              # cls/bboxes/batch_idx/img
             with torch.cuda.amp.autocast(enabled=has_cuda and h.amp):
                 preds = forward_fn(model, inputs)
                 loss, items = _compute_loss(model, preds, batch)
@@ -162,19 +175,16 @@ def train_custom(
         ema.update_attr(model)
         ema.update(model)
         if not samples_val:
-            torch.save({"model": ema.ema.state_dict(), "epoch": epoch,
-                        "best_map": float("nan")}, wdir / "last.pt")
+            save_ckpt(wdir / "last.pt", ema, epoch, float("nan"), cfg, type(model).__name__)
             continue
         is_best = cur_map > best_map
         if is_best:
             best_map = cur_map
             bad_epochs = 0
-            torch.save({"model": ema.ema.state_dict(), "epoch": epoch,
-                        "best_map": best_map}, wdir / "best.pt")
+            save_ckpt(wdir / "best.pt", ema, epoch, best_map, cfg, type(model).__name__)
         else:
             bad_epochs += 1
-        torch.save({"model": ema.ema.state_dict(), "epoch": epoch,
-                    "best_map": cur_map}, wdir / "last.pt")
+        save_ckpt(wdir / "last.pt", ema, epoch, cur_map, cfg, type(model).__name__)
 
         if h.patience and bad_epochs >= h.patience:
             print(f"[{cfg.key}] early stop @ epoch {epoch} (patience {h.patience})")
@@ -184,19 +194,48 @@ def train_custom(
     return wdir
 
 
+def save_ckpt(path, ema, epoch, best_map, cfg: MC.ModelConfig, model_type: str) -> None:
+    """保存可复现的 checkpoint：state_dict + 训练/模型元数据（不再是裸 state_dict）。"""
+    torch.save({
+        "model_state": ema.ema.state_dict(),
+        "epoch": epoch,
+        "best_map": float(best_map),
+        "cfg_key": cfg.key,
+        "class_num": cfg.class_num,
+        "in_channels": cfg.in_channels,
+        "model_type": model_type,                 # DetectionModel / Experiment1Model 等
+        "class_names": MC.CLASS_NAMES,
+    }, path)
+    print(f"[train_loop] saved checkpoint (ep {epoch}) -> {path}")
+
+
 def _compute_loss(model: nn.Module, preds, batch: Dict):
     """按模型类型取损失：DetectionModel 用自带 .loss()；自定义模型用 v8DetectionLoss。
     返回 (loss, items_dict)；items 值为 float。"""
+    # 官方 v8DetectionLoss 需要 model.args 支持属性访问（.box/.cls/.dfl）；
+    # YOLO 加载后 args 是 dict，统一转 SimpleNamespace。
+    from types import SimpleNamespace
+    if isinstance(getattr(model, "args", None), dict):
+        _m = dict(model.args)
+        for _k, _v in (("box", 7.5), ("cls", 0.5), ("dfl", 1.5)):   # 官方默认损失增益
+            _m.setdefault(_k, _v)
+        model.args = SimpleNamespace(**_m)
     if hasattr(model, "loss") and not hasattr(model, "criterion_builder"):
         loss, items = model.loss(batch, preds=preds)
-        return loss, _to_float_items(items)
+        return _scalarize(loss), _to_float_items(items)
     from ultralytics.utils.loss import v8DetectionLoss  # vendor 版
     crit = getattr(model, "_crit_cache", None)
     if crit is None:
         crit = v8DetectionLoss(model)
         model._crit_cache = crit
     loss, items_out = crit(preds, batch)
-    return loss, _to_float_items(items_out or crit.loss_names)
+    return _scalarize(loss), _to_float_items(items_out or crit.loss_names)
+
+
+def _scalarize(loss):
+    """v8DetectionLoss/DetectionModel 返回 (box,cls,dfl) 三分量向量 → 求和为标量（backward 需要）。"""
+    import torch
+    return loss.sum() if torch.is_tensor(loss) and loss.ndim > 0 else loss
 
 
 def _to_float_items(items) -> dict:

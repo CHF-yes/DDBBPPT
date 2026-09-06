@@ -16,9 +16,15 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+# 直接 python common/scan_data.py 运行时也可找到 code 根（-m 方式同样兼容）
+_CODE_ROOT = str(Path(__file__).resolve().parent.parent)
+if _CODE_ROOT not in sys.path:
+    sys.path.insert(0, _CODE_ROOT)
 
 import models_config as MC
 
@@ -31,8 +37,25 @@ MODALITY_HINTS: Dict[str, List[str]] = {
     "ir": ["ir", "infrared", "thermal", "tir"],
     "depth": ["depth", "disp", "d_"],
 }
+# 按「目录名」配对（文件名无模态后缀时用，如 VDT-2048 的 V/T/D 布局）
+MODALITY_DIR_TABLE: Dict[str, List[str]] = {
+    "rgb": ["v", "vis", "visible", "rgb"],
+    "ir": ["t", "ir", "thermal", "infrared", "tir"],
+    "depth": ["d", "depth"],
+}
+# 标签目录候选名（目录布局模式下）
+LABEL_DIR_NAMES = ("labels_multi", "labels", "label", "gt")
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp"}
 LABEL_EXTS = {".txt"}
+
+
+def classify_by_dir(dir_name: str) -> Optional[str]:
+    """按目录名判定模态（精确匹配，返回 rgb/ir/depth 之一）。"""
+    n = dir_name.lower()
+    for mod, names in MODALITY_DIR_TABLE.items():
+        if n in names:
+            return mod
+    return None
 
 
 def _pick_stem(root: Path) -> dict:
@@ -103,7 +126,8 @@ def _strip_modality_tag(stem: str) -> str:
     return lower or stem
 
 
-def scan_samples(data_root: Path, split_subdirs: Optional[list] = None) -> Dict[str, List[Sample]]:
+def scan_samples(data_root: Path, split_subdirs: Optional[list] = None,
+                 layout: bool = False) -> Dict[str, List[Sample]]:
     """
     扫描并按 `split_subdirs` 聚合样本。
 
@@ -113,8 +137,13 @@ def scan_samples(data_root: Path, split_subdirs: Optional[list] = None) -> Dict[
     若 split_subdirs=None 则默认探测 root 的直接子目录(如 train/val)；
     并将返回 {split_name: [Sample, ...]}。
 
-    Sample.img 可能缺某一模态(如 IR 缺失)，返回后由 dataset 层按 cfg 取舍。
+    layout=True（目录布局模式，如 VDT-2048 的 V/T/D/labels_multi）：
+      把 data_root 本身当作"一组"，按目录名 V/T/D→rgb/ir/depth、labels_*→标签 配对，
+      文件名无需携带模态后缀。
     """
+    if layout:
+        return {data_root.name: _scan_one_split_layout(data_root)}
+
     if split_subdirs is None:
         # 自动推断：root 的直接子目录且看起来是 split（含图片集）
         split_subdirs = sorted(
@@ -137,6 +166,27 @@ def scan_samples(data_root: Path, split_subdirs: Optional[list] = None) -> Dict[
         out[sd] = samples
         print(f"[scan] split '{sd}': {len(samples)} 组样本")
     return out
+
+
+def _scan_one_split_layout(base: Path) -> List[Sample]:
+    """目录布局模式：按子目录名配对三模态 + 标签（如 VDT 的 V/T/D/labels_multi）。"""
+    img_by_mod: Dict[str, Dict[str, Path]] = {"rgb": {}, "ir": {}, "depth": {}}
+    label_map: Dict[str, Path] = {}
+    if not base.exists():
+        return []
+    for sub in sorted(p for p in base.iterdir() if p.is_dir()):
+        mod = classify_by_dir(sub.name)
+        if mod is not None:
+            for p in sub.glob("*"):
+                if p.is_file() and p.suffix.lower() in IMAGE_EXTS:
+                    img_by_mod[mod][p.stem] = p
+        elif sub.name.lower() in LABEL_DIR_NAMES:
+            for p in sub.glob("*.txt"):
+                label_map[p.stem] = p
+    stems = set(img_by_mod["rgb"]) if img_by_mod["rgb"] else set(label_map)
+    stems &= set(label_map)
+    return [Sample(stem=s, img={m: img_by_mod[m].get(s) for m in ("rgb", "ir", "depth")},
+                   label=label_map.get(s)) for s in sorted(stems)]
 
 
 def _scan_one_split(base: Path) -> List[Sample]:
@@ -196,15 +246,19 @@ def _scan_one_split(base: Path) -> List[Sample]:
 
 def build_data_yaml(data_root: Path, split_info: Dict[str, List[Sample]],
                     out_path: Path,
-                    train: str = "train", val: str = "val") -> Path:
+                    train: str = "train", val: str = "val",
+                    names: Optional[List[str]] = None) -> Path:
     """
     根据扫描结果生成 data.yaml。
     说明：ultralytics 训练需要 train/val 两个分组的图像目录；若原数据没有 val，
     需自行先划分（例如 8:1 拆出 val）。本函数只写 data.yaml，不代为划分——不足时由 README 指导。
+    names: 类别名列表（每行一个 / 直接传 list）；None 时用赛题 12 类。
     """
     # ultralytics 惯例：data.yaml 的路径是相对它自身所在目录或绝对。
     root_abs = data_root.resolve()
-    names = "\n".join(f"  {i}: {n}" for i, n in enumerate(MC.CLASS_NAMES))
+    names = list(names) if names else []
+    names = names or list(MC.CLASS_NAMES)
+    names_block = "\n".join(f"  {i}: {n}" for i, n in enumerate(names))
 
     # 取各 split 的图像目录（找出同一组内图片所在目录）
     def samples_dir(split_samples: List[Sample]) -> str:
@@ -220,10 +274,11 @@ def build_data_yaml(data_root: Path, split_info: Dict[str, List[Sample]],
         f"train: {samples_dir(split_info.get(train, []))}",
         f"val: {samples_dir(split_info.get(val, []))}",
         "",
-        f"nc: {MC.CLASS_NUM}",
+        f"nc: {len(names)}",
         "names:",
-        names,
+        names_block,
     ]
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"[scan] data.yaml 写入 -> {out_path}")
     return out_path
@@ -233,6 +288,10 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="扫描多模态检测数据布局并(可选)生成 data.yaml")
     ap.add_argument("--root", type=str, default=str(MC.DATA_ROOT), help="数据根目录")
     ap.add_argument("--split-dirs", type=str, default="", help="逗号分隔的分组目录名，如 train,val")
+    ap.add_argument("--layout", action="store_true",
+                    help="目录布局模式：按目录名配对（如 VDT 的 V/T/D/labels_multi）")
+    ap.add_argument("--names", type=str, default=None,
+                    help="类别名文件（每行一个类别名）；默认赛题 12 类")
     ap.add_argument("--out", type=str, default=None,
                     help="可选：输出 data.yaml 路径")
     args = ap.parse_args()
@@ -246,7 +305,14 @@ def main() -> None:
     print_dataset_tree(root, max_depth=2)
 
     split_dirs = [s.strip() for s in args.split_dirs.split(",") if s.strip()] or None
-    res = scan_samples(root, split_dirs or None)
+    res = scan_samples(root, split_dirs or None, layout=args.layout)
+
+    names_list = None
+    if args.names:
+        names_list = [l.strip() for l in
+                      Path(args.names).read_text(encoding="utf-8").splitlines()
+                      if l.strip() and not l.startswith("#")]
+        print(f"[scan] 使用类别名文件: {args.names} ({len(names_list)} 类)")
 
     if args.out:
         # 若无 val 分组，打印提醒
@@ -254,7 +320,7 @@ def main() -> None:
         if not has_val:
             print("\n[注意] 扫描不到 val/validation 分组。ultralytics 训练需要 val 子集，"
                   "请先做 train/val 划分，或提供 --split-dirs train,val。")
-        build_data_yaml(root, res, Path(args.out))
+        build_data_yaml(root, res, Path(args.out), names=names_list)
 
 
 if __name__ == "__main__":

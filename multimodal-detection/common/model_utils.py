@@ -26,17 +26,33 @@ def build_base_model(weights: str):
 
 def ensure_detect_classes(model, class_num: int):
     """
-    提示/封装：把检测分支类别数设定为 class_num(=12)。
-
-    ultralytics 处理类头通常有两条路径：
-      A.（推荐、官方）直接用 YOLO.train(data=你的12类data.yaml)：
-          trainer 会按 data['nc'] 重新构建 Detect 头 → 无需手动改。
-      B.（自定义前向 / 多模态自定义训练循环时）需显式重建 Detect n=class_num,
-         本框架建议通过 .train(nc=class_num) 参数或在生成权重后用:
-            model = YOLO(你的12类.pt)   （已含 nc=12 —— 训练后产物）
-    因此一般不需要手工动 internals。返回 model 原样便于链式调用。
+    把检测头真正重建为 class_num 类（自定义训练必需）：
+    仅改 model.nc 无效——内部 Detect 的 cv3 分类层仍为 80 类权重，
+    自定义训练循环不会像 ultralytics trainer 那样自动重建。
+    本函数重建 cv3（含 one2one 头兼容）并 reset 偏置。
     """
-    model.nc = int(class_num)   # 供自定义建模引用（不给训练器造成负担）
+    import copy
+    import torch.nn as nn
+    from ultralytics.nn.modules import Conv
+
+    class_num = int(class_num)
+    outer = getattr(model, "model", model)          # YOLO 包装 → DetectionModel
+    seq = getattr(outer, "model", outer)            # DetectionModel → Sequential
+    head = seq[-1]
+    head.nc = class_num
+    head.no = class_num + head.reg_max * 4          # DFL 版输出数
+    chs = [m[0].conv.in_channels for m in head.cv2]  # 每尺度输入通道
+    c3 = max(chs[0], min(class_num, 100))            # 与官方 __init__ 同一公式
+    head.cv3 = nn.ModuleList(
+        nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, class_num, 1))
+        for x in chs)
+    # 端到端（yolo26 双头）模型同步重建 one2one 头
+    if hasattr(head, "one2one_cv3") and head.one2one_cv3 is not None:
+        head.one2one_cv3 = copy.deepcopy(head.cv3)
+    if hasattr(head, "bias_init"):
+        head.bias_init()
+    print(f"[model_utils] Detect 头已真正重建为 {class_num} 类 "
+          f"(cv3 各尺度输出 {class_num})")
     return model
 
 

@@ -212,14 +212,14 @@ def hsv_only_rgb(rgb: np.ndarray, h_gain=0.015, s_gain=0.7, v_gain=0.4,
                  rng=None) -> np.ndarray:
     """只对 RGB(BGR) 做 HSV 扰动；IR/Depth 永不参与（避免伪造温度/距离语义）。"""
     iv = _cv()
-    h, s, v = iv.split(iv.cvtColor(rgb, iv.COLOR_BGR2HSV))
+    h, s, v = iv.split(iv.cvtColor(rgb, iv.COLOR_RGB2HSV))
     h, s, v = (x.astype(np.float32) for x in (h, s, v))
     r = rng if rng is not None else random
     h = (h + r.uniform(-h_gain, h_gain) * 180) % 180
     s = np.clip(s * (1 + r.uniform(-s_gain, s_gain)), 0, 255)
     v = np.clip(v * (1 + r.uniform(-v_gain, v_gain)), 0, 255)
     hsv = iv.merge([h.astype(np.uint8), s.astype(np.uint8), v.astype(np.uint8)])
-    return iv.cvtColor(hsv, iv.COLOR_HSV2BGR)
+    return iv.cvtColor(hsv, iv.COLOR_HSV2RGB)
 
 
 # ------------------------------------------------------------
@@ -284,7 +284,14 @@ def consistent_augment_full(
     返回 (rgb_c, ir_c, depth_c, boxes_c)；boxes_c 作用于 letterbox 画布、归一化。
     """
     from models_config import AugmentParams
-    aug = aug if aug is not None else AugmentParams()
+    if aug is None:
+        # aug=None = 验证/推理路径：**无任何随机增强**（关 flip/HSV/IR抖动/Depth噪声/抖动/RGB失效），
+        # 仅保留同步 letterbox，确保验证图像与标签不被随机改动。
+        aug = AugmentParams(
+            flip_p=0.0, vflip_p=0.0, hsv_rgb=False,
+            ir_gain=0.0, ir_bias=0.0, depth_noise=0.0,
+            depth_jitter_prob=0.0, rgb_drop_prob=0.0,
+        )
     rng = random.Random(seed) if seed is not None else random
     # (1) 几何翻转：三图同步（同一掷骰）
     flip_r, flip_i, flip_d, flip_b = flip_lr_consistent(

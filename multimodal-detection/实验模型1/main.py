@@ -29,8 +29,9 @@ def cmd_config(args):
     print(MC.summarize())
     print(TR.train_config_prints(MC.EXPERIMENT1))
     h = MC.EXPERIMENT1.hyper
+    a = h.aug
     print(f"  depth_align : ({h.depth_shift_x}, {h.depth_shift_y})")
-    print(f"  depth_jitter: x={h.depth_jitter_x} y={h.depth_jitter_y} p={h.depth_jitter_prob}")
+    print(f"  depth_jitter: x={a.depth_jitter_x} y={a.depth_jitter_y} p={a.depth_jitter_prob}")
 
 
 def cmd_selfcheck(args):
@@ -57,7 +58,7 @@ def cmd_train(args):
                                  nc=cfg.class_num)
 
     # --- 数据：扫描根目录；无 val 时从 train 抽出 10% 作 val ---
-    root = MC.DATA_ROOT
+    root = Path(args.data_root) if args.data_root else MC.DATA_ROOT
     if not root.exists():
         raise SystemExit(f"[实验模型1] 数据根不存在: {root}（先设 MULTIMODAL_DATA_ROOT 或 DATA_ROOT）")
     scanned = SD.scan_samples(root)
@@ -116,6 +117,7 @@ def main():
     ap.add_argument("--weights", default=None)
     ap.add_argument("--out", default=None)
     ap.add_argument("--data-yaml", default=None)
+    ap.add_argument("--data-root", default=None, help="数据根目录（默认 MC.DATA_ROOT / $MULTIMODAL_DATA_ROOT）")
     args = ap.parse_args()
     {"config": cmd_config, "selfcheck": cmd_selfcheck,
      "train": cmd_train, "predict": cmd_predict}[args.task](args)

@@ -28,7 +28,7 @@ from common import inference as INF         # noqa: E402
 from common import dataset as DS            # noqa: E402
 
 
-def cmd_config():
+def cmd_config(args):
     print(MC.summarize())
     print(TR.train_config_prints(MC.BASELINE2_5CH))
 
@@ -41,11 +41,12 @@ def cmd_train(args):
     cfg = MC.BASELINE2_5CH
     h = cfg.hyper
     from model_builder import build_baseline2
-    model = build_baseline2(weights=args.weights or h.pretrained_weights,
-                            class_num=cfg.class_num)
+    wrapper = build_baseline2(weights=args.weights or h.pretrained_weights,
+                              class_num=cfg.class_num)
+    net = wrapper.model                    # 内部 DetectionModel（训练用，勿用 YOLO 包装器）
 
     # --- 数据：扫描根目录；无 val 时从 train 抽出 10% 作 val（固定 seed 可复现）---
-    root = MC.DATA_ROOT
+    root = Path(args.data_root) if args.data_root else MC.DATA_ROOT
     if not root.exists():
         raise SystemExit(f"[baseline2] 数据根不存在: {root}（先设 MULTIMODAL_DATA_ROOT 或 DATA_ROOT）")
     scanned = SD.scan_samples(root)
@@ -78,8 +79,8 @@ def cmd_train(args):
 
     build_val_batch = lambda chunk, rng: build_batch(chunk, rng, augment=False)  # noqa: E731
 
-    forward_fn = lambda model, inputs: model(inputs["img"])   # noqa: E731
-    TL.train_custom(model, train_samples, val_samples, cfg,
+    forward_fn = lambda net, inputs: net(inputs["img"])   # noqa: E731  内部网络直前向
+    TL.train_custom(net, train_samples, val_samples, cfg,
                     build_batch, forward_fn, out_dir=args.out,
                     build_val_batch=build_val_batch)
 
@@ -101,6 +102,7 @@ def main():
     ap.add_argument("--weights", default=None, help="模型权重")
     ap.add_argument("--out", default=None, help="输出目录(预测)")
     ap.add_argument("--data-yaml", default=None, help="data.yaml 路径(训练)")
+    ap.add_argument("--data-root", default=None, help="数据根目录（默认 MC.DATA_ROOT / $MULTIMODAL_DATA_ROOT）")
     args = ap.parse_args()
     {"config": cmd_config, "train": cmd_train, "predict": cmd_predict}[args.task](args)
 

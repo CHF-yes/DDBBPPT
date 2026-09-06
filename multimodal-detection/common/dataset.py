@@ -136,11 +136,13 @@ def build_input_channels(sample_img_paths: dict, in_channels: int,
     """
     from .multimodal_augment import align_depth
     from models_config import PreprocessParams
+    import cv2
     pp = preprocess if preprocess is not None else PreprocessParams()
-    rgb = read_rgb_bgr(sample_img_paths["rgb"])  # (H,W,3) BGR
+    rgb = read_rgb_bgr(sample_img_paths["rgb"])      # (H,W,3) BGR（OpenCV 读取）
+    rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)       # 统一 RGB：预训练 backbone 惯例
     H, W = rgb.shape[:2]
     if in_channels == 3:
-        ch = norm_array(rgb, pp.rgb_mode).transpose(2, 0, 1)
+        ch = norm_array(rgb, pp.rgb_mode).transpose(2, 0, 1)   # (3,H,W) RGB
     else:
         assert in_channels == 5, in_channels
         ir = read_ir_gray(sample_img_paths["ir"])   # (H,W)  像素即温度亮暗
@@ -150,15 +152,14 @@ def build_input_channels(sample_img_paths: dict, in_channels: int,
                                     pp.depth_scale_mm, pp.depth_invalid_zero)
         # 统一尺寸(resize 三书记一致既保证空间对齐保留——题目已经对齐，此处只顺引)
         if (ir.shape[0], ir.shape[1]) != (H, W):
-            import cv2
             ir = cv2.resize(ir, (W, H), interpolation=cv2.INTER_LINEAR)
             dep_sc = cv2.resize(dep_sc, (W, H), interpolation=cv2.INTER_LINEAR)
 
         rf = norm_array(rgb, pp.rgb_mode)
         r, g, b = rf[:, :, 0], rf[:, :, 1], rf[:, :, 2]
         irn = norm_array(ir, pp.ir_mode)
-        # 组装 [B, G, R, IR, D]
-        ch = np.stack([b, g, r, irn, dep_sc], axis=0)  # (5,H,W)
+        # 组装 [R, G, B, IR, D]（RGB 序与预训练 backbone 一致）
+        ch = np.stack([r, g, b, irn, dep_sc], axis=0)  # (5,H,W)
     if target_size is not None:
         import cv2
         Ht, Wt = target_size

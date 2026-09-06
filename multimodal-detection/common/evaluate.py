@@ -23,6 +23,17 @@ import torch
 import models_config as MC
 
 
+def _move_to_device(x, dev):
+    """递归迁移 dict/tensor（评估用，避免 CPU/GPU 不一致）。"""
+    if isinstance(x, dict):
+        return {k: _move_to_device(v, dev) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return type(x)(_move_to_device(v, dev) for v in x)
+    if isinstance(x, torch.Tensor):
+        return x.to(dev, non_blocking=True)
+    return x
+
+
 def decode_preds(raw: torch.Tensor, nc: int, conf_thres: float = 0.25,
                  iou_thres: float = 0.7, max_det: int = 300):
     """(B,4+nc,8400) → list[(M,6) xyxy+conf+cls]（vendors NMS，非端到端路径）。"""
@@ -38,14 +49,14 @@ def build_tp_matrix(preds: np.ndarray, targets: np.ndarray,
     """
     赛题式逐类贪心匹配：返回 (P, len(iou_thrs)) bool TP 矩阵。
     preds  : (P,6) xyxy+conf+cls（已按 conf 降序）
-    targets: (Q,6) xyxy+cls（cls 在第 0 列）
+    targets: (Q,5) xyxy+cls（cls 在第 4 列，与 evaluate_mAP 构造的 g_xyxy 一致）
     """
     from ultralytics.utils.metrics import box_iou
     P = len(preds)
     tp = np.zeros((P, len(iou_thrs)), dtype=bool)
     if P == 0 or len(targets) == 0:
         return tp
-    pc, tc = preds[:, 5], targets[:, 5]
+    pc, tc = preds[:, 5], targets[:, 4]
     pbox = torch.from_numpy(preds[:, :4]).float()
     tbox = torch.from_numpy(targets[:, :4]).float()
     for ti, t in enumerate(iou_thrs):
@@ -101,7 +112,9 @@ def evaluate_mAP(
         for i in range(0, len(samples_val), 4):          # 小批量评估
             chunk = samples_val[i:i + 4]
             inputs, batch = build_val_batch(chunk, random.Random(0))
-            batch["img"] = batch["img"].to(dev) if batch.get("img") is not None else batch["img"]
+            inputs = _move_to_device(inputs, dev)        # 多模态 inputs 统一迁 GPU
+            batch = {k: (_move_to_device(v, dev) if torch.is_tensor(v) else v)
+                     for k, v in batch.items()}
             raw = forward_fn(model, inputs)
             dets = decode_preds(raw, nc, conf_thres, iou_nms)
 
@@ -133,7 +146,7 @@ def evaluate_mAP(
                     "im_name": f"batch{i}_img{si}",
                 })
 
-    if not any(metrics.stats["target_cls"]):
+    if sum(len(t) for t in metrics.stats["target_cls"]) == 0:
         return {"map50_95": float("nan"), "map50": float("nan"),
                 "precision": float("nan"), "recall": float("nan"), "per_class": {}}
 
