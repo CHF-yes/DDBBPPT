@@ -42,9 +42,27 @@ FORMATS_HELP_MSG = f"Supported formats are:\nimages: {IMG_FORMATS}\nvideos: {VID
 
 
 def img2label_paths(img_paths):
-    """Define label paths as a function of image paths."""
+    """Define label paths as a function of image paths.
+
+    支持三种目录约定（优先级从上到下）：
+    1. 标准 YOLO：/images/ → /labels/
+    2. RGBTD 三模态：/visible/、/infrared/、/depth/ → /labels/（标签在独立 labels 目录）
+    3. 其他：标签与图片同目录（仅替换扩展名为 .txt）
+    """
     sa, sb = f"{os.sep}images{os.sep}", f"{os.sep}labels{os.sep}"  # /images/, /labels/ substrings
-    return [sb.join(x.rsplit(sa, 1)).rsplit(".", 1)[0] + ".txt" for x in img_paths]
+    out = []
+    for x in img_paths:
+        if sa in x:
+            y = sb.join(x.rsplit(sa, 1))
+        else:
+            y = x
+            for m in ("visible", "infrared", "depth"):
+                mm = f"{os.sep}{m}{os.sep}"
+                if mm in x:
+                    y = sb.join(x.rsplit(mm, 1))
+                    break
+        out.append(y.rsplit(".", 1)[0] + ".txt")
+    return out
 
 
 def get_hash(paths):

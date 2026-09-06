@@ -133,7 +133,7 @@ class DetectionTrainer(BaseTrainer):
             use_simotm=self.args.use_simotm,  # 2025-01-05
         )
         # 'yzc' 2025-03-03
-        if self.args.use_simotm in ("RGBT", "RGBRGB6C"):
+        if self.args.use_simotm in ("RGBT", "RGBRGB6C", "RGBTD"):
             plot_images(
                 images=batch["img"],
                 batch_idx=batch["batch_idx"],

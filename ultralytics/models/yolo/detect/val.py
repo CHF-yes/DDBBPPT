@@ -260,7 +260,7 @@ class DetectionValidator(BaseValidator):
             on_plot=self.on_plot,
         )
         # 'yzc' 2025-05-28
-        if self.args.use_simotm in ("RGBT", "RGBRGB6C"):
+        if self.args.use_simotm in ("RGBT", "RGBRGB6C", "RGBTD"):
             plot_images(
                 batch["img"],
                 batch["batch_idx"],

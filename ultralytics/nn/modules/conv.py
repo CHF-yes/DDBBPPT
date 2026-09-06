@@ -482,6 +482,21 @@ class NiNfusion(nn.Module):
         return y
 
 
+class ModalConcat(nn.Module):
+    """多路通道拼接 + 1×1 卷积对齐输出通道（三模态融合，输出通道对齐官方尺度以复用预训练权重）。"""
+
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1):
+        super().__init__()
+        self.concat = Concat(dimension=1)
+        self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p), groups=g, bias=False)
+        self.act = nn.SiLU()
+
+    def forward(self, x):
+        y = self.concat(x)
+        y = self.act(self.conv(y))
+        return y
+
+
 class LearnableCoefficient(nn.Module):
     def __init__(self):
         super(LearnableCoefficient, self).__init__()

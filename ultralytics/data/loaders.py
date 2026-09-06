@@ -326,11 +326,11 @@ class LoadImagesAndVideos:
         self.use_simotm = use_simotm
         self.imgsz=imgsz
         self.pairs_rgb_ir = pairs_rgb_ir
-        # 若 self.pairs_rgb_ir 不是长度为 2 的字符列表，则重置为默认值
+        # 支持二目录(RGBT/RGBRGB6C)或三目录(RGBTD)；长度非法则重置为默认三目录
         if not (isinstance(self.pairs_rgb_ir, list) and
-                len(self.pairs_rgb_ir) == 2 and
+                len(self.pairs_rgb_ir) in (2, 3) and
                 all(isinstance(x, str) for x in self.pairs_rgb_ir)):
-            self.pairs_rgb_ir = ['visible', 'infrared']
+            self.pairs_rgb_ir = ['visible', 'infrared', 'depth']
         self.augment=False
         if isinstance(path, str) and Path(path).suffix == ".txt":  # *.txt file with img/vid/dir on each line
             parent = Path(path).parent
@@ -382,7 +382,9 @@ class LoadImagesAndVideos:
     def __next__(self):
         """Returns the next batch of images or video frames along with their paths and metadata."""
         paths, imgs, info = [], [], []
-        pairs_rgb,pairs_ir=self.pairs_rgb_ir
+        pairs_rgb = self.pairs_rgb_ir[0]
+        pairs_ir = self.pairs_rgb_ir[1] if len(self.pairs_rgb_ir) > 1 else pairs_rgb
+        pairs_depth = self.pairs_rgb_ir[2] if len(self.pairs_rgb_ir) > 2 else None
         while len(imgs) < self.bs:
             if self.count >= self.nf:  # end of file list
                 if imgs:
@@ -604,6 +606,41 @@ class LoadImagesAndVideos:
                     b2, g2, r2 = cv2.split(im_infrared)
                     # 合并成6通道图像
                     im0 = cv2.merge((b, g, r, b2, g2, r2))
+                elif self.use_simotm == 'RGBTD':
+                    im_visible = imread(path)  # BGR
+                    im_infrared = imread(path.replace(pairs_rgb, pairs_ir))  # 3ch 或 1ch
+                    im_depth = imread(path.replace(pairs_rgb, pairs_depth), cv2.IMREAD_UNCHANGED)  # 16bit 单通道
+
+                    if im_infrared.ndim == 2:
+                        im_infrared = cv2.cvtColor(im_infrared, cv2.COLOR_GRAY2BGR)
+                    elif im_infrared.ndim == 3 and im_infrared.shape[2] == 4:
+                        im_infrared = im_infrared[:, :, :3]
+
+                    im_depth = im_depth.astype(np.float32)
+                    im_depth[im_depth < 1e-3] = 0.0
+                    d_min, d_max = float(im_depth.min()), float(im_depth.max())
+                    if d_max - d_min > 1e-6:
+                        im_depth = (im_depth - d_min) / (d_max - d_min) * 255.0
+                    else:
+                        im_depth = np.zeros_like(im_depth)
+                    im_depth = im_depth.astype(np.uint8)
+                    im_depth = cv2.cvtColor(im_depth, cv2.COLOR_GRAY2BGR)
+
+                    h_vis, w_vis = im_visible.shape[:2]
+                    ims = [im_visible, im_infrared, im_depth]
+                    for idx, im_ in enumerate(ims):
+                        h_, w_ = im_.shape[:2]
+                        if h_ != h_vis or w_ != w_vis:
+                            r_ = self.imgsz / max(h_, w_)
+                            interp = cv2.INTER_LINEAR if (self.augment or r_ > 1) else cv2.INTER_AREA
+                            ims[idx] = cv2.resize(im_, (min(math.ceil(w_ * r_), self.imgsz), min(math.ceil(h_ * r_), self.imgsz)),
+                                                  interpolation=interp)
+                    im_visible, im_infrared, im_depth = ims
+
+                    b, g, r = cv2.split(im_visible)
+                    ib, ig, ir = cv2.split(im_infrared)
+                    db, dg, dr = cv2.split(im_depth)
+                    im0 = cv2.merge((b, g, r, ib, ig, ir, db, dg, dr))
                 elif self.use_simotm == 'Multispectral':
                     im0 = imread(path, cv2.IMREAD_COLOR)  # Multispectral
                 elif self.use_simotm == 'Multispectral_16bit':

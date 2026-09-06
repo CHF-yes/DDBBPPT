@@ -1,0 +1,22 @@
+# RGBTD（可见光 + 红外 + 深度）三模态数据集配置模板
+# 赛题：2026AIC 全球校园人工智能算法精英大赛 · 面向城市场景的视觉多模态目标检测
+#
+# 目录结构（与官方样例一致：四个同级目录，文件名一一对应，已空间对齐）：
+#   <path>/
+#     ├── visible/    # 可见光 RGB，8bit 3 通道，.png / .jpg 混存
+#     ├── infrared/   # 红外，8bit 3 通道（单通道灰度堆叠 3 份），.png / .jpg 混存
+#     ├── depth/      # 深度，16bit 单通道灰度，.png（样例中混有少量 8bit 3 通道 jpg 可视化图）
+#     └── labels/     # YOLO 标注：<class_id> <cx> <cy> <w> <h>（坐标归一化到 [0,1]）
+#
+# 赛题仅提供 train / test，无独立 val。本地验证请从 train 切分出一部分作为 val，
+# 避免 train 与 val 指向同一批数据（否则验证指标虚高，无法反映真实泛化）。
+
+path: /path/to/dataset        # TODO: 改成你的数据集根目录绝对路径
+train: visible                # 可见光训练目录（红外/深度按目录名替换自动定位，标签在 labels/）
+val: visible                  # TODO: 建议从 train 切分出 val 子集后，改成如 visible/val
+
+# 类别数
+nc: 12
+
+# 类别名（赛题 12 类，按 class_id 0-11 顺序）
+names: ["person", "boat", "animal", "seat", "sign", "bicycle", "car", "ball", "light", "garbage_can", "uav", "tricycle"]

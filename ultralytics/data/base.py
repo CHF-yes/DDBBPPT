@@ -63,7 +63,7 @@ class BaseDataset(Dataset):
         classes=None,
         fraction=1.0,
         use_simotm="RGB",
-        pairs_rgb_ir=['visible', 'infrared']
+        pairs_rgb_ir=['visible', 'infrared', 'depth']
     ):
         """Initialize BaseDataset with given configuration and options."""
         super().__init__()
@@ -87,12 +87,12 @@ class BaseDataset(Dataset):
             self.set_rectangle()
 
         self.pairs_rgb_ir=pairs_rgb_ir
-        # 若 self.pairs_rgb_ir 不是长度为 2 的字符列表，则重置为默认值
-        # If self.pairs_rgb_ir is not a list of characters with a length of 2, then reset it to the default value.
+        # 支持二目录(RGBT/RGBRGB6C)或三目录(RGBTD)；长度非法则重置为默认三目录
+        # Support 2-dir (RGBT/RGBRGB6C) or 3-dir (RGBTD) modal folders; reset to default on invalid length.
         if not (isinstance(self.pairs_rgb_ir, list) and
-                len(self.pairs_rgb_ir) == 2 and
+                len(self.pairs_rgb_ir) in (2, 3) and
                 all(isinstance(x, str) for x in self.pairs_rgb_ir)):
-            self.pairs_rgb_ir = ['visible', 'infrared']
+            self.pairs_rgb_ir = ['visible', 'infrared', 'depth']
 
         # Buffer thread for mosaic images
         self.buffer = []  # buffer size = batch size
@@ -121,7 +121,7 @@ class BaseDataset(Dataset):
         for f in self.im_files:
             file_path = Path(f)
             pre_fix_mode= ""
-            if self.use_simotm in {"RGBT","RGBRGB6C"}:
+            if self.use_simotm in {"RGBT","RGBRGB6C","RGBTD"}:
                 pre_fix_mode="_"+self.use_simotm
             file_stem = file_path.stem  # 提取文件名主体，比如 "image1"
             new_file_name = file_stem + pre_fix_mode +".npy"
@@ -174,7 +174,7 @@ class BaseDataset(Dataset):
             if self.single_cls:
                 self.labels[i]["cls"][:, 0] = 0
 
-    def load_and_preprocess_image(self, file_path, use_simotm=None, pairs_rgb=None, pairs_ir=None):
+    def load_and_preprocess_image(self, file_path, use_simotm=None, pairs_rgb=None, pairs_ir=None, pairs_depth=None):
         if use_simotm is None:
             use_simotm = self.use_simotm
 
@@ -217,6 +217,27 @@ class BaseDataset(Dataset):
 
             im_visible, im_infrared = self._resize_images(im_visible, im_infrared)
             im = self._merge_channels_rgb(im_visible, im_infrared)
+        elif use_simotm == 'RGBTD':
+            # 三模态：可见光(BGR 3ch) + 红外(3ch) + 深度(16bit 单通道→归一化→3ch)
+            im_visible = imread(file_path)  # BGR
+            im_infrared = imread(file_path.replace(pairs_rgb, pairs_ir))  # 3ch 或 1ch
+            im_depth = imread(file_path.replace(pairs_rgb, pairs_depth), cv2.IMREAD_UNCHANGED)  # 16bit 单通道
+
+            if im_visible is None or im_infrared is None or im_depth is None:
+                raise FileNotFoundError(f"Image Not Found {file_path}")
+
+            # 红外统一成 3 通道（赛题红外为单通道灰度堆叠 3 份，单通道文件则复制成 3 通道）
+            if im_infrared.ndim == 2:
+                im_infrared = cv2.cvtColor(im_infrared, cv2.COLOR_GRAY2BGR)
+            elif im_infrared.ndim == 3 and im_infrared.shape[2] == 4:
+                im_infrared = im_infrared[:, :, :3]
+
+            # 深度：16bit → 归一化 → 8bit 单通道 → 复制成 3 通道
+            im_depth = self._preprocess_depth(im_depth)
+            im_depth = cv2.cvtColor(im_depth, cv2.COLOR_GRAY2BGR)
+
+            im_visible, im_infrared, im_depth = self._resize_images_3(im_visible, im_infrared, im_depth)
+            im = self._merge_channels_rgbt_depth(im_visible, im_infrared, im_depth)
         else:
             im = imread(file_path, cv2.IMREAD_COLOR)  # BGR
 
@@ -256,10 +277,54 @@ class BaseDataset(Dataset):
         im = cv2.merge((b, g, r, b2, g2, r2))
         return im
 
+    def _preprocess_depth(self, im_depth):
+        """深度图预处理：16bit 毫米 → 8bit [0,255]，逐帧 min-max 归一化，无效值(0/过小)置 0。
+
+        兼容两种深度输入：
+        - 16bit 单通道 PNG（正式深度图）
+        - 8bit 3 通道 JPG（深度可视化/伪彩色图，样例中混入），先转单通道灰度
+        """
+        if im_depth.ndim == 3:
+            # 3 通道深度可视化图 → 转单通道灰度（近似深度），避免 cvtColor(GRAY2BGR) 崩溃
+            im_depth = cv2.cvtColor(im_depth, cv2.COLOR_BGR2GRAY)
+        im_depth = im_depth.astype(np.float32)
+        im_depth[im_depth < 1e-3] = 0.0  # 无效深度值置 0
+        d_min = float(im_depth.min())
+        d_max = float(im_depth.max())
+        if d_max - d_min > 1e-6:
+            im_depth = (im_depth - d_min) / (d_max - d_min) * 255.0
+        else:
+            im_depth = np.zeros_like(im_depth)
+        return im_depth.astype(np.uint8)
+
+    def _resize_images_3(self, im_visible, im_infrared, im_depth):
+        """对齐三模态图像尺寸（长边缩放到 imgsz）。"""
+        h_ref, w_ref = im_visible.shape[:2]
+        out = []
+        for im in (im_visible, im_infrared, im_depth):
+            h, w = im.shape[:2]
+            if h != h_ref or w != w_ref:
+                r = self.imgsz / max(h, w)
+                interp = cv2.INTER_LINEAR if (self.augment or r > 1) else cv2.INTER_AREA
+                im = cv2.resize(im, (min(math.ceil(w * r), self.imgsz), min(math.ceil(h * r), self.imgsz)),
+                                interpolation=interp)
+            out.append(im)
+        return out[0], out[1], out[2]
+
+    def _merge_channels_rgbt_depth(self, im_visible, im_infrared, im_depth):
+        """合并三模态为 9 通道：BGR + IR(3) + Depth(3)。"""
+        b, g, r = cv2.split(im_visible)
+        ib, ig, ir = cv2.split(im_infrared)
+        db, dg, dr = cv2.split(im_depth)
+        im = cv2.merge((b, g, r, ib, ig, ir, db, dg, dr))
+        return im
+
     def load_image(self, i, rect_mode=True):
         """Loads 1 image from dataset index 'i', returns (im, resized hw)."""
         im, f, fn = self.ims[i], self.im_files[i], self.npy_files[i]
-        pairs_rgb, pairs_ir = self.pairs_rgb_ir
+        pairs_rgb = self.pairs_rgb_ir[0]
+        pairs_ir = self.pairs_rgb_ir[1] if len(self.pairs_rgb_ir) > 1 else pairs_rgb
+        pairs_depth = self.pairs_rgb_ir[2] if len(self.pairs_rgb_ir) > 2 else None
         if im is None:  # not cached in RAM
             if fn.exists():  # load npy
                 try:
@@ -268,9 +333,9 @@ class BaseDataset(Dataset):
                     LOGGER.warning(f"{self.prefix}WARNING ⚠️ Removing corrupt *.npy image file {fn} due to: {e}")
                     Path(fn).unlink(missing_ok=True)
                     # im = imread(f,cv2.IMREAD_COLOR)  # BGR
-                    im = self.load_and_preprocess_image(f, use_simotm=self.use_simotm, pairs_rgb=pairs_rgb, pairs_ir=pairs_ir)
+                    im = self.load_and_preprocess_image(f, use_simotm=self.use_simotm, pairs_rgb=pairs_rgb, pairs_ir=pairs_ir, pairs_depth=pairs_depth)
             else:  # read image
-                im = self.load_and_preprocess_image(f, use_simotm=self.use_simotm, pairs_rgb=pairs_rgb, pairs_ir=pairs_ir)
+                im = self.load_and_preprocess_image(f, use_simotm=self.use_simotm, pairs_rgb=pairs_rgb, pairs_ir=pairs_ir, pairs_depth=pairs_depth)
 
             h0, w0 = im.shape[:2]  # orig hw
             if rect_mode:  # resize long side to imgsz while maintaining aspect ratio
@@ -314,8 +379,10 @@ class BaseDataset(Dataset):
         """Saves an image as an *.npy file for faster loading."""
         f = self.npy_files[i]
         if not f.exists():
-            pairs_rgb, pairs_ir = self.pairs_rgb_ir
-            im = self.load_and_preprocess_image(self.im_files[i], use_simotm=self.use_simotm, pairs_rgb=pairs_rgb, pairs_ir=pairs_ir)
+            pairs_rgb = self.pairs_rgb_ir[0]
+            pairs_ir = self.pairs_rgb_ir[1] if len(self.pairs_rgb_ir) > 1 else pairs_rgb
+            pairs_depth = self.pairs_rgb_ir[2] if len(self.pairs_rgb_ir) > 2 else None
+            im = self.load_and_preprocess_image(self.im_files[i], use_simotm=self.use_simotm, pairs_rgb=pairs_rgb, pairs_ir=pairs_ir, pairs_depth=pairs_depth)
             np.save(f.as_posix(), im, allow_pickle=False)
 
     def check_cache_disk(self, safety_margin=0.5):
@@ -333,6 +400,8 @@ class BaseDataset(Dataset):
             ratio_m =1.0
             if self.use_simotm in { 'RGBT', 'RGBRGB6C'}:
                 ratio_m=2.0
+            elif self.use_simotm == 'RGBTD':
+                ratio_m=3.0
 
             b += im.nbytes * ratio_m
             if not os.access(Path(im_file).parent, os.W_OK):
@@ -364,6 +433,8 @@ class BaseDataset(Dataset):
             ratio_m =1.0
             if self.use_simotm in { 'RGBT', 'RGBRGB6C'}:
                 ratio_m=2.0
+            elif self.use_simotm == 'RGBTD':
+                ratio_m=3.0
             b += im.nbytes * ratio**2 *ratio_m
 
         mem_required = b * self.ni / n * (1 + safety_margin)  # GB required to cache dataset into RAM
