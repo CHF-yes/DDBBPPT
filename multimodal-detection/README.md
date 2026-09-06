@@ -134,6 +134,40 @@ print(ultralytics.__file__)                 # 应显示 ...\code\vendor\ultralyt
 3. vendor 目录属于**交付物**（半决赛要交代码），改动历史可写入各模型 README；
 4. 想恢复官方行为：删掉 sys.path 注入即回到 pip 版，无需卸载/重装。
 
+## 服务器部署环境
+
+推荐 Linux + conda；依赖清单见 **`deploy_requirements.txt`**（与本地 EFYOLO 实测版本逐项对齐）。
+
+```bash
+# 1. 环境
+conda create -n EFYOLO python=3.12 -y && conda activate EFYOLO
+
+# 2. GPU 版 PyTorch（cu118 已验证；驱动新可换 cu124/cu128）
+pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu118
+
+# 3. 其余依赖
+pip install -r deploy_requirements.txt
+
+# 4. 验证
+python -c "import torch,ultralytics; print(torch.cuda.is_available(), ultralytics.__version__)"
+```
+
+**硬件建议**：GPU ≥16G 显存（32G 最佳，三模态 yolo11m @1024 + batch8 约需 10~20G）；CPU ≥8 核；内存 ≥32G；磁盘 ≥50G（数据 + runs 产物）。
+
+**运行前准备**（详见 MISSING_FILES.md）：
+```bash
+export MULTIMODAL_DATA_ROOT=/path/to/data   # 含 visible/ infrared/ depth/ labels/
+# 权重（直连慢时用镜像）：
+wget -O yolo11s.pt https://gh-proxy.com/https://github.com/ultralytics/assets/releases/download/v8.4.0/yolo11s.pt
+```
+
+**流程**：`python common/scan_data.py --root $MULTIMODAL_DATA_ROOT --out data.yaml`
+→ `python common/split_data.py --root $MULTIMODAL_DATA_ROOT --ratios 0.8,0.1,0.1 --seed 42 --out splits`
+→ `python 基线模型1/main.py train --data-yaml splits/data.yaml --weights yolo11s.pt`
+→ 产物在 `runs/<key>/train/weights/`（评估优先 `best.pt`）。
+
+> 多卡：`models_config.py` 的 `device: "0"` 改为 `"0,1"` 即走 DDP。内网无外网时请提前离线准备 conda 包、权重与数据。
+
 ## 进阶提示（实验模型1 起点）
 - 参考竞赛细则「解题思路」：数据增强；抽取网络特征；合理超参 + 自划验证集。
 - 输出要求：每图同名 txt、`class_id cx cy w h confidence`、conf 缺失即无效、每图≤100 框。

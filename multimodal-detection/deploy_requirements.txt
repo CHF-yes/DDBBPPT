@@ -1,0 +1,37 @@
+# ============================================================
+# multimodal-detection 服务器部署依赖清单（与本地 EFYOLO 实测版本一致）
+#
+# 安装顺序（务必按此）：
+#   1) 创建环境:            conda create -n EFYOLO python=3.12 -y && conda activate EFYOLO
+#   2) 装 GPU 版 PyTorch:    pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu118
+#                           （cu118 已验证可跑 RTX 40 系/A100 等；驱动较新可换 cu124/cu128）
+#   3) 装其余依赖:           pip install -r deploy_requirements.txt
+#   4) 验证:                 python -c "import torch,ultralytics; print(torch.cuda.is_available(), ultralytics.__version__)"
+#
+# 注意: torch/torchvision 的 +cu118 后缀无法从默认 PyPI 安装，必须走上面第 2 步的
+#       --index-url；因此本文件不含 torch/torchvision 之外的版本锁定。
+# ============================================================
+
+# ---- 深度学习框架核心（由第 2 步安装，勿从本文件重装）----
+# torch==2.5.1+cu118
+# torchvision==0.20.1+cu118
+
+# ---- 检测框架 ----
+ultralytics==8.4.138          # 必须 >=8.4.138；建议锁定，防止行为漂移
+ultralytics-thop==2.1.6
+
+# ---- 图像 / 数值 ----
+opencv-python==5.0.0
+numpy==2.5.2
+pillow==12.3.0
+
+# ---- 数据 / 科学计算 ----
+PyYAML==6.0.3
+requests==2.34.2
+tqdm>=4.66
+matplotlib==3.11.1
+scipy>=1.13
+
+# ---- 可选（仅对齐诊断/可视化增强时用，训练推理可省略）----
+# pandas>=2.2
+# seaborn>=0.13
