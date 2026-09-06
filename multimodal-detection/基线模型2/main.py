@@ -82,7 +82,7 @@ def cmd_train(args):
     forward_fn = lambda net, inputs: net(inputs["img"])   # noqa: E731  内部网络直前向
     TL.train_custom(net, train_samples, val_samples, cfg,
                     build_batch, forward_fn, out_dir=args.out,
-                    build_val_batch=build_val_batch)
+                    build_val_batch=build_val_batch, dataset_mode="5ch")
 
 
 def cmd_predict(args):

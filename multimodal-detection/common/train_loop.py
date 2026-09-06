@@ -26,6 +26,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader, Dataset
 
 import models_config as MC
 from common import dataset as DS
@@ -69,14 +70,79 @@ def make_batch_dict(chw_list: List[np.ndarray], boxes_list: List[Optional[np.nda
 
 
 def move_to_device(x, device):
-    """递归把 dict/tensor 迁移到 device（inputs 与 batch 通用）。"""
+    """递归把 dict/numpy/tensor 迁移到 device（inputs 与 batch 通用）。"""
     if isinstance(x, dict):
         return {k: move_to_device(v, device) for k, v in x.items()}
     if isinstance(x, (list, tuple)):
         return type(x)(move_to_device(v, device) for v in x)
     if isinstance(x, torch.Tensor):
         return x.to(device, non_blocking=True)
+    if isinstance(x, np.ndarray):
+        return torch.from_numpy(np.ascontiguousarray(x)).float().to(device)
     return x
+
+
+class MultiSampleDataset(Dataset):
+    """把样本列表包装为 torch Dataset；__getitem__ 在 DataLoader **worker 进程**中
+    执行"读图 + 一致性增强 + 拼装"，实现多进程读图预取。
+
+    支持两种输入模式：
+      "5ch"   ：基线2 —— DS.build_consistent_aug_5ch → (5,H,W) 单输入
+      "three" ：实验1 —— dataset_adapter.build_model_inputs → (rgb, ir, depth)
+    配置全部为可 pickle 的 dataclass/元组，兼容 Linux fork / Windows spawn。
+    """
+
+    def __init__(self, samples, mode="5ch", target_size=(1024, 1024),
+                 aug=None, depth_shift=(0, 0), preprocess=None,
+                 augment=True, seed=0):
+        self.samples = list(samples)
+        self.mode = mode
+        self.target_size = tuple(target_size)
+        self.aug = aug
+        self.depth_shift = tuple(depth_shift)
+        self.preprocess = preprocess
+        self.augment = bool(augment)
+        self.seed = int(seed)
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        s = self.samples[idx]
+        rng_seed = (self.seed + idx * 7919) % (1 << 31)   # 每样本独立种子（可复现）
+        if self.mode == "5ch":
+            chw, boxes, stem = DS.build_consistent_aug_5ch(
+                s, target_size=self.target_size,
+                aug=self.aug if self.augment else None,
+                depth_shift=self.depth_shift, preprocess=self.preprocess,
+                seed=rng_seed)
+            return {"img": chw}, boxes, stem
+        # "three"：实验1 三路输入（调用方须已注入 实验模型1 目录到 sys.path）
+        import dataset_adapter as DA
+        rgb, ir, dep, boxes, stem = DA.build_model_inputs(
+            s, imgsz=self.target_size,
+            aug=self.aug if self.augment else None,
+            depth_shift=self.depth_shift, preprocess=self.preprocess,
+            seed=rng_seed, to_tensor=False)
+        return {"rgb": rgb, "ir": ir, "depth": dep}, boxes, stem
+
+
+def collate_multimodal(items):
+    """[(model_inputs_dict, boxes, stem), ...] → (inputs, batch)。
+    batch 与 make_batch_dict 同构（cls/bboxes/batch_idx/ori_shape/imgsz）。"""
+    if not items:
+        return {}, {}
+    first = items[0][0]
+    key0 = next(iter(first))
+    chw_list = [it[0][key0] for it in items]     # 任一通道张量定 H/W（5ch: img；three: rgb）
+    boxes_list = [it[1] for it in items]
+    stems = [it[2] for it in items]
+    batch = make_batch_dict(chw_list, boxes_list, stems,
+                            (chw_list[0].shape[1], chw_list[0].shape[2]))
+    inputs = {k: np.stack([it[0][k] for it in items], axis=0) for k in first}
+    # 统一转 torch float32：模型前向/设备迁移都按 tensor 处理
+    inputs = {k: torch.from_numpy(np.ascontiguousarray(v)).float() for k, v in inputs.items()}
+    return inputs, batch
 
 
 # ------------------------------------------------------------
@@ -95,6 +161,8 @@ def train_custom(
     build_val_batch: Optional[Callable] = None,  # 无增强的 val 构建器；None 时用 build_batch
     conf_thres: float = 0.25,
     iou_nms: float = 0.7,
+    use_dataloader: bool = True,     # True: DataLoader 多进程读图(num_workers=h.workers)
+    dataset_mode: str = "5ch",       # "5ch"(基线2) | "three"(实验1)
 ):
     """
     多模态自定义训练循环（基线2/实验1 共用）。
@@ -135,9 +203,34 @@ def train_custom(
         acc: Dict[str, float] = {}
         n_batches = 0
 
+        # 多进程预取 DataLoader（worker 内读图+增强）；workers=0 时退回同步 build_batch
+        dl_iter = None
+        if use_dataloader and int(getattr(h, "workers", 0) or 0) > 0:
+            ds = MultiSampleDataset(
+                order, mode=dataset_mode, target_size=(h.imgsz, h.imgsz),
+                aug=h.aug,
+                depth_shift=(h.depth_shift_x, h.depth_shift_y),
+                preprocess=h.preprocess, augment=True, seed=h.seed + epoch)
+            dl = DataLoader(ds, batch_size=h.batch, shuffle=False,
+                            num_workers=int(h.workers),
+                            collate_fn=collate_multimodal,
+                            drop_last=False,
+                            persistent_workers=int(h.workers) > 0)
+            dl_iter = iter(dl)
+            print(f"[{cfg.key}] DataLoader 多进程读图: workers={h.workers} "
+                  f"mode={dataset_mode}")
+        else:
+            print(f"[{cfg.key}] 同步单进程读图 (workers={getattr(h, 'workers', 0)})")
+
         for i in range(0, len(order), h.batch):
-            chunk = order[i:i + h.batch]
-            inputs, batch = build_batch(chunk, rng)
+            if dl_iter is not None:
+                try:
+                    inputs, batch = next(dl_iter)
+                except StopIteration:
+                    break
+            else:
+                chunk = order[i:i + h.batch]
+                inputs, batch = build_batch(chunk, rng)
             inputs = move_to_device(inputs, device)          # rgb/ir/depth 等统一迁 GPU
             batch = {k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v)
                      for k, v in batch.items()}              # cls/bboxes/batch_idx/img

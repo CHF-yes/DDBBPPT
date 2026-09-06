@@ -102,7 +102,7 @@ def cmd_train(args):
 
     TL.train_custom(model, train_samples, val_samples, cfg,
                     build_batch, forward_fn, out_dir=args.out,
-                    build_val_batch=build_val_batch)
+                    build_val_batch=build_val_batch, dataset_mode="three")
 
 
 def cmd_predict(args):
