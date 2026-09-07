@@ -34,8 +34,9 @@ from ultralytics import YOLO                                     # vendor 版
 from ultralytics.nn.modules import Conv, C2f, Concat            # 复用官方组件
 from ultralytics.nn.modules.head import Detect                  # 复用官方检测头
 
-# yolo11 backbone 输出 P3/P4/P5 的模块索引（yolo11.yaml 结构，n/s/m/l/x 一致）
-_IDX_P3, _IDX_P4, _IDX_P5 = 4, 6, 9
+# yolo11 backbone 输出 P3/P4/P5 的模块索引（yolo11.yaml：0-P1 1-P2 3-P3 5-P4 7-P5 9-SPPF 10-C2PSA）
+# 官方 neck 的 P5 输入是 **C2PSA(10)** 而非 SPPF(9)；backbone 切片须含 C2PSA，P5 从 10 取。
+_IDX_P3, _IDX_P4, _IDX_P5 = 4, 6, 10
 
 
 class AuxStream(nn.Module):
@@ -131,7 +132,7 @@ class Experiment1Model(nn.Module):
                  dropout_p: float = 0.2):
         super().__init__()
         base = YOLO(weights).model                       # vendor 加载（含 COCO 权重）
-        self.backbone = base.model[:_IDX_P5 + 1]         # 0..9 主干(含 SPPF)
+        self.backbone = base.model[:_IDX_P5 + 1]         # 0..10 主干(含 SPPF + C2PSA)
 
         # backbone 输出 hooks：收集 P3/P4/P5
         self._feats: dict = {}

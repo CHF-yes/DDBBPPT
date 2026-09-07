@@ -34,6 +34,8 @@ def cmd_train(args):
     from ultralytics import YOLO
     cfg = MC.BASELINE1_3CH
     kw = TR.build_train_kwargs(cfg)
+    if args.imgsz:
+        kw["imgsz"] = int(args.imgsz)
     data_root = Path(args.data_root) if args.data_root else MC.DATA_ROOT
     kw["data"] = args.data_yaml or str(data_root / "data.yaml")
     kw["model"] = cfg.hyper.pretrained_weights
@@ -66,6 +68,7 @@ def main():
     ap.add_argument("--images", default=None)
     ap.add_argument("--data-yaml", default=None)
     ap.add_argument("--data-root", default=None, help="数据根目录（默认 MC.DATA_ROOT / $MULTIMODAL_DATA_ROOT）")
+    ap.add_argument("--imgsz", type=int, default=None, help="训练分辨率快捷覆盖（如 640/1024）")
     args = ap.parse_args()
     {"config": cmd_config, "train": cmd_train, "predict": cmd_predict}[args.task](args)
 

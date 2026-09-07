@@ -163,6 +163,7 @@ def train_custom(
     iou_nms: float = 0.7,
     use_dataloader: bool = True,     # True: DataLoader 多进程读图(num_workers=h.workers)
     dataset_mode: str = "5ch",       # "5ch"(基线2) | "three"(实验1)
+    imgsz_override: Optional[int] = None,   # 快捷覆盖训练分辨率（None=用 cfg.hyper.imgsz）
 ):
     """
     多模态自定义训练循环（基线2/实验1 共用）。
@@ -170,6 +171,7 @@ def train_custom(
     """
     from common import evaluate as EV
     h = cfg.hyper
+    isz = int(imgsz_override or h.imgsz)   # 训练/验证分辨率（--imgsz 可覆盖）
     device = torch.device(h.device if h.device != "0" else "cuda:0")
     has_cuda = torch.cuda.is_available() and str(device).startswith("cuda")
     device = torch.device("cuda:0" if has_cuda else "cpu")
@@ -207,7 +209,7 @@ def train_custom(
         dl_iter = None
         if use_dataloader and int(getattr(h, "workers", 0) or 0) > 0:
             ds = MultiSampleDataset(
-                order, mode=dataset_mode, target_size=(h.imgsz, h.imgsz),
+                order, mode=dataset_mode, target_size=(isz, isz),
                 aug=h.aug,
                 depth_shift=(h.depth_shift_x, h.depth_shift_y),
                 preprocess=h.preprocess, augment=True, seed=h.seed + epoch)
@@ -251,7 +253,7 @@ def train_custom(
         map_res = {}
         if samples_val:
             map_res = EV.evaluate_mAP(
-                model, samples_val, h.imgsz,
+                model, samples_val, isz,
                 build_val_batch or build_batch, forward_fn,
                 nc=cfg.class_num, conf_thres=conf_thres, iou_nms=iou_nms,
                 device=str(device))

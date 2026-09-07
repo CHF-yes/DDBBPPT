@@ -72,7 +72,8 @@ def cmd_train(args):
         print(f"[实验模型1] 无现成 val，从 train 抽出 {k} 组作验证集")
     print(f"[实验模型1] train={len(train_samples)} val={len(val_samples)}")
 
-    imgsz = (h.imgsz, h.imgsz)
+    imgsz = (args.imgsz or h.imgsz, args.imgsz or h.imgsz)
+    isz = int(args.imgsz or h.imgsz)
 
     aug_cfg = h.aug                      # 统一增强配置（models_config.AugmentParams）
 
@@ -102,7 +103,8 @@ def cmd_train(args):
 
     TL.train_custom(model, train_samples, val_samples, cfg,
                     build_batch, forward_fn, out_dir=args.out,
-                    build_val_batch=build_val_batch, dataset_mode="three")
+                    build_val_batch=build_val_batch, dataset_mode="three",
+                    imgsz_override=isz)
 
 
 def cmd_predict(args):
@@ -118,6 +120,7 @@ def main():
     ap.add_argument("--out", default=None)
     ap.add_argument("--data-yaml", default=None)
     ap.add_argument("--data-root", default=None, help="数据根目录（默认 MC.DATA_ROOT / $MULTIMODAL_DATA_ROOT）")
+    ap.add_argument("--imgsz", type=int, default=None, help="训练分辨率快捷覆盖（如 640/1024）")
     args = ap.parse_args()
     {"config": cmd_config, "selfcheck": cmd_selfcheck,
      "train": cmd_train, "predict": cmd_predict}[args.task](args)
