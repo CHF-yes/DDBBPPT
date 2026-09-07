@@ -51,6 +51,13 @@ def ensure_detect_classes(model, class_num: int):
         head.one2one_cv3 = copy.deepcopy(head.cv3)
     if hasattr(head, "bias_init"):
         head.bias_init()
+    # P1-8: 外层 DetectionModel.nc / yaml["nc"] 同步（否则外层仍是 COCO 80 类，
+    # 会带偏日志/校验/导出/checkpoint 元数据等依赖 model.nc 的逻辑）
+    if hasattr(outer, "nc"):
+        outer.nc = class_num
+    yml = getattr(outer, "yaml", None)
+    if isinstance(yml, dict):
+        yml["nc"] = class_num
     print(f"[model_utils] Detect 头已真正重建为 {class_num} 类 "
           f"(cv3 各尺度输出 {class_num})")
     return model

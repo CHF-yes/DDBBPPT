@@ -124,23 +124,31 @@ def depth_mm_to_scaled(depth_mm: np.ndarray, mode: str = "mm_unit",
 
 
 def build_input_channels(sample_img_paths: dict, in_channels: int,
-                         target_size=None, depth_shift=(0, 0), preprocess=None):
+                         target_size=None, depth_shift=(0, 0), preprocess=None,
+                         align=None):
     """
     把一个样本的 {rgb,ir,depth} 文件路径组装成 (C,H,W) float32 输入给网络做前向。
     - in_channels==3 : 只用 RGB(可选缩小) crop BGR 三通道, 顺序 BGR(与 torchpretrained 一致)
     - in_channels==5 : RGB + IR 单通道 + Depth 归一化单通道
+    - in_channels==6 : RGB + IR + Depth 双通道[距离,有效掩码]（Step1）
     - depth_shift: (dx,dy) 固定平移,把 depth warp 到 RGB 坐标系(对齐, 标签不动)
+    - align: AlignConfig；若提供则优先于 depth_shift，内部按**原始图宽**计算平移量
+             （P1-6: -22px@1920 为原图坐标系实测值，不能按目标画布宽度换算）
     - preprocess: PreprocessParams（赛题数据未归一化；三种模态值域策略，默认 div255/mm_unit）
-    返回 (np.ndarray chw) 颜色通道数=3时即 [3,H,W]，5即 [5,H,W]。
+    返回 (np.ndarray chw) 颜色通道数=3时即 [3,H,W]，5即 [5,H,W]，6即 [6,H,W]。
     图像统一 resize 到 target_size(H,W)；未给则用三者中的最大。
+    注意：本函数是"直接拉伸 resize"的旧路径（推理请优先用 build_consistent_aug_5ch
+    的 letterbox 路径，保证与训练几何一致——P1-9）。
     """
-    from .multimodal_augment import align_depth
+    from .multimodal_augment import align_depth, effective_depth_shift
     from models_config import PreprocessParams
     import cv2
     pp = preprocess if preprocess is not None else PreprocessParams()
     rgb = read_rgb_bgr(sample_img_paths["rgb"])      # (H,W,3) BGR（OpenCV 读取）
     rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)       # 统一 RGB：预训练 backbone 惯例
     H, W = rgb.shape[:2]
+    if align is not None:
+        depth_shift = effective_depth_shift(align, W)   # 按原图宽换算（P1-6）
     if in_channels == 3:
         ch = norm_array(rgb, pp.rgb_mode).transpose(2, 0, 1)   # (3,H,W) RGB
     else:
@@ -151,11 +159,12 @@ def build_input_channels(sample_img_paths: dict, in_channels: int,
         dep_sc = depth_mm_to_scaled(dep, pp.depth_mode,
                                     pp.depth_scale_mm, pp.depth_invalid_zero)
         dep_mask = (dep > 1).astype(np.float32)       # Step1: 有效掩码(可信度)
-        # 统一尺寸(resize 三书记一致既保证空间对齐保留——题目已经对齐，此处只顺引)
+        # 统一尺寸：距离与掩码均用 NEAREST，避免无效 0 与有效值线性混合（P1-15）
         if (ir.shape[0], ir.shape[1]) != (H, W):
             ir = cv2.resize(ir, (W, H), interpolation=cv2.INTER_LINEAR)
-            dep_sc = cv2.resize(dep_sc, (W, H), interpolation=cv2.INTER_LINEAR)
+            dep_sc = cv2.resize(dep_sc, (W, H), interpolation=cv2.INTER_NEAREST)
             dep_mask = cv2.resize(dep_mask, (W, H), interpolation=cv2.INTER_NEAREST)
+            dep_sc[dep_mask == 0] = 0.0               # 无效区距离保持 0
 
         rf = norm_array(rgb, pp.rgb_mode)
         r, g, b = rf[:, :, 0], rf[:, :, 1], rf[:, :, 2]
@@ -168,10 +177,14 @@ def build_input_channels(sample_img_paths: dict, in_channels: int,
     if target_size is not None:
         Ht, Wt = target_size
         interp = [cv2.INTER_LINEAR] * ch.shape[0]
+        if in_channels >= 5:
+            interp[-2] = cv2.INTER_NEAREST           # 距离通道最近邻（P1-15）
         if in_channels == 6:
-            interp[-1] = cv2.INTER_NEAREST            # 掩码用最近邻，防伪边界
+            interp[-1] = cv2.INTER_NEAREST           # 掩码最近邻
         ch = np.array([cv2.resize(ch[c], (Wt, Ht), interpolation=interp[c])
                        for c in range(ch.shape[0])])
+        if in_channels == 6:
+            ch[-2][ch[-1] == 0] = 0.0                # 无效区距离归零
     return ch
 
 
@@ -197,22 +210,23 @@ def write_pred_txt(path, boxes_n5, confs=None, class_of_line_first=True) -> None
     """
     写预测结果 txt。形如每行: cls cx cy w h conf。
     boxes_n5: (N,5) cls,cx,cy,w,h(0-1)
-    confs  : (N,) 或 None(缺失则跳过 conf)
+    confs  : (N,) — **必填**（赛题格式要求 confidence，缺失该预测无效——P2-13）
     每张测试图一个同名 txt，无目标也须写空后缀文件(自动 create)。
     """
+    if confs is None:
+        raise ValueError(
+            "write_pred_txt 必须提供 confs（赛题预测格式: class cx cy w h confidence，"
+            "缺 confidence 的预测无效）")
+    confs = np.asarray(confs, dtype=np.float32).reshape(-1)
     if boxes_n5.size == 0:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("", encoding="utf-8")
         return
     lines = []
-    has_conf = confs is not None
-    for i, row in enumerate(boxes_n5):
+    for i, row in enumerate(np.asarray(boxes_n5).reshape(-1, 5)):
         cls, cx, cy, w, h = row
-        if has_conf and i < len(confs):
-            lines.append(
-                f"{int(cls)} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f} {confs[i]:.6f}")
-        else:
-            lines.append(f"{int(cls)} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}")
+        conf = confs[i] if i < len(confs) else 0.0
+        lines.append(f"{int(cls)} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f} {float(conf):.6f}")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -240,10 +254,8 @@ class MultimodalDetectionDataset:
         self.cfg = cfg
         self.imgsz = imgsz
         self.transform = transform
-        # 从统一配置读取 depth 固定对齐（按分辨率等比缩放的可插拔 AlignConfig）
-        from .multimodal_augment import effective_depth_shift
-        self.depth_shift = effective_depth_shift(getattr(cfg.hyper, "align", None),
-                                                 int(imgsz[0]))
+        # 可插拔 AlignConfig（对齐量由 build_input_channels 按**原图宽**换算 —— P1-6）
+        self.align = getattr(cfg.hyper, "align", None)
         # 数据预处理开关（赛题数据未归一化；值域策略可配置）
         self.preprocess = getattr(cfg.hyper, "preprocess", None)
 
@@ -254,7 +266,7 @@ class MultimodalDetectionDataset:
         s = self.samples[idx]
         chw = build_input_channels(s.img, self.cfg.in_channels,
                                    target_size=self.imgsz,
-                                   depth_shift=self.depth_shift,
+                                   align=self.align,
                                    preprocess=self.preprocess)
         lab = read_label_txt(s.label) if s.label else np.empty((0, 5), np.float32)
         if self.transform is not None:
@@ -285,17 +297,18 @@ def load_dataset_cfg(cfg: "MC.ModelConfig", split: str = "train"):
 def build_consistent_aug_5ch(
     sample,                        # scan_data.Sample: img={rgb,ir,depth}, label
     target_size=(1024, 1024),
-    aug=None,                      # AugmentParams 统一增强配置；None=仅同步 letterbox(验证)
-    depth_shift=(0, 0),            # 固定平移对齐(只动 depth；标签锚定 RGB)
+    aug=None,                      # AugmentParams 统一增强配置；None=仅同步 letterbox(验证/推理)
+    depth_shift=(0, 0),            # 固定平移对齐(只动 depth；标签锚定 RGB)（align 优先）
+    align=None,                    # AlignConfig：提供时按**原图宽**换算平移量（P1-6）
     preprocess=None,               # PreprocessParams 值域开关（赛题数据未归一化）
     in_channels: int = 6,          # 5=无掩码(消融对照)；6=[R,G,B,IR,D,mask]
     seed: Optional[int] = None,
     to_tensor: bool = False,
 ):
     """
-    三模态「一致性增强 + 通道拼装」的单一入口，供自定义训练/验证循环使用。
+    三模态「一致性增强 + 通道拼装」的单一入口，供自定义训练/验证/推理循环使用。
 
-    步骤：读 RGB/IR/Depth 三张对齐原图 → [Depth 固定平移对齐] → 按 aug 做
+    步骤：读 RGB/IR/Depth 三张对齐原图 → 统一 RGB 序 → [Depth 固定平移对齐] → 按 aug 做
     **三模态全覆盖一致性增强**(三图同步几何 + RGB-HSV/IR 增益/Depth 噪声与平移)
     → 拼成 (C,H,W) float32 张量。
 
@@ -304,12 +317,17 @@ def build_consistent_aug_5ch(
       boxes_out: (N,5) cls,cx,cy,w,h(归一，参考 letterbox 后画布)；无目标为 None
       stem    : 样本基名
     """
-    from .multimodal_augment import consistent_augment_full, align_depth
+    from .multimodal_augment import consistent_augment_full, align_depth, effective_depth_shift
     from models_config import PreprocessParams
+    import cv2
     import numpy as np
     pp = preprocess if preprocess is not None else PreprocessParams()
 
     rgb = read_rgb_bgr(sample.img["rgb"])                  # (H,W,3) BGR
+    rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)             # P1-7: 全链路统一 RGB 序
+    H, W = rgb.shape[:2]
+    if align is not None:
+        depth_shift = effective_depth_shift(align, W)      # P1-6: 按原图宽换算
     # 校验三模态齐全
     for mod, fn in (("ir", read_ir_gray), ("depth", read_depth_mm)):
         if sample.img.get(mod) is None:
@@ -324,11 +342,11 @@ def build_consistent_aug_5ch(
         rgb, ir, dep_mm, boxes_norm,
         new_size=target_size, aug=aug, seed=seed)
 
-    rf = norm_array(rgb_o, pp.rgb_mode)                     # letterboxed B,G,R 按模式
+    rf = norm_array(rgb_o, pp.rgb_mode)                     # (H,W,3) RGB 序（P1-7）
     if rf.shape[2] == 3:
-        b = rf[:, :, 0]
+        r = rf[:, :, 0]
         g = rf[:, :, 1]
-        r = rf[:, :, 2]
+        b = rf[:, :, 2]
     else:
         r = g = b = rf
     irn = norm_array(ir_o, pp.ir_mode)                       # 单通道亮度(温度归一)

@@ -31,6 +31,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import models_config as MC                                        # noqa: E402
 from ultralytics import YOLO                                     # vendor 版
 from ultralytics.nn.modules import Conv, C2f, Concat            # 复用官方组件
 from ultralytics.nn.modules.head import Detect                  # 复用官方检测头
@@ -74,7 +75,11 @@ class ModalDropout(nn.Module):
         self.p = float(p)
 
     def _drop(self, feats):
-        return [torch.zeros_like(f) if torch.rand(1).item() < self.p else f for f in feats]
+        # P2-11: 每个模态整路一次采样（不是每个尺度独立掷骰）——
+        # 覆盖「仅IR失效/仅Depth失效/双失效/齐全」四种**全局**模态态
+        if torch.rand(1).item() < self.p:
+            return [torch.zeros_like(f) for f in feats]
+        return feats
 
     def forward(self, feats_ir, feats_dep):
         if not self.training or self.p <= 0.0:
@@ -191,6 +196,8 @@ class Experiment1Model(nn.Module):
                  aux_heads: bool = True,  # Step3 每模态辅助头(中心分类)
                  ):
         super().__init__()
+        # P2-16: 权重解析为绝对路径（离线环境禁止联网下载兜底）
+        weights = str(MC.resolve_pretrained_weights(weights))
         base = YOLO(weights).model                       # vendor 加载（含 COCO 权重）
         self.backbone = base.model[:_IDX_P5 + 1]         # 0..10 主干(含 SPPF + C2PSA)
 

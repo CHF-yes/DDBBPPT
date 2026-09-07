@@ -31,17 +31,17 @@ from common import dataset as DS                 # noqa: E402
 
 
 def build_5ch_from_sample_paths(paths: dict, imgsz=(1024, 1024),
-                                depth_shift=None) -> np.ndarray:
+                                align=None, in_channels: int = 6) -> np.ndarray:
     """
     入口：给样本三模态路径(如 {"rgb":..., "ir":..., "depth":...}) + 目标尺寸，
-    返回 (5,H,W) float32 归一化张量（RGB·IR·Depth）。见 common.dataset.build_input_channels。
-    depth_shift: 固定平移对齐(dx,dy)；None 时自动读 models_config 的 depth_shift_x/y。
+    返回 (C,H,W) float32 归一化张量（默认 6ch=[R,G,B,IR,D,mask]；5ch 供无掩码消融）。
+    align: AlignConfig；None 时自动读 models_config 的 BASELINE2_5CH.hyper.align；
+          内部按**原图宽**换算平移量（P1-6/P1-14：不再走裸 depth_shift_x/y）。
     """
-    if depth_shift is None:
-        h = MC.BASELINE2_5CH.hyper
-        depth_shift = (h.depth_shift_x, h.depth_shift_y)
-    return DS.build_input_channels(paths, 5, target_size=imgsz,
-                                   depth_shift=depth_shift)
+    if align is None:
+        align = MC.BASELINE2_5CH.hyper.align
+    return DS.build_input_channels(paths, in_channels, target_size=imgsz,
+                                   align=align)
 
 
 def preview_sample(data_root: Path, stem: str) -> None:

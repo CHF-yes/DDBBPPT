@@ -23,7 +23,6 @@ for p in (str(_CODE_ROOT), str(_CODE_ROOT / "vendor"), str(_DIR)):
 
 import models_config as MC                      # noqa: E402
 from common import trainer as TR                # noqa: E402
-from common.multimodal_augment import effective_depth_shift  # noqa: E402
 
 
 def cmd_config(args):
@@ -61,13 +60,17 @@ def cmd_train(args):
                                  nc=cfg.class_num,
                                  mega=h.mega, aux_heads=h.aux_heads)
 
-    # --- 数据：扫描根目录；无 val 时从 train 抽出 10% 作 val ---
+    # --- 数据：自动布局探测扫描；无 val 时从 train 抽出 10% 作 val ---
     root = Path(args.data_root) if args.data_root else MC.DATA_ROOT
     if not root.exists():
         raise SystemExit(f"[实验模型1] 数据根不存在: {root}（先设 MULTIMODAL_DATA_ROOT 或 DATA_ROOT）")
-    scanned = SD.scan_samples(root)
+    scanned = SD.scan_samples_auto(root)          # P0-5: 自动回退 V/T/D layout 扫描
     train_samples = scanned.get("train", []) or next(iter(scanned.values()))
     val_samples = scanned.get("val", []) or scanned.get("validation", [])
+    if not train_samples:
+        raise SystemExit(
+            f"[实验模型1] 扫描到 0 个训练样本（root={root}，splits={list(scanned)}）。"
+            f"请检查数据根路径/布局（支持 Train/V/T/D/labels_multi 布局）。")
     if not val_samples and train_samples:
         rng = random.Random(h.seed)
         order = list(train_samples); rng.shuffle(order)
@@ -87,7 +90,7 @@ def cmd_train(args):
             rgb, ir, dep, boxes, stem = DA.build_model_inputs(
                 s, imgsz=imgsz,
                 aug=aug_cfg if augment else None,
-                depth_shift=effective_depth_shift(h.align, imgsz[0]),
+                align=h.align,                       # P1-6: 对齐量按原图宽换算
                 preprocess=h.preprocess,
                 seed=rng.randrange(1 << 31), to_tensor=False)
             rgb_l.append(rgb); ir_l.append(ir); dep_l.append(dep)
@@ -112,9 +115,68 @@ def cmd_train(args):
 
 
 def cmd_predict(args):
-    raise SystemExit(
-        "[实验模型1] 推理需先完成训练；结构见 model_builder.Experiment1Model，"
-        "输出后处理（NMS→赛题 txt 格式）参考 common.inference。")
+    """实验模型1 三路推理（P0-3）：扫描测试样本 → rgb/ir/depth 三路前向 → NMS → 赛题 txt。"""
+    import numpy as np
+    import torch
+    import model_builder as MB
+    import dataset_adapter as DA
+    from common import scan_data as SD
+    from common import train_loop as TL
+    from common.evaluate import decode_preds
+    from common.inference import _pick_out_dir
+
+    cfg = MC.EXPERIMENT1
+    h = cfg.hyper
+    isz = int(args.imgsz or h.imgsz)                       # P2-12: 预测也读 --imgsz
+
+    # P0-4: 结构从预训练构建（保证辅助流/MEGA/Detect 结构与训练一致），再回填 checkpoint
+    model = MB.build_experiment1(weights=h.pretrained_weights, nc=cfg.class_num,
+                                 mega=h.mega, aux_heads=h.aux_heads)
+    if args.weights:
+        TL.load_custom_checkpoint(args.weights, model, strict=False)
+    model.eval()
+    dev = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    model = model.to(dev)
+
+    root = Path(args.data_root) if args.data_root else MC.DATA_ROOT
+    if not root.exists():
+        raise SystemExit(f"[实验模型1] 数据根不存在: {root}")
+    scanned = SD.scan_samples_auto(root)                   # P0-5: 自动布局回退
+    samples = (scanned.get("test") or scanned.get("val")
+               or scanned.get("train") or next(iter(scanned.values()), []))
+    if not samples:
+        raise SystemExit(f"[实验模型1 predict] 扫描到 0 个样本（root={root}），无法预测")
+
+    out_dir = Path(args.out) if args.out else _pick_out_dir(cfg.key)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    n_written = 0
+    with torch.no_grad():
+        for s in samples:
+            rgb, ir, dep, _boxes, stem = DA.build_model_inputs(
+                s, imgsz=(isz, isz), aug=None,
+                align=h.align,                             # P1-6: 对齐按原图宽换算
+                preprocess=h.preprocess, to_tensor=False)
+            rgb_t = torch.from_numpy(np.ascontiguousarray(rgb)).float().unsqueeze(0).to(dev)
+            ir_t = torch.from_numpy(np.ascontiguousarray(ir)).float().unsqueeze(0).to(dev)
+            dep_t = torch.from_numpy(np.ascontiguousarray(dep)).float().unsqueeze(0).to(dev)
+            out = model(rgb_t, ir_t, dep_t)
+            det = decode_preds(out, cfg.class_num,
+                               conf_thres=0.25, iou_thres=0.7)[0]
+            det = det.cpu().numpy() if not isinstance(det, np.ndarray) else det
+            lines = []
+            if len(det):
+                for x1, y1, x2, y2, conf, cls in det[:100]:   # conf 降序已由 NMS 保证
+                    cx = (x1 + x2) / 2 / isz
+                    cy = (y1 + y2) / 2 / isz
+                    w = (x2 - x1) / isz
+                    hh = (y2 - y1) / isz
+                    lines.append(
+                        f"{int(cls)} {cx:.6f} {cy:.6f} {w:.6f} {hh:.6f} {float(conf):.6f}")
+            (out_dir / f"{stem}.txt").write_text(
+                "\n".join(lines) + "\n" if lines else "", encoding="utf-8")
+            n_written += 1
+    print(f"[实验模型1 predict] {n_written} 组样本 -> {out_dir}（含空 txt，≤100 框/图）")
 
 
 def main():

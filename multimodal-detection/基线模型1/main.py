@@ -58,7 +58,9 @@ def cmd_predict(args):
     cfg = MC.BASELINE1_3CH
     data_root = Path(args.data_root) if args.data_root else MC.DATA_ROOT
     images = args.images or str(data_root / "visible")   # 只对可见光目录预测，避免多模态根混跑
-    INF.predict_rgb_ultralytics(args.weights, images, cfg=cfg, imgsz=cfg.hyper.imgsz)
+    # P2-12: 预测也读 --imgsz（不传则用配置默认）
+    INF.predict_rgb_ultralytics(args.weights, images, cfg=cfg,
+                                imgsz=args.imgsz or cfg.hyper.imgsz)
 
 
 def main():

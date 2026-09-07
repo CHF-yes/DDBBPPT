@@ -48,6 +48,31 @@ DATA_ROOT: Path = Path(
     __import__("os").environ.get(_DATA_ROOT_ENV, r"D:\datasets\multimodal_det")
 )
 
+# 预训练权重目录：模型注册表所在目录（code 根）。训练/推理一律解析为绝对路径，
+# 离线竞赛环境禁止 ultralytics 联网下载兜底。
+_CODE_ROOT: Path = Path(__file__).resolve().parent
+
+
+def resolve_pretrained_weights(name) -> Path:
+    """
+    把权重名/路径解析为绝对路径（P2-16）：
+      1) 绝对路径：存在则直接返回，否则报错；
+      2) 相对名（如 "yolo11s.pt"）：优先 code 根（与 models_config.py 同目录），
+         其次当前工作目录；找不到直接 FileNotFoundError —— 禁止触发联网下载。
+    """
+    p = Path(str(name)).expanduser()
+    if p.is_absolute():
+        if not p.exists():
+            raise FileNotFoundError(
+                f"[cfg] 预训练权重不存在: {p}（离线环境禁止联网下载，请检查路径）")
+        return p
+    for cand in (_CODE_ROOT / p, Path.cwd() / p):
+        if cand.exists():
+            return cand.resolve()
+    raise FileNotFoundError(
+        f"[cfg] 找不到预训练权重 {name!r}（已查 code 根 {_CODE_ROOT} 与当前目录）。"
+        f"请把权重放到 code 根或传绝对路径。")
+
 # 每个样本应出现的通道文件名关键字（用于 scan_data 自动配对，可追加别名）
 MODALITY_KEYS = {
     "rgb": ("rgb", "visible", "color"),
@@ -227,35 +252,37 @@ BASELINE1_3CH = ModelConfig(
     data_prep="仅读取 RGB 三通道并归一化；Depth/IR 不参与该版本。",
 )
 
-# ---- 基线模型2：5 通道前期融合（RGB + IR 单通道 + Depth 单通道）----
+# ---- 基线模型2：6 通道早期融合（RGB3 + IR 1 + Depth 2 [距离+掩码]）----
 BASELINE2_5CH = ModelConfig(
     key="baseline2_5ch",
     name="基线模型2",
-    description=("5 通道前期融合：RGB(3)+IR 单通道灰度(1)+Depth 归一化(1)。"
-                 "把三模态在输入端拼接成 5 通道，仅改造首层卷积，最小侵入的融合基线。"),
+    description=("6 通道早期融合：RGB(3)+IR 单通道灰度(1)+Depth 双通道(2)=[归一化距离,有效掩码]。"
+                 "把三模态在输入端拼接成 6 通道，仅改造首层卷积，最小侵入的融合基线。"),
     in_channels=6,
     modality=Modality.RGB_IR_DEPTH,
     fusion=FusionScheme.EARLY,
     enabled=True,
     hyper=HyperParams(pretrained_weights="yolo11s.pt"),
     notes=("首层 Conv3→6 权重初始化：前 3 通道继承预训练 RGB 权重，"
-           "新增通道复制其三通道均值后再随机微调（见实例 model_builder）。"
+           "新增通道复制其三通道均值后再按比例缩放（见实例 model_builder）。"
            "Step1: Depth 双通道=[归一化距离, 有效掩码]；in_channels=5 可作无掩码消融。"),
-    data_prep="RGB/IR 三通道转 8bit；IR 取第 0 通道当单通道灰度；Depth 从 16bit 毫米值缩放至[0,255]。",
+    data_prep="RGB/IR 读图后统一转 RGB 序并归一化；IR 取单通道灰度；Depth 毫米值缩放至[0,1]+有效掩码。",
 )
 
-# ---- 实验模型1：占位（预留进阶改动，本次不落实例）----
+# ---- 实验模型1：RGB 主流 + 轻辅助流 + 分级融合（已落地完整实例）----
 EXPERIMENT1 = ModelConfig(
     key="experiment1",
     name="实验模型1",
-    description=("预留实验版（进阶多模态融合）。具体方案待定——可做三流 backbone、"
-                 "注意力融合/门控、模态 dropout 等。本次仅登记占位，不生成实例代码。"),
-    in_channels=5,
+    description=("RGB 主流(yolo11s) + IR/Depth 轻量辅助流 + P3/P4/P5 分级融合 + ModalDropout "
+                 "+ MEGA 边缘引导注意力 + 每模态辅助头（Step0-4 方案完整实现）。"),
+    in_channels=6,                          # 三路输入总通道：RGB3 + IR1 + Depth2（非单张拼接）
     modality=Modality.RGB_IR_DEPTH,
-    fusion=FusionScheme.MIDFUSION,      # 实际为主干 P3/P4/P5 分级中间融合（见 model_builder）
-    enabled=False,                      # 占位，不落地可运行实例
+    fusion=FusionScheme.MIDFUSION,          # 主干 P3/P4/P5 分级中间融合（见 model_builder）
+    enabled=True,                           # 已落地可运行实例（config/selfcheck/train/predict）
     hyper=HyperParams(pretrained_weights="yolo11s.pt"),
-    notes=("设计稿占位。字段结构与前两者对齐，待方案确定后在 `实验模型1/README.md` 更新并落地。"),
+    notes=("输入为三路 tensor：rgb(B,3,H,W)/ir(B,1,H,W)/depth(B,2,H,W)——"
+           "in_channels=6 仅表示总输入通道数，非单张拼接。"
+           "训练/推理见 实验模型1/main.py；checkpoint 见 common.train_loop.load_custom_checkpoint。"),
 )
 
 _MODELS: List[ModelConfig] = [BASELINE1_3CH, BASELINE2_5CH, EXPERIMENT1]

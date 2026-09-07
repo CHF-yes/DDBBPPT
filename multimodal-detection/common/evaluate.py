@@ -119,9 +119,10 @@ def evaluate_mAP(
             dets = decode_preds(raw, nc, conf_thres, iou_nms)
 
             # GT：batch 内 (cls, xywh 像素) → xyxy+cls
-            cls = batch["cls"].numpy().astype(np.float64)
-            bidx = batch["batch_idx"].numpy().astype(np.int64)
-            xywh = batch["bboxes"].numpy().astype(np.float64)
+            # 注意 batch 已迁到 GPU（可能 cuda）——必须先 detach().cpu() 再 numpy()
+            cls = batch["cls"].detach().cpu().numpy().astype(np.float64)
+            bidx = batch["batch_idx"].detach().cpu().numpy().astype(np.int64)
+            xywh = batch["bboxes"].detach().cpu().numpy().astype(np.float64)
             g_xyxy = np.zeros((len(cls), 5))
             if len(cls):
                 cx, cy, w, h = xywh[:, 0], xywh[:, 1], xywh[:, 2], xywh[:, 3]

@@ -26,7 +26,6 @@ import models_config as MC                  # noqa: E402
 from common import trainer as TR            # noqa: E402
 from common import inference as INF         # noqa: E402
 from common import dataset as DS            # noqa: E402
-from common.multimodal_augment import effective_depth_shift  # noqa: E402
 
 
 def cmd_config(args):
@@ -46,13 +45,17 @@ def cmd_train(args):
                               class_num=cfg.class_num)
     net = wrapper.model                    # 内部 DetectionModel（训练用，勿用 YOLO 包装器）
 
-    # --- 数据：扫描根目录；无 val 时从 train 抽出 10% 作 val（固定 seed 可复现）---
+    # --- 数据：自动布局探测扫描；无 val 时从 train 抽出 10% 作 val（固定 seed 可复现）---
     root = Path(args.data_root) if args.data_root else MC.DATA_ROOT
     if not root.exists():
         raise SystemExit(f"[baseline2] 数据根不存在: {root}（先设 MULTIMODAL_DATA_ROOT 或 DATA_ROOT）")
-    scanned = SD.scan_samples(root)
+    scanned = SD.scan_samples_auto(root)          # P0-5: 自动回退 V/T/D layout 扫描
     train_samples = scanned.get("train", []) or next(iter(scanned.values()))
     val_samples = scanned.get("val", []) or scanned.get("validation", [])
+    if not train_samples:
+        raise SystemExit(
+            f"[baseline2] 扫描到 0 个训练样本（root={root}，splits={list(scanned)}）。"
+            f"请检查数据根路径/布局（支持 Train/V/T/D/labels_multi 布局）。")
     if not val_samples and train_samples:
         rng = random.Random(h.seed)
         order = list(train_samples); rng.shuffle(order)
@@ -72,7 +75,7 @@ def cmd_train(args):
             chw, boxes, stem = DS.build_consistent_aug_5ch(
                 s, target_size=imgsz,
                 aug=aug_cfg if augment else None,
-                depth_shift=effective_depth_shift(h.align, imgsz[0]),
+                align=h.align,                       # P1-6: 对齐量按原图宽换算
                 preprocess=h.preprocess,
                 seed=rng.randrange(1 << 31))
             chw_list.append(chw); boxes_list.append(boxes); stems.append(stem)
@@ -90,12 +93,34 @@ def cmd_train(args):
 
 def cmd_predict(args):
     import model_builder as MB
+    from common import train_loop as TL
+    from common import scan_data as SD
+    from common import inference as INF
     cfg = MC.BASELINE2_5CH
-    m = MB.build_baseline2(weights=args.weights)
-    out = args.out or (MC.DATA_ROOT / "pred_baseline2")
-    # 简化示例：对 dataset_adapter 遍历分组逐个写(空)txt —— 见 common.inference
-    INF.predict_multimodal_custom(m, [], cfg, out_dir=args.out)
-    print(f"[baseline2 predict] 输出目录: {args.out or out}")
+    h = cfg.hyper
+    isz = int(args.imgsz or h.imgsz)                     # P2-12: 预测也读 --imgsz
+
+    # P0-2/P0-4: 结构始终从预训练权重构建（保证首层 6ch / 12 类一致），
+    # 训练产物（自定义 {"model_state":...} 或 ultralytics 原生 ckpt）由统一协议回填
+    wrapper = MB.build_baseline2(weights=h.pretrained_weights, class_num=cfg.class_num)
+    net = wrapper.model                                  # 内部 DetectionModel（非 YOLO 包装器）
+    if args.weights:
+        TL.load_custom_checkpoint(args.weights, net, strict=False)
+
+    root = Path(args.data_root) if args.data_root else MC.DATA_ROOT
+    if not root.exists():
+        raise SystemExit(f"[baseline2] 数据根不存在: {root}")
+    scanned = SD.scan_samples_auto(root)                 # P0-5: 自动布局回退
+    samples = (scanned.get("test") or scanned.get("val")
+               or scanned.get("train") or next(iter(scanned.values()), []))
+    if not samples:
+        raise SystemExit(f"[baseline2 predict] 扫描到 0 个样本（root={root}），无法预测")
+
+    # P2-12: 实际输出目录 = 打印路径（函数 out_dir 参数优先，不再各自为政）
+    out = args.out or (MC.DATA_ROOT / f"pred_{cfg.key}")
+    result = INF.predict_multimodal_custom(net, samples, cfg, out_dir=out,
+                                           imgsz=(isz, isz))
+    print(f"[baseline2 predict] 共 {len(samples)} 组 -> {result}")
 
 
 def main():

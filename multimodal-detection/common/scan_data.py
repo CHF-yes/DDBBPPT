@@ -168,6 +168,32 @@ def scan_samples(data_root: Path, split_subdirs: Optional[list] = None,
     return out
 
 
+def _looks_like_layout_root(root: Path) -> bool:
+    """判断 root 是否为目录布局根（如 VDT 的 V/T/D/labels_multi、visible/infrared/depth/labels）。"""
+    names = {p.name.lower() for p in root.iterdir() if p.is_dir()}
+    mod_names = set(MODALITY_DIR_TABLE["rgb"] + MODALITY_DIR_TABLE["ir"]
+                    + MODALITY_DIR_TABLE["depth"])
+    lab_names = {n.lower() for n in LABEL_DIR_NAMES}
+    has_mod_dirs = bool(names & mod_names)
+    has_label_dirs = bool(names & lab_names)
+    return has_mod_dirs and has_label_dirs
+
+
+def scan_samples_auto(data_root: Path) -> Dict[str, List[Sample]]:
+    """
+    P0-5: 主训练入口用的自动探测：
+      先按默认 split 子目录扫描；若 0 样本且 root 是 V/T/D/labels_multi 型
+      目录布局，自动降级为 layout=True 重扫（无需用户手动传 layout）。
+    """
+    res = scan_samples(data_root, layout=False)
+    total = sum(len(v) for v in res.values())
+    if total == 0 and data_root.is_dir() and _looks_like_layout_root(data_root):
+        print("[scan] 默认 split 扫描 0 样本；检测到 V/T/D/labels_multi 目录布局，"
+              "自动切换 layout 模式重扫 ...")
+        res = scan_samples(data_root, layout=True)
+    return res
+
+
 def _scan_one_split_layout(base: Path) -> List[Sample]:
     """目录布局模式：按子目录名配对三模态 + 标签（如 VDT 的 V/T/D/labels_multi）。"""
     img_by_mod: Dict[str, Dict[str, Path]] = {"rgb": {}, "ir": {}, "depth": {}}
@@ -315,8 +341,9 @@ def main() -> None:
         print(f"[scan] 使用类别名文件: {args.names} ({len(names_list)} 类)")
 
     if args.out:
-        # 若无 val 分组，打印提醒
-        has_val = "val" in res or "validation" in res or any(len(v) for v in res.values())
+        # P0-5: has_val 只应反映是否存在 val/validation 分组数据
+        # （旧逻辑 "any split 有数据" 会把只有 train 的情形误判为有 val）
+        has_val = bool(res.get("val") or res.get("validation"))
         if not has_val:
             print("\n[注意] 扫描不到 val/validation 分组。ultralytics 训练需要 val 子集，"
                   "请先做 train/val 划分，或提供 --split-dirs train,val。")

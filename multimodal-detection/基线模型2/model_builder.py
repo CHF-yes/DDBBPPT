@@ -36,6 +36,7 @@ def build_baseline2(weights: str = None, class_num: int = MC.CLASS_NUM):
     """
     cfg = MC.BASELINE2_5CH
     w = weights or cfg.hyper.pretrained_weights
+    w = str(MC.resolve_pretrained_weights(w))   # P2-16: 解析绝对路径，离线禁止联网下载
     model = MU.build_base_model(w)              # ultralytics YOLO 对象
     # 首层 3→5
     MU.rebuild_first_conv(model, cfg.in_channels, strategy="mean_rgb")

@@ -50,7 +50,7 @@ def predict_rgb_ultralytics(weights: str,
                             imgsz: int = 1024) -> Path:
     """对 image_dir 中每张 rgb 图跑 ultralytics 检测，输出同名预测 txt。"""
     from ultralytics import YOLO
-    out_dir = out_dir or _pick_out_dir("baseline1_3ch")
+    out_dir = Path(out_dir) if out_dir is not None else _pick_out_dir("baseline1_3ch")
     out_dir.mkdir(parents=True, exist_ok=True)
     cls2name = {i: n for i, n in enumerate(MC.CLASS_NAMES)}
 
@@ -106,25 +106,26 @@ def predict_multimodal_custom(model,           # 内部检测网络(DetectionMod
       * 每图必写同名 txt；无目标写空文件；
       * 每图最多 100 框（按置信度截断）；
       * 坐标归一化（相对输入画布 W/H）。
+    预处理用 build_consistent_aug_5ch(aug=None)（同步 letterbox，P1-9：
+    与训练/验证几何一致，不再用直接拉伸 resize）。
     """
     import torch
-    from .evaluate import _move_to_device, decode_preds
-    from .multimodal_augment import effective_depth_shift
-    out_dir = out_dir or _pick_out_dir(cfg.key)
+    from .evaluate import decode_preds
+    out_dir = Path(out_dir) if out_dir is not None else _pick_out_dir(cfg.key)
     out_dir.mkdir(parents=True, exist_ok=True)
-    model = model.eval()
     dev = device or ("cuda:0" if torch.cuda.is_available() else "cpu")
-    model = _move_to_device(model, dev)
+    model = model.to(dev).eval()          # P0-2: _move_to_device 不处理 nn.Module，必须显式 .to()
 
     n_written = 0
     for s in samples:
-        chw = DS.build_input_channels(
-            s.img, cfg.in_channels, target_size=imgsz,
-            depth_shift=effective_depth_shift(cfg.hyper.align, imgsz[0]),
-            preprocess=cfg.hyper.preprocess)
+        chw, _boxes, _stem = DS.build_consistent_aug_5ch(
+            s, target_size=imgsz, aug=None,
+            align=cfg.hyper.align,                 # P1-6: 对齐量按原图宽换算
+            preprocess=cfg.hyper.preprocess,
+            in_channels=cfg.in_channels)
         H, W = chw.shape[1], chw.shape[2]
         t = torch.from_numpy(np.ascontiguousarray(chw)).float().unsqueeze(0)
-        t = _move_to_device(t, dev)
+        t = t.to(dev)
         with torch.no_grad():
             out = model(t)
         det = decode_preds(out, cfg.class_num, conf_thr, iou_thr)[0]

@@ -27,25 +27,32 @@ from common import multimodal_augment as MA     # noqa: E402
 
 
 def build_model_inputs(sample, imgsz=(1024, 1024), aug=None,
-                       depth_shift=None, preprocess=None, seed=None,
+                       depth_shift=None, align=None, preprocess=None, seed=None,
                        to_tensor: bool = True):
     """
     读一个样本的三模态，按统一 aug 配置做一致性增强 + depth 固定对齐，
     返回 (rgb, ir, depth, boxes_out, stem)：
-      rgb   : (3,H,W) 或 tensor(B=1,3,H,W)
+      rgb   : (3,H,W) RGB 序 或 tensor(B=1,3,H,W)
       ir    : (1,H,W)
       depth : (2,H,W)  = [归一化距离, 有效掩码]（Step1）
       boxes_out : (N,5) 归一化框(letterbox 画布) 或 None
-    aug=None 时仅同步 letterbox（验证路径）；preprocess=None 时读总配置。
+    depth_shift / align：对齐平移；**align（AlignConfig）优先**——提供时按原图宽
+    等比换算（P1-6: -22px@1920 是原图坐标系实测值），depth_shift 仅作显式覆盖。
+    aug=None 时仅同步 letterbox（验证/推理路径）；preprocess=None 时读总配置。
     """
     if sample.img.get("ir") is None or sample.img.get("depth") is None:
         raise ValueError(f"实验模型1 需要 ir/depth；样本 {sample.stem} 缺失")
     h = MC.EXPERIMENT1.hyper
-    if depth_shift is None:
-        depth_shift = (h.depth_shift_x, h.depth_shift_y)
     pp = preprocess if preprocess is not None else h.preprocess
 
     rgb = DS.read_rgb_bgr(sample.img["rgb"])            # (H,W,3) BGR
+    import cv2
+    rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)          # P1-7: 统一 RGB 序（预训练 backbone 惯例）
+    W0 = rgb.shape[1]
+    if align is not None:
+        depth_shift = MA.effective_depth_shift(align, W0)   # P1-6: 按原图宽换算
+    elif depth_shift is None:
+        depth_shift = MA.effective_depth_shift(h.align, W0)
     ir = DS.read_ir_gray(sample.img["ir"])              # (H,W) uint8
     dep_mm = DS.read_depth_mm(sample.img["depth"])      # (H,W) uint16 mm
     dep_mm = MA.align_depth(dep_mm, *depth_shift)       # 固定平移对齐到 RGB 坐标系

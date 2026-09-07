@@ -207,7 +207,7 @@ def rgb_dropout(rgb: np.ndarray, prob: float = 0.2, mode: str = "zero",
         return rgb
     iv = _cv()
     if mode == "gray":
-        g = iv.cvtColor(rgb, iv.COLOR_BGR2GRAY)
+        g = iv.cvtColor(rgb, iv.COLOR_RGB2GRAY)   # RGB 语义（P1-7：与全链路 RGB 序一致）
         return np.stack([g, g, g], axis=-1)
     if mode == "noise":
         out = rgb.astype(np.float32) * r.uniform(0.2, 0.6)
@@ -223,7 +223,8 @@ def rgb_dropout(rgb: np.ndarray, prob: float = 0.2, mode: str = "zero",
 
 def hsv_only_rgb(rgb: np.ndarray, h_gain=0.015, s_gain=0.7, v_gain=0.4,
                  rng=None) -> np.ndarray:
-    """只对 RGB(BGR) 做 HSV 扰动；IR/Depth 永不参与（避免伪造温度/距离语义）。"""
+    """只对 RGB（**RGB 序**，调用方须已 BGR2RGB）做 HSV 扰动；
+    IR/Depth 永不参与（避免伪造温度/距离语义）。"""
     iv = _cv()
     h, s, v = iv.split(iv.cvtColor(rgb, iv.COLOR_RGB2HSV))
     h, s, v = (x.astype(np.float32) for x in (h, s, v))

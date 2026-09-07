@@ -94,13 +94,14 @@ class MultiSampleDataset(Dataset):
     """
 
     def __init__(self, samples, mode="5ch", target_size=(1024, 1024),
-                 aug=None, depth_shift=(0, 0), preprocess=None,
+                 aug=None, depth_shift=(0, 0), align=None, preprocess=None,
                  augment=True, seed=0):
         self.samples = list(samples)
         self.mode = mode
         self.target_size = tuple(target_size)
         self.aug = aug
         self.depth_shift = tuple(depth_shift)
+        self.align = align                    # P1-6: 提供时按**原图宽**换算对齐量
         self.preprocess = preprocess
         self.augment = bool(augment)
         self.seed = int(seed)
@@ -115,7 +116,8 @@ class MultiSampleDataset(Dataset):
             chw, boxes, stem = DS.build_consistent_aug_5ch(
                 s, target_size=self.target_size,
                 aug=self.aug if self.augment else None,
-                depth_shift=self.depth_shift, preprocess=self.preprocess,
+                depth_shift=self.depth_shift, align=self.align,
+                preprocess=self.preprocess,
                 seed=rng_seed)
             return {"img": chw}, boxes, stem
         # "three"：实验1 三路输入（调用方须已注入 实验模型1 目录到 sys.path）
@@ -123,7 +125,8 @@ class MultiSampleDataset(Dataset):
         rgb, ir, dep, boxes, stem = DA.build_model_inputs(
             s, imgsz=self.target_size,
             aug=self.aug if self.augment else None,
-            depth_shift=self.depth_shift, preprocess=self.preprocess,
+            depth_shift=self.depth_shift, align=self.align,
+            preprocess=self.preprocess,
             seed=rng_seed, to_tensor=False)
         return {"rgb": rgb, "ir": ir, "depth": dep}, boxes, stem
 
@@ -212,7 +215,7 @@ def train_custom(
             ds = MultiSampleDataset(
                 order, mode=dataset_mode, target_size=(isz, isz),
                 aug=h.aug,
-                depth_shift=effective_depth_shift(h.align, isz),
+                align=h.align,           # P1-6: 对齐量按原图宽换算（不再是目标 imgsz）
                 preprocess=h.preprocess, augment=True, seed=h.seed + epoch)
             dl = DataLoader(ds, batch_size=h.batch, shuffle=False,
                             num_workers=int(h.workers),
@@ -309,6 +312,42 @@ def save_ckpt(path, ema, epoch, best_map, cfg: MC.ModelConfig, model_type: str) 
         "class_names": MC.CLASS_NAMES,
     }, path)
     print(f"[train_loop] saved checkpoint (ep {epoch}) -> {path}")
+
+
+def load_custom_checkpoint(path, model: nn.Module, strict: bool = True) -> dict:
+    """
+    统一自定义 checkpoint 加载协议（P0-4）——训练保存的 best.pt/last.pt
+    不是 ultralytics 原生格式，YOLO() 无法直接 load；必须先构建结构再回填权重。
+
+    支持三种格式：
+      1) 本框架自定义格式 {"model_state": ..., ...}（save_ckpt 产出）；
+      2) ultralytics 原生训练产物（含 "ema"/"model" 键，如 YOLO.train 的 best.pt）；
+      3) 裸 state_dict（旧版兼容）。
+    返回 checkpoint dict（含 epoch/best_map/cfg_key 等元数据，供打印）。
+    """
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(ckpt, dict):
+        raise TypeError(f"[load_ckpt] 无法识别 checkpoint 格式: {path}")
+    state = None
+    if "model_state" in ckpt:                     # 本框架自定义格式
+        state = ckpt["model_state"]
+    elif "ema" in ckpt and hasattr(ckpt["ema"], "state_dict"):
+        state = ckpt["ema"].state_dict()          # ultralytics 原生（EMA 版）
+    elif "model" in ckpt and hasattr(ckpt["model"], "state_dict"):
+        state = ckpt["model"].state_dict()        # ultralytics 原生（裸模型）
+    elif "state_dict" in ckpt:
+        state = ckpt["state_dict"]
+    elif all(isinstance(v, torch.Tensor) for v in ckpt.values()):
+        state = ckpt                              # 裸 state_dict
+    if state is None:
+        raise KeyError(f"[load_ckpt] {path} 中找不到可加载的 state_dict 键")
+    missing, unexpected = model.load_state_dict(state, strict=strict)
+    meta = {k: ckpt.get(k) for k in ("epoch", "best_map", "cfg_key", "class_num",
+                                     "in_channels", "model_type") if k in ckpt}
+    print(f"[load_ckpt] {path} 加载完成: {meta}"
+          + ("" if strict else f" (strict=False; missing={len(missing)}, "
+                               f"unexpected={len(unexpected)})"))
+    return ckpt
 
 
 def _compute_loss(model: nn.Module, preds, batch: Dict):
