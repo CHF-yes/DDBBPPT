@@ -34,7 +34,7 @@ def build_model_inputs(sample, imgsz=(1024, 1024), aug=None,
     返回 (rgb, ir, depth, boxes_out, stem)：
       rgb   : (3,H,W) 或 tensor(B=1,3,H,W)
       ir    : (1,H,W)
-      depth : (1,H,W)
+      depth : (2,H,W)  = [归一化距离, 有效掩码]（Step1）
       boxes_out : (N,5) 归一化框(letterbox 画布) 或 None
     aug=None 时仅同步 letterbox（验证路径）；preprocess=None 时读总配置。
     """
@@ -62,8 +62,10 @@ def build_model_inputs(sample, imgsz=(1024, 1024), aug=None,
     # 值域按 PreprocessParams 模式处理（赛题数据未归一化；默认 div255 / mm_unit）
     rgb_t = DS.norm_array(rgb_o, pp.rgb_mode).transpose(2, 0, 1)      # (3,H,W)
     ir_t = DS.norm_array(ir_o, pp.ir_mode)[None, ...]
-    dep_t = DS.depth_mm_to_scaled(dep_o, pp.depth_mode,
-                                  pp.depth_scale_mm, pp.depth_invalid_zero)[None, ...]
+    dep_sc = DS.depth_mm_to_scaled(dep_o, pp.depth_mode,
+                                   pp.depth_scale_mm, pp.depth_invalid_zero)
+    dep_mask = (dep_o > 1).astype(np.float32)                          # 有效掩码(增强后同步)
+    dep_t = np.stack([dep_sc, dep_mask], axis=0)                       # (2,H,W)
     if to_tensor:
         rgb_t = torch.from_numpy(np.ascontiguousarray(rgb_t)).float()
         ir_t = torch.from_numpy(np.ascontiguousarray(ir_t)).float()

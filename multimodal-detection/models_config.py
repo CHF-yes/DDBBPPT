@@ -137,6 +137,19 @@ class PreprocessParams:
 
 
 @dataclass
+class AlignConfig:
+    """Depth 对齐（可插拔）：mode=none 关闭；shift 固定平移 + 按分辨率自动缩放。
+    shift_x/y 在 ref_size 基准分辨率下实测（赛题示例 1920×1080 测出 -22px）；
+    scale_with_res=True 时按目标宽等比换算（如 VDT 640 → -22×640/1920≈-7px）。
+    """
+    mode: str = "shift"            # none | shift
+    shift_x: int = -22
+    shift_y: int = 0
+    ref_size: int = 1920           # 偏移实测时的基准图像宽度
+    scale_with_res: bool = True
+
+
+@dataclass
 class HyperParams:
     """默认训练超参（针对 2000 组三模态小样本 + mAP@50-95 指标）。"""
     model: str = ""                       # 内部权重文件/结构名，由各实例填充
@@ -152,15 +165,28 @@ class HyperParams:
     patience: int = 30                    # 早停
     pretrained_weights: str = "yolo11s.pt"  # COCO 预训练(允许)；换规格改此键
 
-    # ---- Depth 对齐（非增强）：depth 相对 RGB 系统性右偏，需左移 ~22px @1920×1080 ----
-    depth_shift_x: int = -22              # <0 = 内容左移（实测中位值；按数据分辨率换算）
-    depth_shift_y: int = 0
+    # ---- Depth 对齐（可插拔配置；兼容旧 depth_shift_x/y 读取）----
+    align: AlignConfig = field(default_factory=AlignConfig)
+
+    # ---- Step3/4 多模态增强开关与辅助损失权重 ----
+    mega: bool = True               # Step4 MEGA 边缘引导注意力(P4/P5)
+    aux_heads: bool = True          # Step3 每模态辅助头(中心分类)
+    aux_lambda: float = 0.1         # 辅助损失权重(训练期间线性退火→0)
 
     # ---- 统一数据增强（三模态全覆盖；各版本可覆写）----
     aug: AugmentParams = field(default_factory=AugmentParams)
 
     # ---- 数据预处理开关（赛题数据未归一化；三种模态值域策略可配置）----
     preprocess: PreprocessParams = field(default_factory=PreprocessParams)
+
+    # 兼容旧引用：h.depth_shift_x / h.depth_shift_y（读取 align）
+    @property
+    def depth_shift_x(self) -> int:
+        return int(self.align.shift_x)
+
+    @property
+    def depth_shift_y(self) -> int:
+        return int(self.align.shift_y)
 
 
 # ============================================================
@@ -207,13 +233,14 @@ BASELINE2_5CH = ModelConfig(
     name="基线模型2",
     description=("5 通道前期融合：RGB(3)+IR 单通道灰度(1)+Depth 归一化(1)。"
                  "把三模态在输入端拼接成 5 通道，仅改造首层卷积，最小侵入的融合基线。"),
-    in_channels=5,
+    in_channels=6,
     modality=Modality.RGB_IR_DEPTH,
     fusion=FusionScheme.EARLY,
     enabled=True,
     hyper=HyperParams(pretrained_weights="yolo11s.pt"),
-    notes=("首层 Conv3→5 权重初始化：前 3 通道继承预训练 RGB 权重，"
-           "后 2 通道复制其三通道均值后再随机微调（见实例 model_builder）。"),
+    notes=("首层 Conv3→6 权重初始化：前 3 通道继承预训练 RGB 权重，"
+           "新增通道复制其三通道均值后再随机微调（见实例 model_builder）。"
+           "Step1: Depth 双通道=[归一化距离, 有效掩码]；in_channels=5 可作无掩码消融。"),
     data_prep="RGB/IR 三通道转 8bit；IR 取第 0 通道当单通道灰度；Depth 从 16bit 毫米值缩放至[0,255]。",
 )
 

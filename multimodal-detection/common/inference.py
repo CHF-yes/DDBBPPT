@@ -109,6 +109,7 @@ def predict_multimodal_custom(model,           # 内部检测网络(DetectionMod
     """
     import torch
     from .evaluate import _move_to_device, decode_preds
+    from .multimodal_augment import effective_depth_shift
     out_dir = out_dir or _pick_out_dir(cfg.key)
     out_dir.mkdir(parents=True, exist_ok=True)
     model = model.eval()
@@ -119,7 +120,7 @@ def predict_multimodal_custom(model,           # 内部检测网络(DetectionMod
     for s in samples:
         chw = DS.build_input_channels(
             s.img, cfg.in_channels, target_size=imgsz,
-            depth_shift=(cfg.hyper.depth_shift_x, cfg.hyper.depth_shift_y),
+            depth_shift=effective_depth_shift(cfg.hyper.align, imgsz[0]),
             preprocess=cfg.hyper.preprocess)
         H, W = chw.shape[1], chw.shape[2]
         t = torch.from_numpy(np.ascontiguousarray(chw)).float().unsqueeze(0)

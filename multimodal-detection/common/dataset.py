@@ -144,27 +144,34 @@ def build_input_channels(sample_img_paths: dict, in_channels: int,
     if in_channels == 3:
         ch = norm_array(rgb, pp.rgb_mode).transpose(2, 0, 1)   # (3,H,W) RGB
     else:
-        assert in_channels == 5, in_channels
+        assert in_channels in (5, 6), in_channels
         ir = read_ir_gray(sample_img_paths["ir"])   # (H,W)  像素即温度亮暗
         dep = read_depth_mm(sample_img_paths["depth"])  # (H,W) mm
         dep = align_depth(dep, *depth_shift)          # 固定平移对齐到 RGB 坐标系
         dep_sc = depth_mm_to_scaled(dep, pp.depth_mode,
                                     pp.depth_scale_mm, pp.depth_invalid_zero)
+        dep_mask = (dep > 1).astype(np.float32)       # Step1: 有效掩码(可信度)
         # 统一尺寸(resize 三书记一致既保证空间对齐保留——题目已经对齐，此处只顺引)
         if (ir.shape[0], ir.shape[1]) != (H, W):
             ir = cv2.resize(ir, (W, H), interpolation=cv2.INTER_LINEAR)
             dep_sc = cv2.resize(dep_sc, (W, H), interpolation=cv2.INTER_LINEAR)
+            dep_mask = cv2.resize(dep_mask, (W, H), interpolation=cv2.INTER_NEAREST)
 
         rf = norm_array(rgb, pp.rgb_mode)
         r, g, b = rf[:, :, 0], rf[:, :, 1], rf[:, :, 2]
         irn = norm_array(ir, pp.ir_mode)
-        # 组装 [R, G, B, IR, D]（RGB 序与预训练 backbone 一致）
-        ch = np.stack([r, g, b, irn, dep_sc], axis=0)  # (5,H,W)
+        # 组装 [R, G, B, IR, D(, mask)]（RGB 序与预训练 backbone 一致）
+        if in_channels == 6:
+            ch = np.stack([r, g, b, irn, dep_sc, dep_mask], axis=0)  # (6,H,W)
+        else:
+            ch = np.stack([r, g, b, irn, dep_sc], axis=0)            # (5,H,W)
     if target_size is not None:
-        import cv2
         Ht, Wt = target_size
-        ch = np.array([cv2.resize(c, (Wt, Ht), interpolation=cv2.INTER_LINEAR)
-                       for c in ch])
+        interp = [cv2.INTER_LINEAR] * ch.shape[0]
+        if in_channels == 6:
+            interp[-1] = cv2.INTER_NEAREST            # 掩码用最近邻，防伪边界
+        ch = np.array([cv2.resize(ch[c], (Wt, Ht), interpolation=interp[c])
+                       for c in range(ch.shape[0])])
     return ch
 
 
@@ -233,9 +240,10 @@ class MultimodalDetectionDataset:
         self.cfg = cfg
         self.imgsz = imgsz
         self.transform = transform
-        # 从统一配置读取 depth 固定对齐（默认不偏移，基线2/实验1 各自配置可覆写）
-        self.depth_shift = (getattr(cfg.hyper, "depth_shift_x", 0),
-                            getattr(cfg.hyper, "depth_shift_y", 0))
+        # 从统一配置读取 depth 固定对齐（按分辨率等比缩放的可插拔 AlignConfig）
+        from .multimodal_augment import effective_depth_shift
+        self.depth_shift = effective_depth_shift(getattr(cfg.hyper, "align", None),
+                                                 int(imgsz[0]))
         # 数据预处理开关（赛题数据未归一化；值域策略可配置）
         self.preprocess = getattr(cfg.hyper, "preprocess", None)
 
@@ -280,18 +288,19 @@ def build_consistent_aug_5ch(
     aug=None,                      # AugmentParams 统一增强配置；None=仅同步 letterbox(验证)
     depth_shift=(0, 0),            # 固定平移对齐(只动 depth；标签锚定 RGB)
     preprocess=None,               # PreprocessParams 值域开关（赛题数据未归一化）
+    in_channels: int = 6,          # 5=无掩码(消融对照)；6=[R,G,B,IR,D,mask]
     seed: Optional[int] = None,
     to_tensor: bool = False,
 ):
     """
-    三模态 5 通道「一致性增强 + 通道拼装」的单一入口，供自定义训练/验证循环使用。
+    三模态「一致性增强 + 通道拼装」的单一入口，供自定义训练/验证循环使用。
 
     步骤：读 RGB/IR/Depth 三张对齐原图 → [Depth 固定平移对齐] → 按 aug 做
     **三模态全覆盖一致性增强**(三图同步几何 + RGB-HSV/IR 增益/Depth 噪声与平移)
-    → 拼成 (5,H,W) float32 张量。
+    → 拼成 (C,H,W) float32 张量。
 
     返回 (chw, boxes_out, stem)：
-      chw     : (5,H,W) float32，通道序 [B,G,R,IR_norm,Depth_scaled]
+      chw     : in_channels=6 → (6,H,W) [R,G,B,IR,D_scaled,D_mask]；5 → (5,H,W) 无掩码
       boxes_out: (N,5) cls,cx,cy,w,h(归一，参考 letterbox 后画布)；无目标为 None
       stem    : 样本基名
     """
@@ -316,13 +325,20 @@ def build_consistent_aug_5ch(
         new_size=target_size, aug=aug, seed=seed)
 
     rf = norm_array(rgb_o, pp.rgb_mode)                     # letterboxed B,G,R 按模式
-    b = rf[:, :, 0]
-    g = rf[:, :, 1]
-    r = rf[:, :, 2]
+    if rf.shape[2] == 3:
+        b = rf[:, :, 0]
+        g = rf[:, :, 1]
+        r = rf[:, :, 2]
+    else:
+        r = g = b = rf
     irn = norm_array(ir_o, pp.ir_mode)                       # 单通道亮度(温度归一)
     dep_sc = depth_mm_to_scaled(dep_o, pp.depth_mode,
                                 pp.depth_scale_mm, pp.depth_invalid_zero)  # mm→[0,1]/原值
-    chw = np.stack([b, g, r, irn, dep_sc], axis=0)           # (5,H,W)
+    if in_channels == 6:
+        dep_mask = (dep_o > 1).astype(np.float32)            # Step1: 有效掩码(增强后同步)
+        chw = np.stack([r, g, b, irn, dep_sc, dep_mask], axis=0)   # (6,H,W) RGB 序
+    else:
+        chw = np.stack([r, g, b, irn, dep_sc], axis=0)       # (5,H,W) RGB 序
     if to_tensor:
         chw = to_torch_tensor(chw)
     return chw, boxes_out, sample.stem

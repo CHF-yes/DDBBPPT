@@ -114,6 +114,19 @@ def letterbox_consistent(rgb: np.ndarray, ir: np.ndarray, depth: np.ndarray,
 # Depth 专用平移（对齐 + 随机抖动）
 # ------------------------------------------------------------
 
+def effective_depth_shift(align, target_w: int):
+    """按 AlignConfig 计算实际平移量（含按分辨率等比缩放）。返回 (sx, sy)。"""
+    if align is None:
+        return 0, 0
+    if getattr(align, "mode", "shift") == "none":
+        return 0, 0
+    sx, sy = int(align.shift_x), int(align.shift_y)
+    if getattr(align, "scale_with_res", True) and int(getattr(align, "ref_size", 0) or 0) > 0:
+        k = float(target_w) / float(align.ref_size)
+        sx, sy = round(sx * k), round(sy * k)
+    return int(sx), int(sy)
+
+
 def align_depth(depth: np.ndarray, shift_x=0, shift_y=0) -> np.ndarray:
     """
     固定平移对齐：把 depth 内容平移 (shift_x, shift_y) 像素到目标坐标系(如 RGB)。

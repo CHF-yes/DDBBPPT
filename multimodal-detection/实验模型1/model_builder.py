@@ -29,6 +29,7 @@ for _p in (str(_CODE_ROOT), str(_VENDOR)):
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from ultralytics import YOLO                                     # vendor 版
 from ultralytics.nn.modules import Conv, C2f, Concat            # 复用官方组件
@@ -42,19 +43,20 @@ _IDX_P3, _IDX_P4, _IDX_P5 = 4, 6, 10
 class AuxStream(nn.Module):
     """轻量单通道辅助流：IR/Depth 各一条，输出与主流 P3(1/8)/P4(1/16)/P5(1/32) 同分辨率。
     每级恰好下采样 1 次：1/2 → 1/4 → 1/8(f3) → 1/16(f4) → 1/32(f5)。
-    ch = (c_f3, c_f4, c_f5) 为三个输出通道数。"""
+    ch = (c_f3, c_f4, c_f5) 为三个输出通道数。
+    in_ch：输入通道（IR=1；Step1 后 Depth=2：距离+有效掩码）。"""
 
-    def __init__(self, ch=(32, 48, 64)):
+    def __init__(self, ch=(32, 48, 64), in_ch: int = 1):
         super().__init__()
         c1, c2, c3 = ch
-        self.s1 = nn.Sequential(Conv(1, 16, 3, 2), C2f(16, 16, n=1))
+        self.s1 = nn.Sequential(Conv(in_ch, 16, 3, 2), C2f(16, 16, n=1))
         self.s2 = nn.Sequential(Conv(16, 24, 3, 2), C2f(24, 24, n=1))
         self.s3 = nn.Sequential(Conv(24, c1, 3, 2), C2f(c1, c1, n=1))
         self.s4 = nn.Sequential(Conv(c1, c2, 3, 2), C2f(c2, c2, n=1))
         self.s5 = nn.Sequential(Conv(c2, c3, 3, 2), C2f(c3, c3, n=1))
 
     def forward(self, x: torch.Tensor):
-        """x: (B,1,H,W) → (f3(B,c1,H/8,W/8), f4(B,c2,H/16,W/16), f5(B,c3,H/32,W/32))"""
+        """x: (B,in_ch,H,W) → (f3(B,c1,H/8,W/8), f4(B,c2,H/16,W/16), f5(B,c3,H/32,W/32))"""
         f3 = self.s3(self.s2(self.s1(x)))
         f4 = self.s4(f3)
         f5 = self.s5(f4)
@@ -62,17 +64,22 @@ class AuxStream(nn.Module):
 
 
 class ModalDropout(nn.Module):
-    """模态 dropout：训练时按概率把某一辅助路特征整体置零（赛题鲁棒性：某模态失效时不崩）。
-    只作用于辅助流（RGB 主流不作丢弃），且仅在 self.training 时生效。"""
+    """逐模态独立 dropout（Step2）：IR 与 Depth **各自独立**按概率置零（concat 前），
+    训练覆盖「仅 IR 失效 / 仅 Depth 失效 / 双失效 / 齐全」四种态——
+    对应赛题"单模态质量差时性能不崩"的鲁棒性要求。
+    只作用于辅助流（RGB 主流不丢）；仅 self.training 时生效。"""
 
     def __init__(self, p: float = 0.2):
         super().__init__()
         self.p = float(p)
 
-    def forward(self, feats):
-        if not self.training or self.p <= 0.0:
-            return feats
+    def _drop(self, feats):
         return [torch.zeros_like(f) if torch.rand(1).item() < self.p else f for f in feats]
+
+    def forward(self, feats_ir, feats_dep):
+        if not self.training or self.p <= 0.0:
+            return feats_ir, feats_dep
+        return self._drop(feats_ir), self._drop(feats_dep)
 
 
 class FusionBlock(nn.Module):
@@ -116,6 +123,56 @@ class SimplePAN(nn.Module):
         return p3f, p4b, p5b
 
 
+class EdgeAttnGate(nn.Module):
+    """Step4 MEGA —— 多模态边缘引导注意力。
+
+    E_m：模型内**固定 Sobel** 生成（零可训练参数）——RGB/IR/Depth 各自边缘幅值；
+    A_m = σ(Conv([F, E_rgb, E_ir, E_dep]))：位置级注意力门（每模态一个）；
+    残差保底门控：F' = F * (1 + α·Σ_m W_m·A_m)
+      α：可学标量（初始 0 → 起步等价于纯 F，防无边缘区被抑制）
+      W_m：每模态可学权重（初始均分）—— 位置级 × 模态级
+    只放 P4/P5 融合特征上；边缘图在特征分辨率最近邻插值（不抹平边缘）。
+    """
+
+    def __init__(self, c_in: int, n_mod: int = 3):
+        super().__init__()
+        self.att = nn.Conv2d(c_in + n_mod, n_mod, 1)
+        self.alpha = nn.Parameter(torch.zeros(1))            # 残差保底系数
+        self.w = nn.Parameter(torch.full((n_mod,), 1.0 / n_mod))
+        k = torch.tensor([[-1.0, 0, 1], [-2.0, 0, 2], [-1.0, 0, 1]]).view(1, 1, 3, 3)
+        self.register_buffer("_sobel_x", k)
+        self.register_buffer("_sobel_y", k.transpose(2, 3))
+
+    def edge_map(self, x: torch.Tensor) -> torch.Tensor:
+        """(B,C,H,W) → 边缘幅值图 (B,1,H,W)。固定 Sobel，无参数。"""
+        g = x.mean(dim=1, keepdim=True)
+        ex = F.conv2d(g, self._sobel_x, padding=1)
+        ey = F.conv2d(g, self._sobel_y, padding=1)
+        return (ex.abs() + ey.abs()).clamp_max(1.0)
+
+    def forward(self, feat: torch.Tensor, edge_imgs):
+        """feat: (B,C,H,W)；edge_imgs: 输入分辨率边缘源（rgb/ir/depth 各一）。"""
+        es = [F.interpolate(self.edge_map(e), size=feat.shape[-2:], mode="nearest")
+              for e in edge_imgs]
+        A = torch.sigmoid(self.att(torch.cat([feat, *es], 1)))       # (B,3,H,W)
+        A = A * self.w.view(1, -1, 1, 1)                             # 模态级×位置级
+        return feat * (1.0 + self.alpha * A.sum(dim=1, keepdim=True))
+
+
+class AuxHead(nn.Module):
+    """Step3 每模态辅助头（P4 分辨率中心分类）：
+    从辅助流特征预测中心 heatmap（nc 类），GT 框中心像素为 1（one-hot），
+    用 BCE 训练 —— 逼迫"该模态被真正用上"（防止被 RGB 主流淹没）。
+    输入只来自 AuxStream → 梯度天然不经过主流 backbone（隔离）。"""
+
+    def __init__(self, c_in: int, nc: int):
+        super().__init__()
+        self.conv = nn.Sequential(Conv(c_in, 64, 3), Conv(64, nc, 1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(x)          # (B,nc,H,W) logits
+
+
 class Experiment1Model(nn.Module):
     """
     三模态检测模型骨架。
@@ -129,7 +186,10 @@ class Experiment1Model(nn.Module):
 
     def __init__(self, weights: str = "yolo11s.pt", nc: int = 12,
                  aux_ch=(32, 48, 64), fusion_ch=None,
-                 dropout_p: float = 0.2):
+                 dropout_p: float = 0.2,
+                 mega: bool = True,      # Step4 MEGA 边缘引导注意力(P4/P5)
+                 aux_heads: bool = True,  # Step3 每模态辅助头(中心分类)
+                 ):
         super().__init__()
         base = YOLO(weights).model                       # vendor 加载（含 COCO 权重）
         self.backbone = base.model[:_IDX_P5 + 1]         # 0..10 主干(含 SPPF + C2PSA)
@@ -146,8 +206,8 @@ class Experiment1Model(nn.Module):
             _ = self.backbone(torch.zeros(1, 3, 64, 64))
         c3, c4, c5 = (self._feats[k].shape[1] for k in ("p3", "p4", "p5"))
 
-        self.aux_ir = AuxStream(aux_ch)                  # IR 辅助流
-        self.aux_dep = AuxStream(aux_ch)                 # Depth 辅助流
+        self.aux_ir = AuxStream(aux_ch)                  # IR 辅助流 (1ch 输入)
+        self.aux_dep = AuxStream(aux_ch, in_ch=2)        # Depth 辅助流 (Step1: 2ch 输入)
         self.modal_drop = ModalDropout(dropout_p)
 
         ca1, ca2, ca3 = aux_ch
@@ -155,6 +215,18 @@ class Experiment1Model(nn.Module):
         self.fuse4 = FusionBlock(c4, ca2 * 2, c4)
         self.fuse5 = FusionBlock(c5, ca3 * 2, c5)
         self.pan = SimplePAN(c3, c4, c5)
+
+        # ---- Step4: MEGA（P4/P5 融合特征；模型内固定 Sobel，零参数边缘）----
+        self.mega_enabled = bool(mega)
+        self.mega4 = EdgeAttnGate(c4)
+        self.mega5 = EdgeAttnGate(c5)
+
+        # ---- Step3: 每模态辅助头（P4 分辨率中心分类；梯度只回传辅助流）----
+        self.aux_enabled = bool(aux_heads)
+        self._aux_logits: dict = {}
+        if self.aux_enabled:
+            self.aux_ir_head = AuxHead(ca2, nc)
+            self.aux_dep_head = AuxHead(ca2, nc)
 
         # 官方 Detect（nc=12，非端到端；stride 按 640 输入推断的 [8,16,32]）
         self.detect = Detect(nc, reg_max=16, end2end=False, ch=(c3, c4, c5))
@@ -174,19 +246,31 @@ class Experiment1Model(nn.Module):
         return h
 
     def forward(self, rgb: torch.Tensor, ir: torch.Tensor, depth: torch.Tensor):
-        """rgb(B,3,H,W); ir/depth(B,1,H,W) → Detect 输出（训练格式 3 个尺度）。"""
+        """rgb(B,3,H,W); ir(B,1,H,W); depth(B,2,H,W) → Detect 输出（训练格式 3 个尺度）。
+        Step3 辅助 logits 缓存到 self._aux_logits（仅训练态；主检测输出不变）。"""
         self._feats.clear()
         _ = self.backbone(rgb)
         p3, p4, p5 = self._feats["p3"], self._feats["p4"], self._feats["p5"]
 
         f_ir = self.aux_ir(ir)
         f_dep = self.aux_dep(depth)
+        f_ir, f_dep = self.modal_drop(f_ir, f_dep)      # Step2: 逐模态独立置零
         aux = [torch.cat([a, b], 1) for a, b in zip(f_ir, f_dep)]
-        aux = self.modal_drop(aux)
 
         f3 = self.fuse3(p3, aux[0])
         f4 = self.fuse4(p4, aux[1])
         f5 = self.fuse5(p5, aux[2])
+
+        # Step4: MEGA 边缘引导（P4/P5；边缘图最近邻插值到特征分辨率）
+        if self.mega_enabled:
+            f4 = self.mega4(f4, [rgb, ir, depth])
+            f5 = self.mega5(f5, [rgb, ir, depth])
+
+        # Step3: 辅助头（P4 尺度 = f_ir[1]/f_dep[1]，通道 ca2）
+        if self.aux_enabled and self.training:
+            self._aux_logits = {"ir": self.aux_ir_head(f_ir[1]),
+                                "dep": self.aux_dep_head(f_dep[1])}
+
         neck = self.pan(f3, f4, f5)
         return self.detect(list(neck))
 
@@ -211,12 +295,12 @@ if __name__ == "__main__":
     with torch.no_grad():
         out = m(torch.zeros(1, 3, 640, 640),
                 torch.zeros(1, 1, 640, 640),
-                torch.zeros(1, 1, 640, 640))
+                torch.zeros(1, 2, 640, 640))          # Step1: depth 两通道
     print("train-mode detect output:", {k: _shape_of(v) for k, v in out.items()})
     m.eval()
     with torch.no_grad():
         y = m(torch.zeros(1, 3, 640, 640),
               torch.zeros(1, 1, 640, 640),
-              torch.zeros(1, 1, 640, 640))
+              torch.zeros(1, 2, 640, 640))
     print("eval-mode decode shape:", _shape_of(y))
     print("EXP1_FORWARD_OK")

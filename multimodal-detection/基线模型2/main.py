@@ -26,6 +26,7 @@ import models_config as MC                  # noqa: E402
 from common import trainer as TR            # noqa: E402
 from common import inference as INF         # noqa: E402
 from common import dataset as DS            # noqa: E402
+from common.multimodal_augment import effective_depth_shift  # noqa: E402
 
 
 def cmd_config(args):
@@ -71,7 +72,7 @@ def cmd_train(args):
             chw, boxes, stem = DS.build_consistent_aug_5ch(
                 s, target_size=imgsz,
                 aug=aug_cfg if augment else None,
-                depth_shift=(h.depth_shift_x, h.depth_shift_y),
+                depth_shift=effective_depth_shift(h.align, imgsz[0]),
                 preprocess=h.preprocess,
                 seed=rng.randrange(1 << 31))
             chw_list.append(chw); boxes_list.append(boxes); stems.append(stem)

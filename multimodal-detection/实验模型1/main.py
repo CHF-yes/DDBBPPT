@@ -23,6 +23,7 @@ for p in (str(_CODE_ROOT), str(_CODE_ROOT / "vendor"), str(_DIR)):
 
 import models_config as MC                      # noqa: E402
 from common import trainer as TR                # noqa: E402
+from common.multimodal_augment import effective_depth_shift  # noqa: E402
 
 
 def cmd_config(args):
@@ -37,7 +38,9 @@ def cmd_config(args):
 def cmd_selfcheck(args):
     import model_builder as MB
     m = MB.build_experiment1(weights=MC.EXPERIMENT1.hyper.pretrained_weights,
-                             nc=MC.EXPERIMENT1.class_num)
+                             nc=MC.EXPERIMENT1.class_num,
+                             mega=MC.EXPERIMENT1.hyper.mega,
+                             aux_heads=MC.EXPERIMENT1.hyper.aux_heads)
     print("selfcheck: model built OK, params(M) =",
           round(sum(p.numel() for p in m.parameters()) / 1e6, 2))
     print("(dummy forward 请在 model_builder.py __main__ 中运行)")
@@ -55,7 +58,8 @@ def cmd_train(args):
     import model_builder as MB
     import dataset_adapter as DA
     model = MB.build_experiment1(weights=args.weights or h.pretrained_weights,
-                                 nc=cfg.class_num)
+                                 nc=cfg.class_num,
+                                 mega=h.mega, aux_heads=h.aux_heads)
 
     # --- 数据：扫描根目录；无 val 时从 train 抽出 10% 作 val ---
     root = Path(args.data_root) if args.data_root else MC.DATA_ROOT
@@ -83,7 +87,7 @@ def cmd_train(args):
             rgb, ir, dep, boxes, stem = DA.build_model_inputs(
                 s, imgsz=imgsz,
                 aug=aug_cfg if augment else None,
-                depth_shift=(h.depth_shift_x, h.depth_shift_y),
+                depth_shift=effective_depth_shift(h.align, imgsz[0]),
                 preprocess=h.preprocess,
                 seed=rng.randrange(1 << 31), to_tensor=False)
             rgb_l.append(rgb); ir_l.append(ir); dep_l.append(dep)

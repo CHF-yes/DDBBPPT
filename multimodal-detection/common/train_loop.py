@@ -30,6 +30,7 @@ from torch.utils.data import DataLoader, Dataset
 
 import models_config as MC
 from common import dataset as DS
+from common.multimodal_augment import effective_depth_shift
 
 
 # ------------------------------------------------------------
@@ -211,7 +212,7 @@ def train_custom(
             ds = MultiSampleDataset(
                 order, mode=dataset_mode, target_size=(isz, isz),
                 aug=h.aug,
-                depth_shift=(h.depth_shift_x, h.depth_shift_y),
+                depth_shift=effective_depth_shift(h.align, isz),
                 preprocess=h.preprocess, augment=True, seed=h.seed + epoch)
             dl = DataLoader(ds, batch_size=h.batch, shuffle=False,
                             num_workers=int(h.workers),
@@ -239,6 +240,12 @@ def train_custom(
             with torch.cuda.amp.autocast(enabled=has_cuda and h.amp):
                 preds = forward_fn(model, inputs)
                 loss, items = _compute_loss(model, preds, batch)
+            # Step3: 每模态辅助头损失（中心分类；λ 随 epoch 线性退火，梯度只回传辅助流）
+            if getattr(model, "aux_enabled", False) and model.training and model._aux_logits:
+                al = _aux_center_loss(model._aux_logits, batch)
+                lam = float(getattr(h, "aux_lambda", 0.1)) * (1.0 - epoch / max(int(h.epochs), 1))
+                loss = loss + lam * al
+                items["aux_loss"] = float(al.detach())
             opt.zero_grad()
             scaler.scale(loss).backward()
             scaler.step(opt)
@@ -331,6 +338,27 @@ def _scalarize(loss):
     """v8DetectionLoss/DetectionModel 返回 (box,cls,dfl) 三分量向量 → 求和为标量（backward 需要）。"""
     import torch
     return loss.sum() if torch.is_tensor(loss) and loss.ndim > 0 else loss
+
+
+def _aux_center_loss(logits: dict, batch: Dict):
+    """Step3 中心分类辅助损失（CenterNet 风格，P4 stride=16）：
+    GT 框中心映射到 (B,nc,H4,W4) one-hot → BCEWithLogits。
+    logits 只由 AuxStream→AuxHead 路径产生 → 梯度天然不经过主流 backbone。"""
+    import torch.nn.functional as F
+    device = next(iter(logits.values())).device
+    cls = batch["cls"].to(device).long()
+    cx, cy = batch["bboxes"][:, 0].to(device), batch["bboxes"][:, 1].to(device)
+    bidx = batch["batch_idx"].to(device).long()
+    total = 0.0
+    for logit in logits.values():
+        nc_, H4, W4 = logit.shape[1], logit.shape[2], logit.shape[3]
+        stride = 16.0
+        gx = (cx / stride).long().clamp(0, W4 - 1)
+        gy = (cy / stride).long().clamp(0, H4 - 1)
+        target = torch.zeros(logit.shape, device=device)
+        target[bidx, cls, gy, gx] = 1.0
+        total = total + F.binary_cross_entropy_with_logits(logit, target)
+    return total / max(len(logits), 1)
 
 
 def _to_float_items(items) -> dict:
