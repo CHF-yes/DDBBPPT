@@ -6,7 +6,9 @@
 #   2) 装 GPU 版 PyTorch:    pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu118
 #                           （cu118 已验证可跑 RTX 40 系/A100 等；驱动较新可换 cu124/cu128）
 #   3) 装其余依赖:           pip install -r deploy_requirements.txt
-#   4) 验证:                 python -c "import torch,ultralytics; print(torch.cuda.is_available(), ultralytics.__version__)"
+#   4) 放预训练权重:         将 yolo11s.pt 拷贝到 code/ 根（离线运行不联网下载；
+#                           缺失时 models_config.resolve_pretrained_weights 会直接报错）
+#   5) 验证:                 python -c "import torch,ultralytics; print(torch.cuda.is_available(), ultralytics.__version__)"
 #
 # 注意: torch/torchvision 的 +cu118 后缀无法从默认 PyPI 安装，必须走上面第 2 步的
 #       --index-url；因此本文件不含 torch/torchvision 之外的版本锁定。

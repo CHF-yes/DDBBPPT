@@ -36,6 +36,12 @@ def cmd_train(args):
     kw = TR.build_train_kwargs(cfg)
     if args.imgsz:
         kw["imgsz"] = int(args.imgsz)
+    if args.epochs:
+        kw["epochs"] = int(args.epochs)
+    if args.batch:
+        kw["batch"] = int(args.batch)
+    if args.workers is not None:
+        kw["workers"] = int(args.workers)
     data_root = Path(args.data_root) if args.data_root else MC.DATA_ROOT
     kw["data"] = args.data_yaml or str(data_root / "data.yaml")
     kw["model"] = cfg.hyper.pretrained_weights
@@ -71,6 +77,9 @@ def main():
     ap.add_argument("--data-yaml", default=None)
     ap.add_argument("--data-root", default=None, help="数据根目录（默认 MC.DATA_ROOT / $MULTIMODAL_DATA_ROOT）")
     ap.add_argument("--imgsz", type=int, default=None, help="训练分辨率快捷覆盖（如 640/1024）")
+    ap.add_argument("--epochs", type=int, default=None, help="轮数覆盖（如 1 快速冒烟）")
+    ap.add_argument("--batch", type=int, default=None, help="batch size 覆盖")
+    ap.add_argument("--workers", type=int, default=None, help="读图 worker 数覆盖")
     args = ap.parse_args()
     {"config": cmd_config, "train": cmd_train, "predict": cmd_predict}[args.task](args)
 

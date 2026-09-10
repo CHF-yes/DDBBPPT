@@ -36,7 +36,11 @@ def _move_to_device(x, dev):
 
 def decode_preds(raw: torch.Tensor, nc: int, conf_thres: float = 0.25,
                  iou_thres: float = 0.7, max_det: int = 300):
-    """(B,4+nc,8400) → list[(M,6) xyxy+conf+cls]（vendors NMS，非端到端路径）。"""
+    """(B,4+nc,8400) → list[(M,6) xyxy+conf+cls]（vendors NMS，非端到端路径）。
+
+    赛题口径提示：规则按"提交的全部框按置信度排序"计算 AP（每图≤100 框、按置信度截断），
+    所以**评测/选优**建议 conf_thres 取很小（如 0.001）+ max_det=100，而非 0.25。
+    """
     from ultralytics.utils.nms import non_max_suppression  # vendor 8.4
     if isinstance(raw, (tuple, list)):
         raw = raw[0] if isinstance(raw[0], torch.Tensor) else raw
@@ -90,6 +94,7 @@ def evaluate_mAP(
     nc: int = MC.CLASS_NUM,
     conf_thres: float = 0.25,
     iou_nms: float = 0.7,
+    max_det: int = 300,
     device: Optional[str] = None,
     names: Optional[dict] = None,
 ) -> Dict[str, float]:
@@ -97,6 +102,9 @@ def evaluate_mAP(
     全量验证集 mAP 评估。返回 dict：
       {"map50_95": float, "map50": float, "precision": float, "recall": float,
        "per_class": {cls_name: ap50_95}}
+
+    conf_thres / max_det：赛题按"全部提交框排序算 AP、每图≤100 框"，因此
+    **评测与选优**建议 conf_thres=0.001、max_det=100（默认 0.25/300 仅用于兼容旧结果）。
     """
     import random
     from ultralytics.utils.metrics import DetMetrics  # vendor 版
@@ -116,9 +124,9 @@ def evaluate_mAP(
             batch = {k: (_move_to_device(v, dev) if torch.is_tensor(v) else v)
                      for k, v in batch.items()}
             raw = forward_fn(model, inputs)
-            dets = decode_preds(raw, nc, conf_thres, iou_nms)
+            dets = decode_preds(raw, nc, conf_thres, iou_nms, max_det=max_det)
 
-            # GT：batch 内 (cls, xywh 像素) → xyxy+cls
+            # GT：batch 内 (cls, 归一化 xywh) → xyxy+cls（像素，×imgsz）
             # 注意 batch 已迁到 GPU（可能 cuda）——必须先 detach().cpu() 再 numpy()
             cls = batch["cls"].detach().cpu().numpy().astype(np.float64)
             bidx = batch["batch_idx"].detach().cpu().numpy().astype(np.int64)
@@ -126,10 +134,10 @@ def evaluate_mAP(
             g_xyxy = np.zeros((len(cls), 5))
             if len(cls):
                 cx, cy, w, h = xywh[:, 0], xywh[:, 1], xywh[:, 2], xywh[:, 3]
-                g_xyxy[:, 0] = cx - w / 2
-                g_xyxy[:, 1] = cy - h / 2
-                g_xyxy[:, 2] = cx + w / 2
-                g_xyxy[:, 3] = cy + h / 2
+                g_xyxy[:, 0] = (cx - w / 2) * imgsz
+                g_xyxy[:, 1] = (cy - h / 2) * imgsz
+                g_xyxy[:, 2] = (cx + w / 2) * imgsz
+                g_xyxy[:, 3] = (cy + h / 2) * imgsz
                 g_xyxy[:, 4] = cls
 
             for si, det in enumerate(dets):              # 逐图像统计

@@ -35,10 +35,23 @@ def cmd_config(args):
 
 def cmd_train(args):
     import random
+    import dataclasses
     from common import scan_data as SD
     from common import train_loop as TL
 
     cfg = MC.BASELINE2_5CH
+    # CLI 快捷覆盖（仅本次运行生效，不改 config）：--epochs/--class-num/--batch/--workers
+    ov_h = {}
+    if args.epochs:
+        ov_h["epochs"] = int(args.epochs)
+    if args.batch:
+        ov_h["batch"] = int(args.batch)
+    if args.workers is not None:
+        ov_h["workers"] = int(args.workers)
+    if ov_h:
+        cfg = dataclasses.replace(cfg, hyper=dataclasses.replace(cfg.hyper, **ov_h))
+    if args.class_num:
+        cfg = dataclasses.replace(cfg, class_num=int(args.class_num))
     h = cfg.hyper
     from model_builder import build_baseline2
     wrapper = build_baseline2(weights=args.weights or h.pretrained_weights,
@@ -132,6 +145,10 @@ def main():
     ap.add_argument("--data-yaml", default=None, help="data.yaml 路径(训练)")
     ap.add_argument("--data-root", default=None, help="数据根目录（默认 MC.DATA_ROOT / $MULTIMODAL_DATA_ROOT）")
     ap.add_argument("--imgsz", type=int, default=None, help="训练分辨率快捷覆盖（如 640/1024）")
+    ap.add_argument("--epochs", type=int, default=None, help="轮数覆盖（如 1 快速冒烟）")
+    ap.add_argument("--class-num", type=int, default=None, help="类别数覆盖（如 VDT=45）")
+    ap.add_argument("--batch", type=int, default=None, help="batch size 覆盖")
+    ap.add_argument("--workers", type=int, default=None, help="读图 worker 数覆盖（0=单进程，Windows 冒烟推荐）")
     args = ap.parse_args()
     {"config": cmd_config, "train": cmd_train, "predict": cmd_predict}[args.task](args)
 

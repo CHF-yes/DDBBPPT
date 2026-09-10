@@ -21,15 +21,16 @@ diff -rq <site-packages>/ultralytics code/vendor/ultralytics   # 0 差异
 
 | 位置 | 做法 | 说明 |
 |---|---|---|
-| 基线模型2 `model_builder.py` | `rebuild_first_conv`：把 `model.model[0].conv` 的 `nn.Conv2d(3,...)` **替换为 5 通道**，前 3 通道继承 COCO 权重、后 2 通道取 RGB 均值再微调 | **早期融合**：输入 RGB3+IR1+Depth1 拼 5 通道 |
-| 实验模型1 `model_builder.py` | 从 vendor `import Conv, C2f, Concat, Detect`，自组 `AuxStream + ModalDropout + FusionBlock + SimplePAN`；主 backbone **直接复用官方 yolo11.pt**（不改 yaml），按模块索引 4/6/9 取 P3/P4/P5 | **中间融合**：主路全量 + IR/Depth 轻量辅助流，P3/P4/P5 分级融合 + 模态 dropout |
-| common `dataset.py` / `multimodal_augment.py` | 三模态读取 → 5 通道张量拼装；几何同步增强（flip/letterbox 三图共享、HSV 仅 RGB、Depth 最近邻） | 不触碰官方 DataLoader，独立数据管道 |
-| `model_utils.py` | `ensure_detect_classes`：把官方 Detect 头的 `nc=80` 改为赛题 12 | 运行时改参数，不改源码 |
+| 基线模型2 `model_builder.py` | `rebuild_first_conv`：把 `model.model[0].conv` 的 `nn.Conv2d(3,...)` **替换为 6 通道**，前 3 通道继承 COCO 权重、新增 3 通道（IR/距离/掩码）取 RGB 均值 ×5% 起步 | **早期融合**：输入 RGB3+IR1+Depth2(距离+有效掩码) 拼 6 通道；`in_channels=5` 可作无掩码消融 |
+| 实验模型1 `model_builder.py` | 从 vendor `import Conv, C2f, Concat, Detect`，自组 `AuxStream + ModalDropout + FusionBlock + EdgeAttnGate(MEGA) + AuxHead + SimplePAN`；主 backbone **直接复用官方 yolo11.pt**（不改 yaml），按模块索引 4/6/10 取 P3/P4/P5（**P5=C2PSA，非 SPPF**） | **中间融合**：主路全量 + IR/Depth 轻量辅助流，P3/P4/P5 分级融合；Step2 逐模态整路 dropout；Step4 MEGA（固定 Sobel 边缘 + 位置级门 × 模态级权重 + 残差保底，P4/P5）；Step3 每模态辅助头（P4 中心分类 + λ 退火辅助损失） |
+| common `dataset.py` / `multimodal_augment.py` | 三模态读取 → 6 通道张量拼装（RGB 序 + 有效掩码）；几何同步增强（flip/letterbox 三图共享、HSV 仅 RGB、Depth 最近邻）；`AlignConfig` 按原图宽换算深度平移 | 不触碰官方 DataLoader，独立数据管道；训练/验证/推理共用 `build_consistent_aug_5ch`（letterbox 一致） |
+| `model_utils.py` | `ensure_detect_classes`：重建官方 Detect 头的 `cv3`（nc=80→赛题 12），并**同步外层** `DetectionModel.nc` 与 `yaml["nc"]` | 运行时改参数，不改源码 |
+| `train_loop.py` | 自定义训练循环（DataLoader 多进程读图 + ultralytics `v8DetectionLoss` + EMA + 余弦调度 + 早停 + 赛题口径 mAP 评估 + 辅助损失）；`save_ckpt`/`load_custom_checkpoint` 统一 checkpoint 协议 | 复用官方损失/EMA 实现，仅组合不修改 |
 
-### 1.3 全部新增文件（27 个 .py，均为独立模块，官方包外）
+### 1.3 全部新增文件（均为独立模块，官方包外）
 
 ```
-models_config.py                     # 版本注册表（三版本配置）
+models_config.py                     # 版本注册表（三版本配置 + AlignConfig/PreprocessParams/AugmentParams）
 common/                              # 共享层 12 个
   __init__.py dataset.py evaluate.py inference.py mask_to_boxes.py
   model_utils.py multimodal_augment.py scan_data.py split_data.py
@@ -44,10 +45,10 @@ experiment1.py                       # 早期冒烟实验
 
 ## 2. 什么没改（保持原生）
 
-- **训练/推理全流程**：TaskAlignedAssigner 标签分配、`v8DetectionLoss`（BCE + DFL + CIoU）、EMA、学习率调度、`close_mosaic`、自动混合精度、DDP 多卡、NMS 后处理——**全部原版未动**；
-- **模型结构文件**：`yolo11.yaml` 及其 backbone（C3k2/SPPF）、neck（PAN-FPN/C2PSA）、Detect 头——**未修改、未新增层**（实验模型1 只是"借用"其主干模块并外挂辅助流）；
+- **训练/推理核心组件**：TaskAlignedAssigner 标签分配、`v8DetectionLoss`（BCE + DFL + CIoU）、EMA、学习率调度、`close_mosaic`、自动混合精度、DDP 多卡、NMS 后处理——**全部原版未动**（自定义循环是"调用"而非"改写"）；
+- **模型结构文件**：`yolo11.yaml` 及其 backbone（C3k2/SPPF）、neck（PAN-FPN/C2PSA）、Detect 头——**未修改、未新增层**（实验模型1 只是"借用"其主干模块并外挂辅助流/融合/注意力/辅助头）；
 - **数据增强管线**：官方 Mosaic/HSV/Flip/RandomPerspective/MixUp 等超参与实现未动；
-- **官方内置 DataLoader**：未改造（5 通道数据由我们自己的 `common.dataset` 管道读取，训练主循环用自定义 `train_loop.py`/`datasets`，与官方 loader 并行不冲突）。
+- **官方内置 DataLoader**：未改造（多模态数据由 `common.dataset` 管道读取，训练主循环用自定义 `train_loop.py`，与官方 loader 并行不冲突）。
 
 ---
 
@@ -67,4 +68,10 @@ diff -rq /path/to/site-packages/ultralytics code/vendor/ultralytics | grep -v __
 
 # import 冒烟（确认新增层可用）
 python -c "import sys; sys.path.insert(0,'code'); import models_config, common; print('OK')"
+
+# 实验模型1 结构自检（构建 + dummy 前向，含 MEGA/AuxHead）
+python 实验模型1/main.py selfcheck
+
+# 基线2 构建自检（首层 6 通道 / 外层 nc=12）
+python -c "import sys; sys.path.insert(0,'code/基线模型2'); import model_builder as MB; w=MB.build_baseline2(); print(w.model.model[0].conv.in_channels, w.model.nc)"
 ```

@@ -118,6 +118,11 @@ class AugmentParams:
     # ---- 几何（三图同步）----
     flip_p: float = 0.5              # 水平翻转概率
     vflip_p: float = 0.0             # 垂直翻转概率（默认关：上下语义失真）
+    scale: float = 0.0               # 随机缩放 ±scale（0=关；与基线1 对齐用 0.5）
+    translate: float = 0.0           # 随机平移（占画布比例；与基线1 对齐用 0.1）
+    mosaic_p: float = 0.0            # 4 图拼接概率（0=关；与基线1 对齐用 1.0）
+    close_mosaic_epochs: int = 10    # 最后 N 轮关闭 mosaic（0=不关）
+    close_mosaic_frac: float = 0.0   # 按比例关闭：最后 frac×epochs 轮关 mosaic（与上一项取较大者）
     # ---- RGB 光度 ----
     hsv_rgb: bool = True             # 是否启用 RGB HSV
     hsv_h: float = 0.015
@@ -185,6 +190,10 @@ class HyperParams:
     workers: int = 4
     optimizer: str = "auto"
     lr0: float = 0.01
+    weight_decay: float = 5e-4
+    warmup_epochs: float = 0.0           # 自定义循环的线性 warmup；实验1单独开启
+    lrf: float = 0.01                    # 最终学习率 = lr0 * lrf（余弦退火不降到0）
+    backbone_lr_mult: float = 1.0        # 预训练 backbone 相对新模块的学习率倍率
     amp: bool = True                      # 混合精度省显存
     seed: int = 42
     patience: int = 30                    # 早停
@@ -196,7 +205,16 @@ class HyperParams:
     # ---- Step3/4 多模态增强开关与辅助损失权重 ----
     mega: bool = True               # Step4 MEGA 边缘引导注意力(P4/P5)
     aux_heads: bool = True          # Step3 每模态辅助头(中心分类)
-    aux_lambda: float = 0.1         # 辅助损失权重(训练期间线性退火→0)
+    aux_lambda: float = 0.1         # 辅助损失权重(训练期间线性退火→下限)
+    aux_lambda_final: float = 0.0   # λ 下限（0=允许退到 0；>0 让辅助监督后期仍生效）
+
+    # ---- 实验模型1 专用开关（其余版本取默认值即行为不变）----
+    modal_dropout_p: float = 0.0    # 辅助流逐模态 dropout（0=关）
+    fusion_warmup_epochs: float = 0.0  # 前 N 轮锁 γ=0 只训 RGB，之后解冻融合
+    gamma_init: float = 0.0         # 注入门 γ 初始值（0=严格恒等，保持与官方一致）
+    per_modality_gate: bool = True  # 逐模态 × 逐位置门控（含 depth 有效性掩码先验）
+    aux_depth_head: bool = True     # 稀疏距离辅助头（深度图自监督）
+    aux_dist_head_src: str = "ir"   # 距离头挂在哪个流：ir（跨模态推断，默认）| dep
 
     # ---- 统一数据增强（三模态全覆盖；各版本可覆写）----
     aug: AugmentParams = field(default_factory=AugmentParams)
@@ -279,7 +297,31 @@ EXPERIMENT1 = ModelConfig(
     modality=Modality.RGB_IR_DEPTH,
     fusion=FusionScheme.MIDFUSION,          # 主干 P3/P4/P5 分级中间融合（见 model_builder）
     enabled=True,                           # 已落地可运行实例（config/selfcheck/train/predict）
-    hyper=HyperParams(pretrained_weights="yolo11s.pt"),
+    hyper=HyperParams(
+        pretrained_weights="yolo11s.pt",
+        optimizer="AdamW",
+        lr0=1e-3,
+        weight_decay=5e-4,
+        warmup_epochs=3.0,
+        lrf=0.01,
+        backbone_lr_mult=0.1,
+        # ---- 几何增强（三模态同步；对齐基线1 但 mosaic 降到 0.5）----
+        aug=AugmentParams(
+            rgb_drop_prob=0.0,           # 关：整图丢 RGB 是净损失
+            scale=0.5, translate=0.1,    # 与基线1 一致（随机缩放 ±50% + 平移 0.1）
+            # mosaic=1.0 时训练分布全是拼接图，而验证/Test 是干净单图 —— 且本次 81 轮早停
+            # 使 close_mosaic（原定末 10 轮）从未生效 → 分布不匹配。故降到 0.5：
+            # 一半样本始终是干净单图，同时保留拼接带来的尺度/上下文多样性。
+            mosaic_p=0.5, close_mosaic_epochs=10, close_mosaic_frac=0.15,
+        ),
+        modal_dropout_p=0.0,             # 关：辅助门控本就很小，再 dropout 只会更小
+        fusion_warmup_epochs=5.0,        # 前 5 轮锁 γ=0 只训 RGB，之后解冻融合
+        # ---- 阶段2：让辅助流具备检测/几何能力 ----
+        aux_lambda_final=0.02,           # λ 不再退火到 0
+        aux_depth_head=True,             # 稀疏距离头（深度图自监督）
+        per_modality_gate=True,          # 逐模态 × 逐位置门控 + 掩码先验
+        gamma_init=0.0,                  # 保持"γ=0 时与官方 YOLO11s 逐位一致"
+    ),
     notes=("输入为三路 tensor：rgb(B,3,H,W)/ir(B,1,H,W)/depth(B,2,H,W)——"
            "in_channels=6 仅表示总输入通道数，非单张拼接。"
            "训练/推理见 实验模型1/main.py；checkpoint 见 common.train_loop.load_custom_checkpoint。"),

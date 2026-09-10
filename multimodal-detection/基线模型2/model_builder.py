@@ -41,7 +41,7 @@ def build_baseline2(weights: str = None, class_num: int = MC.CLASS_NUM):
     # 首层 3→5
     MU.rebuild_first_conv(model, cfg.in_channels, strategy="mean_rgb")
     MU.ensure_detect_classes(model, class_num)
-    print(f"[baseline2] 已构建 {cfg.name}  首层输入={cfg.in_channels} 类={cfg.class_num}")
+    print(f"[baseline2] 已构建 {cfg.name}  首层输入={cfg.in_channels} 类={class_num}")
     return model
 
 

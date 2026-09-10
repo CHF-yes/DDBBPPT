@@ -47,25 +47,31 @@ def _read(path, flags: int):
 # 模态读取与归一化
 # ------------------------------------------------------------
 
-def read_rgb_bgr(path) -> np.ndarray:
+def read_rgb_bgr(path, reduce: int = 1) -> np.ndarray:
     """读可见光三通道, 返回 BGR ndarray (H,W,3) uint8。后续需 BGR2RGB。
-    用 fromfile+imdecode 兼容中文路径。"""
+    用 fromfile+imdecode 兼容中文路径。
+    reduce=2/4：解码时直接降采样（mosaic 的辅助源本来就要缩到 1/2，省 4 倍解码时间）。"""
     import cv2
+    flag = {1: cv2.IMREAD_COLOR, 2: cv2.IMREAD_REDUCED_COLOR_2,
+            4: cv2.IMREAD_REDUCED_COLOR_4}[int(reduce)]
     data = np.fromfile(str(path), dtype=np.uint8)
-    img = cv2.imdecode(data, cv2.IMREAD_COLOR)
+    img = cv2.imdecode(data, flag)
     if img is None:
         raise FileNotFoundError(f"RGB 读取失败: {path}")
     return img
 
 
-def read_ir_gray(path) -> np.ndarray:
+def read_ir_gray(path, reduce: int = 1) -> np.ndarray:
     """
     读红外图。文件存为三通道灰阶(PNG/JPG)，视觉一致(实为 3x 单通道堆叠)。
     因此返回单通道 uint8 (H,W)，取第 0 通道。兼容中文路径。
+    reduce=2/4：解码时降采样（灰阶版），仅用于 mosaic 辅助源。
     """
     import cv2
+    flag = {1: cv2.IMREAD_UNCHANGED, 2: cv2.IMREAD_REDUCED_GRAYSCALE_2,
+            4: cv2.IMREAD_REDUCED_GRAYSCALE_4}[int(reduce)]
     data = np.fromfile(str(path), dtype=np.uint8)
-    img = cv2.imdecode(data, cv2.IMREAD_UNCHANGED)  # 保留原深度、不转彩
+    img = cv2.imdecode(data, flag)  # 保留原深度、不转彩
     if img is None:
         raise FileNotFoundError(f"IR 读取失败: {path}")
     if img.ndim == 3:

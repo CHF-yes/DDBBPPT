@@ -274,6 +274,116 @@ def transform_boxes_letterbox(boxes_norm: np.ndarray, info: dict) -> np.ndarray:
 
 
 # ------------------------------------------------------------
+# 几何增强（三模态同步）：随机缩放/平移 + 4 图拼接
+# ------------------------------------------------------------
+
+def _boxes_to_canvas(boxes_norm, info, min_px: float = 2.0):
+    """归一化框 → 画布归一化框（复用 letterbox 变换），并丢弃出画/退化框。"""
+    if boxes_norm is None:
+        return None
+    b = transform_boxes_letterbox(boxes_norm, info)
+    if b is None or b.size == 0:
+        return b
+    nh, nw = info["new_size"]
+    keep = (b[:, 3] * nw >= min_px) & (b[:, 4] * nh >= min_px)
+    return b[keep]
+
+
+def random_affine_consistent(rgb: np.ndarray, ir: np.ndarray, depth: np.ndarray,
+                             boxes_norm, new_size=(1024, 1024),
+                             scale: float = 0.0, translate: float = 0.0, rng=None):
+    """
+    三模态**同步**的随机缩放 + 随机平移（等比、不旋转/不剪切）。
+
+    缩放比 = 基准 letterbox 缩放 × (1 ± scale)，再叠加 ±translate 的画布比例平移；
+    三图共用**同一仿射矩阵**，像素一一对应关系严格保持（对齐不破坏）。
+    - rgb  : INTER_LINEAR + 填 114（与 letterbox 一致）
+    - ir   : INTER_LINEAR + 填 114
+    - depth: **INTER_NEAREST** + 填 0 —— 绝不插值出伪距离，无效区仍为 0
+    返回 (rgb_o, ir_o, dep_o, boxes_o, info)。
+    """
+    iv = _cv()
+    rng = rng if rng is not None else random
+    h0, w0 = rgb.shape[:2]
+    nh, nw = int(new_size[0]), int(new_size[1])
+    base = min(nh / h0, nw / w0)
+    s = base * (1.0 + rng.uniform(-scale, scale)) if scale > 0 else base
+    dx = (nw - w0 * s) / 2.0 + (rng.uniform(-translate, translate) * nw if translate > 0 else 0.0)
+    dy = (nh - h0 * s) / 2.0 + (rng.uniform(-translate, translate) * nh if translate > 0 else 0.0)
+    M = np.float32([[s, 0.0, dx], [0.0, s, dy]])
+    rgb_o = iv.warpAffine(rgb, M, (nw, nh), flags=iv.INTER_LINEAR,
+                          borderMode=iv.BORDER_CONSTANT, borderValue=(_RGB_PAD,) * 3)
+    ir_o = iv.warpAffine(ir, M, (nw, nh), flags=iv.INTER_LINEAR,
+                         borderMode=iv.BORDER_CONSTANT, borderValue=_IR_PAD)
+    dep_o = iv.warpAffine(depth, M, (nw, nh), flags=iv.INTER_NEAREST,
+                          borderMode=iv.BORDER_CONSTANT, borderValue=_DEPTH_PAD_FLOAT)
+    info = dict(scale=s, dx=dx, dy=dy, old_h=h0, old_w=w0, new_size=(nh, nw))
+    return rgb_o, ir_o, dep_o, _boxes_to_canvas(boxes_norm, info), info
+
+
+def mosaic_consistent(items, new_size=(1024, 1024), rng=None, jitter: float = 0.15):
+    """
+    4 图 2×2 拼接（三模态共用同一布局）。
+
+    items: [(rgb, ir, depth, boxes_norm), ...]（各源均为原始图坐标、已过翻转/光度）
+    返回 (rgb_o, ir_o, dep_o, boxes_o)：画布 new_size，框为画布归一化。
+    - 每个源等比 letterbox 进各自象限（居中 + ±jitter 的位置抖动），象限顺序随机打乱；
+      **位置抖动很重要**：固定象限会让"物体永远不出现在画布中心/接缝附近"成为强位置先验，
+      验证集（物体在任意位置）会因此掉点。
+    - rgb/ir 用 INTER_LINEAR 填 114，depth 用 INTER_NEAREST 填 0（保持"0=无效"）；
+    - 框按各自仿射变换到画布，越界裁剪、退化框丢弃；
+    - 注意：拼接缝在深度图上不是真实几何边界（物理上不存在），靠 close_mosaic
+      在训练末段关闭 mosaic 来消除该偏差。
+    - **尺度**：本函数把每个源固定缩到约 0.5 倍；必须再叠一层随机缩放（见
+      consistent_augment_full 中 mosaic 之后的 random_affine），否则模型会被
+      单一尺度锁死（实测：只在 0.5 倍尺度上训练，1.0 倍验证集 mAP 只有 0.16，
+      同一权重在 0.5 倍验证集上却有 0.60）。
+    """
+    iv = _cv()
+    rng = rng if rng is not None else random
+    nh, nw = int(new_size[0]), int(new_size[1])
+    hh, hw = nh // 2, nw // 2
+    items = list(items)[:4]
+    order = list(range(len(items)))
+    rng.shuffle(order)
+    rgb_o = np.full((nh, nw, items[0][0].shape[2]), _RGB_PAD, items[0][0].dtype)
+    ir_o = np.full((nh, nw), _IR_PAD, items[0][1].dtype)
+    dep_o = np.zeros((nh, nw), items[0][2].dtype)
+    boxes_all = []
+    for slot, idx in enumerate(order):
+        rgb, ir, dep, boxes = items[idx]
+        h0, w0 = rgb.shape[:2]
+        s = min(hh / h0, hw / w0)
+        col, row = slot % 2, slot // 2
+        dx = col * hw + (hw - w0 * s) / 2.0 + (rng.uniform(-jitter, jitter) * hw if jitter else 0.0)
+        dy = row * hh + (hh - h0 * s) / 2.0 + (rng.uniform(-jitter, jitter) * hh if jitter else 0.0)
+        # 只 warp 该 tile 的目标矩形（而不是整张画布 + 掩码复制）——后者在 640×640 上
+        # 每样本要多做 12 次全尺寸 warp，是整个数据管线的主要开销。
+        tw, th = int(round(w0 * s)), int(round(h0 * s))
+        x0, y0 = int(round(dx)), int(round(dy))
+        rx0, ry0 = max(0, x0), max(0, y0)
+        rx1, ry1 = min(nw, x0 + tw), min(nh, y0 + th)
+        if rx1 <= rx0 or ry1 <= ry0:
+            continue
+        M = np.float32([[s, 0.0, dx - rx0], [0.0, s, dy - ry0]])
+        rgb_o[ry0:ry1, rx0:rx1] = iv.warpAffine(
+            rgb, M, (rx1 - rx0, ry1 - ry0), flags=iv.INTER_LINEAR,
+            borderMode=iv.BORDER_CONSTANT, borderValue=(_RGB_PAD,) * 3)
+        ir_o[ry0:ry1, rx0:rx1] = iv.warpAffine(
+            ir, M, (rx1 - rx0, ry1 - ry0), flags=iv.INTER_LINEAR,
+            borderMode=iv.BORDER_CONSTANT, borderValue=_IR_PAD)
+        dep_o[ry0:ry1, rx0:rx1] = iv.warpAffine(
+            dep, M, (rx1 - rx0, ry1 - ry0), flags=iv.INTER_NEAREST,
+            borderMode=iv.BORDER_CONSTANT, borderValue=_DEPTH_PAD_FLOAT)
+        b = _boxes_to_canvas(boxes, dict(scale=s, dx=dx, dy=dy, old_h=h0, old_w=w0,
+                                         new_size=(nh, nw)))
+        if b is not None and len(b):
+            boxes_all.append(b)
+    boxes_o = np.concatenate(boxes_all, axis=0) if boxes_all else None
+    return rgb_o, ir_o, dep_o, boxes_o
+
+
+# ------------------------------------------------------------
 # 组装
 # ------------------------------------------------------------
 
@@ -283,19 +393,25 @@ def consistent_augment_full(
     new_size=(1024, 1024),
     aug: Optional["AugmentParams"] = None,
     seed: Optional[int] = None,
+    extras: Optional[Sequence[tuple]] = None,
+    rng=None,
 ):
     """
     三模态「一致性 + 全覆盖」增强组装（由统一配置 AugmentParams 驱动）：
 
-      (1) 几何：水平/垂直翻转三图**同步**(同一掷骰)；是否翻转由 aug.flip_p/vflip_p；
-      (2) RGB 光度：HSV 抖动（aug.hsv_rgb/hsv_h/s/v）；
-      (3) IR 光度：灰度增益/偏置抖动（aug.ir_gain/ir_bias）；
-      (4) Depth 光度：有效区乘性噪声（aug.depth_noise）；
-      (5) Depth 几何：随机平移模拟对齐残差（aug.depth_jitter_*，标签不动）；
-      (6) 几何：同步 LetterBox（同一 scale+pad，Depth 用最近邻防伪值）。
+      (1) 几何：水平/垂直翻转三图**同步**（同一掷骰）；
+      (2) RGB 光度：HSV 抖动；IR 光度：灰度增益/偏置；Depth 光度：有效区乘性噪声；
+      (3) Depth 几何：随机平移模拟对齐残差（标签不动）；
+      (4) 几何（三图同步，二选一）：
+            * mosaic：与 extras 的 3 个源做 4 图拼接（aug.mosaic_p 命中时）；
+            * 随机缩放+平移（aug.scale / aug.translate > 0 时）；
+            * 否则退回原**确定性 letterbox**（验证/推理路径行为完全不变）。
+      (5) 拼接缝在深度图上非真实几何，训练末段用 close_mosaic_epochs 关闭 mosaic。
 
     aug=None 时等于"无光度/无抖动增强，仅同步 letterbox"（验证路径）。
-    返回 (rgb_c, ir_c, depth_c, boxes_c)；boxes_c 作用于 letterbox 画布、归一化。
+    extras: 可选的 3 组额外源 [(rgb, ir, depth, boxes_norm), ...]（原图坐标）。
+    rng   : 传入时复用该随机源（与上层采样共享种子）；否则由 seed 构造。
+    返回 (rgb_c, ir_c, depth_c, boxes_c)；boxes_c 作用于画布、归一化。
     """
     from models_config import AugmentParams
     if aug is None:
@@ -306,34 +422,57 @@ def consistent_augment_full(
             ir_gain=0.0, ir_bias=0.0, depth_noise=0.0,
             depth_jitter_prob=0.0, rgb_drop_prob=0.0,
         )
-    rng = random.Random(seed) if seed is not None else random
-    # (1) 几何翻转：三图同步（同一掷骰）
-    flip_r, flip_i, flip_d, flip_b = flip_lr_consistent(
-        rgb, ir, depth, boxes_norm, p=aug.flip_p, rng=rng)
-    if aug.vflip_p > 0 and rng.random() < aug.vflip_p:
-        def _vf(img):
-            return img[::-1, :, :] if img.ndim == 3 else img[::-1, :]
-        flip_r, flip_i, flip_d = _vf(flip_r), _vf(flip_i), _vf(flip_d)
-        if flip_b is not None and flip_b.size:
-            flip_b[:, 2] = 1.0 - flip_b[:, 2]   # cy → 1-cy
-    # (2) RGB 随机失效（防主导模态垄断；仅训练，标签不动）
-    rgb_dropped = False
-    if aug.rgb_drop_prob > 0 and rng.random() < aug.rgb_drop_prob:
-        flip_r = rgb_dropout(flip_r, prob=1.0, mode=aug.rgb_drop_mode, rng=rng)
-        rgb_dropped = True
-    # (3) RGB HSV（RGB 已失效则跳过，颜色增强无意义）
-    if aug.hsv_rgb and not rgb_dropped:
-        flip_r = hsv_only_rgb(flip_r, aug.hsv_h, aug.hsv_s, aug.hsv_v, rng=rng)
-    # (4) IR 增益/偏置
-    flip_i = ir_gain_jitter(flip_i, aug.ir_gain, aug.ir_bias, rng=rng)
-    # (5) Depth 值噪声（有效区）
-    flip_d = depth_value_noise(flip_d, aug.depth_noise, rng=rng)
-    # (6) Depth 随机平移（对齐残差模拟）
-    flip_d = random_shift_depth(flip_d, aug.depth_jitter_x, aug.depth_jitter_y,
-                                aug.depth_jitter_prob, rng=rng)
-    # (7) 同步 letterbox
-    r_o, i_o, d_o, info = letterbox_consistent(flip_r, flip_i, flip_d, new_size)
-    b_o = transform_boxes_letterbox(flip_b, info) if flip_b is not None else None
+    rng = rng if rng is not None else (random.Random(seed) if seed is not None else random)
+
+    # (1) 几何翻转：**所有源共用同一掷骰**（各源内部三模态因此严格同步）
+    do_flip = aug.flip_p > 0 and rng.random() < aug.flip_p
+    do_vflip = aug.vflip_p > 0 and rng.random() < aug.vflip_p
+
+    def _prep(src):
+        r, i, d, b = src
+        if do_flip:
+            r, i, d, b = flip_lr_consistent(r, i, d, b, p=1.0, rng=rng)
+        if do_vflip:
+            def _vf(img):
+                return img[::-1, :, :] if img.ndim == 3 else img[::-1, :]
+            r, i, d = _vf(r), _vf(i), _vf(d)
+            if b is not None and np.asarray(b).size:
+                b = np.array(b, dtype=np.float32).reshape(-1, 5).copy()
+                b[:, 2] = 1.0 - b[:, 2]
+        # (2) RGB 随机失效（防主导模态垄断；仅训练，标签不动）
+        dropped = False
+        if aug.rgb_drop_prob > 0 and rng.random() < aug.rgb_drop_prob:
+            r = rgb_dropout(r, prob=1.0, mode=aug.rgb_drop_mode, rng=rng)
+            dropped = True
+        # (3) 光度：HSV 只作用 RGB；IR 增益/偏置；Depth 有效区噪声
+        if aug.hsv_rgb and not dropped:
+            r = hsv_only_rgb(r, aug.hsv_h, aug.hsv_s, aug.hsv_v, rng=rng)
+        i = ir_gain_jitter(i, aug.ir_gain, aug.ir_bias, rng=rng)
+        d = depth_value_noise(d, aug.depth_noise, rng=rng)
+        d = random_shift_depth(d, aug.depth_jitter_x, aug.depth_jitter_y,
+                               aug.depth_jitter_prob, rng=rng)
+        return r, i, d, b
+
+    main_src = _prep((rgb, ir, depth, boxes_norm))
+    use_mosaic = (bool(extras) and getattr(aug, "mosaic_p", 0.0) > 0
+                  and rng.random() < float(aug.mosaic_p))
+    if use_mosaic:
+        srcs = [main_src] + [_prep(e) for e in list(extras)[:3]]
+        r_o, i_o, d_o, b_o = mosaic_consistent(srcs, new_size, rng)
+        # mosaic 把每个源固定缩到约 0.5 倍 → 必须再叠随机缩放/平移，否则尺度退化为单一值
+        # （与基线1 的 ultralytics 流程一致：mosaic + RandomPerspective(scale/translate)）。
+        if getattr(aug, "scale", 0.0) > 0 or getattr(aug, "translate", 0.0) > 0:
+            r_o, i_o, d_o, b_o, _ = random_affine_consistent(
+                r_o, i_o, d_o, b_o, new_size, float(aug.scale), float(aug.translate), rng)
+    elif getattr(aug, "scale", 0.0) > 0 or getattr(aug, "translate", 0.0) > 0:
+        r_o, i_o, d_o, b_o, _ = random_affine_consistent(
+            main_src[0], main_src[1], main_src[2], main_src[3],
+            new_size, float(aug.scale), float(aug.translate), rng)
+    else:
+        r_o, i_o, d_o, info = letterbox_consistent(
+            main_src[0], main_src[1], main_src[2], new_size)
+        b_o = (transform_boxes_letterbox(main_src[3], info)
+               if main_src[3] is not None else None)
     return r_o, i_o, d_o, b_o
 
 
@@ -343,6 +482,8 @@ __all__ = [
     "hsv_only_rgb",
     "transform_boxes_letterbox",
     "consistent_augment_full",
+    "random_affine_consistent",
+    "mosaic_consistent",
     "align_depth",
     "random_shift_depth",
     "ir_gain_jitter",

@@ -19,6 +19,8 @@ ultralytics 内建训练器假设"一图固定通道"（3ch RGB 目录）。而�
 from __future__ import annotations
 
 import copy
+import dataclasses
+import math
 import random
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
@@ -26,6 +28,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 import models_config as MC
@@ -42,7 +45,9 @@ def make_batch_dict(chw_list: List[np.ndarray], boxes_list: List[Optional[np.nda
     """
     把逐样本的 (C,H,W) 张量与归一化框组装成 ultralytics 训练 batch dict。
     boxes 参考系: letterbox 后画布、归一化 [cls,cx,cy,w,h]。
-    返回 dict: cls(N,), bboxes(N,4) xywh 像素, batch_idx(N,), img(B,C,H,W),
+    注意：bboxes **保持归一化 xywh**——vendors v8DetectionLoss 的 Labels.preprocess
+    会按 imgsz 缩放后转 xyxy（传像素坐标会越界 → assigner 0 正样本，见实测 bug）。
+    返回 dict: cls(N,), bboxes(N,4) 归一化 xywh, batch_idx(N,), img(B,C,H,W),
                ori_shape, imgsz
     """
     device = torch.device("cpu")
@@ -51,11 +56,9 @@ def make_batch_dict(chw_list: List[np.ndarray], boxes_list: List[Optional[np.nda
     for i, boxes in enumerate(boxes_list):
         if boxes is None or boxes.size == 0:
             continue
-        H, W = imgs.shape[2], imgs.shape[3]
         b = np.asarray(boxes, dtype=np.float32).reshape(-1, 5)
         cls_all.append(b[:, 0].astype(np.float32))
-        cx, cy, w, h = b[:, 1] * W, b[:, 2] * H, b[:, 3] * W, b[:, 4] * H
-        box_all.append(np.stack([cx, cy, w, h], axis=1))
+        box_all.append(np.ascontiguousarray(b[:, 1:5]))   # 归一化 xywh（勿转像素！）
         idx_all.append(np.full(len(b), i, dtype=np.int64))
     cls = (np.concatenate(cls_all) if cls_all else np.zeros((0,), np.float32))
     boxes = (np.concatenate(box_all) if box_all else np.zeros((0, 4), np.float32))
@@ -127,7 +130,8 @@ class MultiSampleDataset(Dataset):
             aug=self.aug if self.augment else None,
             depth_shift=self.depth_shift, align=self.align,
             preprocess=self.preprocess,
-            seed=rng_seed, to_tensor=False)
+            seed=rng_seed, to_tensor=False,
+            mosaic_pool=self.samples if self.augment else None)
         return {"rgb": rgb, "ir": ir, "depth": dep}, boxes, stem
 
 
@@ -181,15 +185,19 @@ def train_custom(
     device = torch.device("cuda:0" if has_cuda else "cpu")
     model = model.to(device)
 
-    # 优化器 / 调度 / 混合精度
-    if h.optimizer.lower() in ("sgd", "auto"):
-        opt = torch.optim.SGD(model.parameters(), lr=h.lr0, momentum=0.937,
-                              weight_decay=5e-4)
-    else:
-        opt = torch.optim.AdamW(model.parameters(), lr=h.lr0, weight_decay=5e-4)
     steps_per_epoch = max(1, (len(samples_train) + h.batch - 1) // h.batch)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=h.epochs * steps_per_epoch)
-    scaler = torch.cuda.amp.GradScaler(enabled=has_cuda and h.amp)
+    opt = _build_optimizer(model, h)
+    warmup_steps = max(0, int(round(float(getattr(h, "warmup_epochs", 0.0)) * steps_per_epoch)))
+    total_steps = max(1, int(h.epochs) * steps_per_epoch)
+    scaler = torch.amp.GradScaler("cuda", enabled=has_cuda and h.amp)
+    optimizer_step = 0
+
+    group_desc = ", ".join(
+        f"{g.get('group_name', i)}={g['target_lr']:.2e}"
+        for i, g in enumerate(opt.param_groups))
+    print(f"[{cfg.key}] optimizer={type(opt).__name__} groups[{group_desc}] "
+          f"warmup={warmup_steps} steps ({getattr(h, 'warmup_epochs', 0.0):g} epochs) "
+          f"lrf={getattr(h, 'lrf', 0.01):g}")
 
     # EMA（与 ultralytics 一致）
     from ultralytics.utils.torch_utils import ModelEMA  # vendor 版
@@ -200,6 +208,8 @@ def train_custom(
     out_dir = Path(out_dir) if out_dir else Path.cwd() / "runs" / cfg.key
     wdir = out_dir / "weights"
     wdir.mkdir(parents=True, exist_ok=True)
+    print(f"[{cfg.key}] run epochs={h.epochs} patience={h.patience} imgsz={isz} "
+          f"batch={h.batch} workers={h.workers} out={out_dir}")
 
     for epoch in range(1, h.epochs + 1):
         model.train()
@@ -209,12 +219,29 @@ def train_custom(
         acc: Dict[str, float] = {}
         n_batches = 0
 
+        # ---- 每轮生效的增强：close_mosaic（末段关闭 mosaic，消除拼接缝的伪几何）----
+        # 窗口 = max(close_mosaic_epochs, close_mosaic_frac × epochs)
+        # 注意：若训练被 patience 提前截断，窗口可能永远到不了 —— 因此还需
+        # 用占比较小的 mosaic_p（见 models_config）+ 足够大的 patience 配合。
+        aug_eff = h.aug
+        cm = int(getattr(h.aug, "close_mosaic_epochs", 0) or 0)
+        cm = max(cm, int(round(float(getattr(h.aug, "close_mosaic_frac", 0.0) or 0.0)
+                               * int(h.epochs))))
+        if cm > 0 and epoch > int(h.epochs) - cm:
+            aug_eff = dataclasses.replace(h.aug, mosaic_p=0.0)
+        model._aug_override = aug_eff          # 同步读图路径的 build_batch 会读它
+
+        # ---- 融合课程：前 N 轮整体旁路注入（先让 RGB 通路站稳）----
+        if hasattr(model, "set_fusion_enabled"):
+            fw = float(getattr(h, "fusion_warmup_epochs", 0.0) or 0.0)
+            model.set_fusion_enabled(epoch > fw)
+
         # 多进程预取 DataLoader（worker 内读图+增强）；workers=0 时退回同步 build_batch
         dl_iter = None
         if use_dataloader and int(getattr(h, "workers", 0) or 0) > 0:
             ds = MultiSampleDataset(
                 order, mode=dataset_mode, target_size=(isz, isz),
-                aug=h.aug,
+                aug=aug_eff,
                 align=h.align,           # P1-6: 对齐量按原图宽换算（不再是目标 imgsz）
                 preprocess=h.preprocess, augment=True, seed=h.seed + epoch)
             dl = DataLoader(ds, batch_size=h.batch, shuffle=False,
@@ -240,20 +267,40 @@ def train_custom(
             inputs = move_to_device(inputs, device)          # rgb/ir/depth 等统一迁 GPU
             batch = {k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v)
                      for k, v in batch.items()}              # cls/bboxes/batch_idx/img
-            with torch.cuda.amp.autocast(enabled=has_cuda and h.amp):
+            _set_optimizer_lr(opt, optimizer_step, warmup_steps, total_steps,
+                              float(getattr(h, "lrf", 0.01)))
+            opt.zero_grad(set_to_none=True)
+            with torch.amp.autocast(device_type="cuda", enabled=has_cuda and h.amp):
                 preds = forward_fn(model, inputs)
                 loss, items = _compute_loss(model, preds, batch)
-            # Step3: 每模态辅助头损失（中心分类；λ 随 epoch 线性退火，梯度只回传辅助流）
+            # Step3: 每模态辅助头损失（中心分类；λ 线性退火但**保留下限**）
+            lam = 0.0
+            if int(h.epochs) <= 1:
+                aux_factor = 1.0
+            else:
+                aux_factor = 1.0 - (epoch - 1) / (int(h.epochs) - 1)
+            lam = max(float(getattr(h, "aux_lambda_final", 0.0) or 0.0),
+                      float(getattr(h, "aux_lambda", 0.1)) * aux_factor)
             if getattr(model, "aux_enabled", False) and model.training and model._aux_logits:
-                al = _aux_center_loss(model._aux_logits, batch)
-                lam = float(getattr(h, "aux_lambda", 0.1)) * (1.0 - epoch / max(int(h.epochs), 1))
+                al = _aux_center_loss(model._aux_logits, batch,
+                                      getattr(model, "_aux_keep", None))
                 loss = loss + lam * al
                 items["aux_loss"] = float(al.detach())
-            opt.zero_grad()
+            # Step3b: 稀疏距离头损失（GT = 深度图自身，零额外标注）
+            if (getattr(model, "dist_enabled", False) and model.training
+                    and getattr(model, "_aux_dist_logits", None) is not None
+                    and isinstance(inputs, dict) and "depth" in inputs):
+                dl = _aux_distance_loss(model._aux_dist_logits, batch, inputs["depth"],
+                                        scale_mm=float(getattr(h.preprocess, "depth_scale_mm", 20000.0)))
+                loss = loss + lam * dl
+                items["dist_loss"] = float(dl.detach())
             scaler.scale(loss).backward()
+            scale_before = scaler.get_scale()
             scaler.step(opt)
             scaler.update()
-            sched.step()
+            # AMP 溢出时 GradScaler 会跳过 optimizer.step；学习率进度也必须同步跳过。
+            if not scaler.is_enabled() or scaler.get_scale() >= scale_before:
+                optimizer_step += 1
             for k, v in items.items():
                 acc[k] = acc.get(k, 0.0) + float(v)
             n_batches += 1
@@ -275,7 +322,7 @@ def train_custom(
             map_str = (f"mAP50-95 {cur_map:.3f} mAP50 {map_res.get('map50', float('nan')):.3f}"
                        if map_res else "no val")
             print(f"[{cfg.key}] ep {epoch}/{h.epochs} {avg_str} {map_str} "
-                  f"lr {sched.get_last_lr()[0]:.2e}")
+                  f"lr[{_format_group_lrs(opt)}]")
 
         ema.update_attr(model)
         ema.update(model)
@@ -379,25 +426,161 @@ def _scalarize(loss):
     return loss.sum() if torch.is_tensor(loss) and loss.ndim > 0 else loss
 
 
-def _aux_center_loss(logits: dict, batch: Dict):
-    """Step3 中心分类辅助损失（CenterNet 风格，P4 stride=16）：
-    GT 框中心映射到 (B,nc,H4,W4) one-hot → BCEWithLogits。
+def _aux_center_loss(logits: dict, batch: Dict, keep_masks: Optional[dict] = None):
+    """Step3 中心分类辅助损失（CenterNet 风格，P4 stride 网格）：
+    GT 框中心映射为 3x3 高斯热图，并用 modified focal loss 处理极端前景稀疏。
     logits 只由 AuxStream→AuxHead 路径产生 → 梯度天然不经过主流 backbone。"""
-    import torch.nn.functional as F
     device = next(iter(logits.values())).device
     cls = batch["cls"].to(device).long()
     cx, cy = batch["bboxes"][:, 0].to(device), batch["bboxes"][:, 1].to(device)
     bidx = batch["batch_idx"].to(device).long()
-    total = 0.0
-    for logit in logits.values():
+    total = next(iter(logits.values())).new_zeros(())
+    used_modalities = 0
+    for name, raw_logit in logits.items():
+        # AMP 下 FP16 的 1-1e-4 会舍入成1，进而 log(1-p)=log(0)=inf；
+        # focal loss固定使用FP32，梯度仍会正常回传到原始辅助头。
+        logit = raw_logit.float()
         nc_, H4, W4 = logit.shape[1], logit.shape[2], logit.shape[3]
-        stride = 16.0
-        gx = (cx / stride).long().clamp(0, W4 - 1)
-        gy = (cy / stride).long().clamp(0, H4 - 1)
-        target = torch.zeros(logit.shape, device=device)
-        target[bidx, cls, gy, gx] = 1.0
-        total = total + F.binary_cross_entropy_with_logits(logit, target)
-    return total / max(len(logits), 1)
+        if keep_masks and name in keep_masks:
+            active = keep_masks[name].reshape(logit.shape[0]).to(device=device).bool()
+        else:
+            active = torch.ones(logit.shape[0], device=device, dtype=torch.bool)
+        if not active.any():
+            continue
+        valid = ((bidx >= 0) & (bidx < logit.shape[0]) &
+                 (cls >= 0) & (cls < nc_) & active[bidx.clamp(0, logit.shape[0] - 1)])
+        gx = (cx * W4).long().clamp(0, W4 - 1)
+        gy = (cy * H4).long().clamp(0, H4 - 1)
+        target = torch.zeros_like(logit)
+        # 3x3 Gaussian (sigma=1)：中心为1，邻域为软目标；重叠位置取最大值。
+        kernel = logit.new_tensor([[0.36787945, 0.60653067, 0.36787945],
+                                   [0.60653067, 1.0,        0.60653067],
+                                   [0.36787945, 0.60653067, 0.36787945]])
+        for bi, ci, yi, xi in zip(bidx[valid].tolist(), cls[valid].tolist(),
+                                  gy[valid].tolist(), gx[valid].tolist()):
+            y0, y1 = max(0, yi - 1), min(H4, yi + 2)
+            x0, x1 = max(0, xi - 1), min(W4, xi + 2)
+            ky0, kx0 = y0 - (yi - 1), x0 - (xi - 1)
+            patch = kernel[ky0:ky0 + (y1 - y0), kx0:kx0 + (x1 - x0)]
+            target[bi, ci, y0:y1, x0:x1] = torch.maximum(
+                target[bi, ci, y0:y1, x0:x1], patch)
+
+        pred = logit.sigmoid().clamp(1e-4, 1.0 - 1e-4)
+        active_map = active.view(-1, 1, 1, 1)
+        pos = target.eq(1.0) & active_map
+        neg = target.lt(1.0) & active_map
+        neg_weights = (1.0 - target).pow(4)
+        pos_loss = -(pred.log() * (1.0 - pred).pow(2) * pos).sum()
+        neg_loss = -((1.0 - pred).log() * pred.pow(2) * neg_weights * neg).sum()
+        num_pos = pos.sum().clamp_min(1).to(logit.dtype)
+        total = total + (pos_loss + neg_loss) / num_pos
+        used_modalities += 1
+    return total / max(used_modalities, 1)
+
+
+def _aux_distance_loss(logits: torch.Tensor, batch: Dict, depth_input: torch.Tensor,
+                       scale_mm: float = 20000.0, win: int = 9, min_valid: float = 0.5):
+    """Step3b 稀疏距离回归（深度图自监督，零额外标注）。
+
+    logits      : (B,1,H4,W4) 距离头输出（P4 分辨率，log(米)）
+    depth_input : (B,2,H,W)  模型输入的 depth = [归一化距离, 有效掩码]
+    GT：GT 框中心处 **win×win 窗口内有效像素的均值距离**（毫米→米→log）。
+        为降低噪声：窗口要求有效比例 ≥ min_valid，否则该框不参与
+        （否则框中心可能落在背景/深度空洞/mosaic 拼接缝上 → 伪 GT）。
+    返回 Huber 损失；梯度只回传距离头所在辅助流。
+    """
+    device = logits.device
+    b, _, h4, w4 = logits.shape
+    cls = batch["cls"].to(device)
+    cx = batch["bboxes"][:, 0].to(device)
+    cy = batch["bboxes"][:, 1].to(device)
+    bidx = batch["batch_idx"].to(device).long()
+    d_norm = depth_input[:, 0].to(device)              # (B,H,W)
+    d_mask = depth_input[:, 1].to(device)              # (B,H,W)
+    B, H, W = d_norm.shape
+
+    # 窗口内有效像素的均值距离（向量化，避免逐框循环）
+    d_sum = F.avg_pool2d((d_norm * d_mask).unsqueeze(1), win, stride=1,
+                         padding=win // 2).squeeze(1)
+    m_avg = F.avg_pool2d(d_mask.unsqueeze(1), win, stride=1,
+                         padding=win // 2).squeeze(1)
+    d_mean = d_sum / m_avg.clamp_min(1e-6)
+
+    valid = (bidx >= 0) & (bidx < B) & (cls >= 0)
+    if not bool(valid.any()):
+        return logits.sum() * 0.0
+    bi = bidx[valid]
+    px = (cx[valid] * W).long().clamp(0, W - 1)
+    py = (cy[valid] * H).long().clamp(0, H - 1)
+    tgt_m = d_mean[bi, py, px] * (scale_mm / 1000.0)   # 米
+    ok = m_avg[bi, py, px] >= float(min_valid)         # 有效比例达标才作为 GT
+    if not bool(ok.any()):
+        return logits.sum() * 0.0
+
+    gx = (cx[valid] * w4).long().clamp(0, w4 - 1)
+    gy = (cy[valid] * h4).long().clamp(0, h4 - 1)
+    pred = logits[bi, 0, gy, gx].float()
+    target = torch.log(tgt_m.clamp_min(0.05)).float()
+    return F.smooth_l1_loss(pred[ok], target[ok], beta=0.2)
+
+
+def _split_decay_params(named_params):
+    """AdamW/SGD 参数拆成 decay 与 no_decay（bias、BN及标量不衰减）。"""
+    decay, no_decay = [], []
+    for _name, p in named_params:
+        if not p.requires_grad:
+            continue
+        (decay if p.ndim > 1 else no_decay).append(p)
+    return decay, no_decay
+
+
+def _build_optimizer(model: nn.Module, h):
+    """实验1按预训练 backbone / 新模块分组；其余模型保持单一目标学习率。"""
+    backbone_mult = float(getattr(h, "backbone_lr_mult", 1.0))
+    named = list(model.named_parameters())
+    if hasattr(model, "backbone") and backbone_mult != 1.0:
+        partitions = [
+            ("backbone", [(n, p) for n, p in named if n.startswith("backbone.")], backbone_mult),
+            ("new", [(n, p) for n, p in named if not n.startswith("backbone.")], 1.0),
+        ]
+    else:
+        partitions = [("all", named, 1.0)]
+
+    groups = []
+    weight_decay = float(getattr(h, "weight_decay", 5e-4))
+    for name, params, mult in partitions:
+        decay, no_decay = _split_decay_params(params)
+        target_lr = float(h.lr0) * mult
+        if decay:
+            groups.append({"params": decay, "lr": target_lr, "target_lr": target_lr,
+                           "weight_decay": weight_decay, "group_name": f"{name}/decay"})
+        if no_decay:
+            groups.append({"params": no_decay, "lr": target_lr, "target_lr": target_lr,
+                           "weight_decay": 0.0, "group_name": f"{name}/no_decay"})
+
+    if h.optimizer.lower() in ("sgd", "auto"):
+        return torch.optim.SGD(groups, lr=float(h.lr0), momentum=0.937)
+    return torch.optim.AdamW(groups, lr=float(h.lr0), betas=(0.9, 0.999))
+
+
+def _set_optimizer_lr(opt, step: int, warmup_steps: int, total_steps: int, lrf: float):
+    """按实际成功的 optimizer 更新次数执行线性 warmup + 非零余弦退火。"""
+    if warmup_steps > 0 and step < warmup_steps:
+        factor = 0.1 + 0.9 * (step + 1) / warmup_steps
+    else:
+        remain = max(1, total_steps - warmup_steps)
+        progress = min(max((step - warmup_steps) / remain, 0.0), 1.0)
+        factor = lrf + 0.5 * (1.0 - lrf) * (1.0 + math.cos(math.pi * progress))
+    for group in opt.param_groups:
+        group["lr"] = group["target_lr"] * factor
+
+
+def _format_group_lrs(opt) -> str:
+    seen = {}
+    for i, group in enumerate(opt.param_groups):
+        prefix = str(group.get("group_name", i)).split("/", 1)[0]
+        seen[prefix] = group["lr"]
+    return ",".join(f"{name}={lr:.2e}" for name, lr in seen.items())
 
 
 def _to_float_items(items) -> dict:

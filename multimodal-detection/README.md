@@ -10,31 +10,34 @@ code/
 ├── models_config.py          ★ 唯一版本注册表（改配置就改这一处）
 ├── common/                   共享代码层（不掺实例逻辑）
 │   ├── __init__.py           sys.path 引导 + 公共 API
-│   ├── scan_data.py          数据布局探测 + 生成 ultralytics data.yaml
+│   ├── scan_data.py          数据布局探测（默认/目录布局自动回退）+ 生成 data.yaml
 │   ├── split_data.py         train/val/test 划分（设种子 + 类别分层）+ 清单/yaml
-│   ├── dataset.py            三/五通道读取与拼装；标签/预测 txt 读写
+│   ├── dataset.py            三/五/六通道读取与拼装；标签/预测 txt 读写
 │   ├── multimodal_augment.py 三模态一致性增强（几何同步 + 仅RGB变色 + Depth最近邻）
-│   ├── model_utils.py        YOLO 首层 3→5 改造 / 类头设定 / 权重继承
+│   ├── model_utils.py        YOLO 首层 3→6 改造 / 类头设定 / 权重继承
+│   ├── train_loop.py         自定义训练循环（DataLoader 多进程读图 + EMA + mAP 评估 + 辅助损失）
+│   ├── evaluate.py           mAP@50-95 赛题口径评估（逐类 IoU 贪心匹配）
 │   ├── trainer.py            训练超参封装（从 models_config 读）
 │   └── inference.py          推理 + 输出赛题同名预测 txt
 ├── 基线模型1/                3 通道原版 YOLO（单模态 RGB 对照）
 │   ├── model_builder.py  dataset_adapter.py  main.py  README.md  __init__.py
-├── 基线模型2/                5 通道前期融合（RGB3+IR1+Depth1）
+├── 基线模型2/                6 通道早期融合（RGB3 + IR1 + Depth2[距离+有效掩码]）
 │   ├── 同基线模型1 的对称四件套
-├── 实验模型1/                [占位] 进阶融合预留，不建实例（仅 README + __init__.py）
+├── 实验模型1/                RGB 主流 + IR/Depth 轻辅助流 + P3/P4/P5 分级融合
+│   ├── （ModalDropout + MEGA 边缘注意力 + 每模态辅助头；config/selfcheck/train/predict 齐全）
 └── vendor/ultralytics/       本地钉死的 ultralytics 8.4.138 源码（与 EFYOLO 运行时同版本）
                              实验模型1 源码级改造时使用；基线1/2 继续用 pip 版，互不影响
 ```
 
-依赖运行环境建议：EFYOLO conda（已装 ultralytics + CUDA）。
+依赖运行环境建议：EFYOLO conda（已装 ultralytics + CUDA），部署依赖清单见 `deploy_requirements.txt`。
 
 ## 三版本差异（消融对照表）
 
 | 版本 cfg key | 目录 | 输入 | 融合 | 首层 | enabled | 说明 |
 |---|---|---|---|---|---|---|
 | `baseline1_3ch` | 基线模型1 | RGB 3ch | 无 | 3(原版) | ✅ | 只读 RGB 的对照基线 |
-| `baseline2_5ch` | 基线模型2 | RGB+IR+Depth 5ch | 前期(cat) | 3→5 | ✅ | 三模态拼接的最小融合基线 |
-| `experiment1`  | 实验模型1 | 5ch(待定) | 进阶(待) | 待定 | ❌占位 | 中间/注意力/门控/模态dropout |
+| `baseline2_5ch` | 基线模型2 | RGB3+IR1+Depth2 共 6ch | 前期(cat) | 3→6 | ✅ | 三模态拼接的最小融合基线；`in_channels=5` 可作无掩码消融 |
+| `experiment1`  | 实验模型1 | 三路：rgb(3)/ir(1)/depth(2) | P3/P4/P5 分级 | 各流独立首层 | ✅ | 轻量辅助流 + ModalDropout + MEGA + 每模态辅助头（Step0-4 方案） |
 
 > 对分数来源的取向（见讨论）：**融合模块设计 > 输入分辨率 > 网络规格(n/s/m/l/x)**；
 > 在 2000 组、12 类、mAP@50-95 的高框精度需求下，优先 s/m + 高 imgsz + 扎实验证融合。
@@ -44,20 +47,29 @@ code/
 ```powershell
 $env:MULTIMODAL_DATA_ROOT = "填你自己的赛题数据根"   # 或改 models_config.py 的 DATA_ROOT
 
-# ① 建模型骨架环境（已在 EFYOLO 装好 ultralytics/cuda）
+# ① 建模型骨架环境（已在 EFYOLO 装好 ultralytics/cuda；权重 yolo11s.pt 必须放 code/ 根）
 code> & "D:\Development_Tools\anaconda3\envs\EFYOLO\python.exe" -c "import ultralytics, torch; print(torch.cuda.is_available())"
 
 # ② 探测数据根布局、按命名自动配对三模态+标签、生成 data.yaml
+#    支持两种布局：文件名带模态后缀（xxx_rgb.png 等）与目录布局（V/T/D 或
+#    visible/infrared/depth 子目录 + labels/labels_multi）——训练主入口会自动回退探测
 code> & "D:\Development_Tools\anaconda3\envs\EFYOLO\python.exe" common/scan_data.py --root $env:MULTIMODAL_DATA_ROOT --out data.yaml
-#    提示：若没有 train/val 分组，先用 --split-dirs train,val 或先切出验证集
 
-# ③ 查看各版本配置 / 构建
-code> & "D:\Development_Tools\anaconda3\envs\EFYOLO\python.exe" 基线模型1/main.py config
+# ③ 查看各版本配置 / 自检
 code> & "D:\Development_Tools\anaconda3\envs\EFYOLO\python.exe" 基线模型2/main.py config
+code> & "D:\Development_Tools\anaconda3\envs\EFYOLO\python.exe" 实验模型1/main.py selfcheck   # 构建+dummy前向
 
-# ④ 训练 / 预测 —— 详见各子目录 README
-#    3 通道可走 ultralytics 内建（基线1）；5 通道多输入需后续(实验)阶段自定义循环。
+# ④ 训练（无现成 val 时自动从 train 抽 10%；扫描到 0 样本立即报错）
+code> & "D:\Development_Tools\anaconda3\envs\EFYOLO\python.exe" 基线模型2/main.py train --data-root $env:MULTIMODAL_DATA_ROOT --imgsz 640
+code> & "D:\Development_Tools\anaconda3\envs\EFYOLO\python.exe" 实验模型1/main.py train --data-root $env:MULTIMODAL_DATA_ROOT --imgsz 640
+
+# ⑤ 预测（--weights 传训练产物 best.pt；自动识别自定义/原生 checkpoint；--imgsz 与训练一致）
+code> & "D:\Development_Tools\anaconda3\envs\EFYOLO\python.exe" 基线模型2/main.py predict --weights runs/experiment1/weights/best.pt --data-root $env:MULTIMODAL_DATA_ROOT --imgsz 640 --out pred_baseline2
 ```
+
+训练保存的 checkpoint 是自定义格式（`{"model_state":..., "cfg_key":...}`），预测入口统一走
+`common/train_loop.load_custom_checkpoint()` 回填（同时兼容 ultralytics 原生权重）。**离线环境注意**：
+`yolo11s.pt` 必须提前放到 code/ 根（缺失时 `MC.resolve_pretrained_weights` 直接报错，不会联网下载）。
 
 ## 训练 / 验证 / 测试 划分接口（common/split_data.py）
 
@@ -89,7 +101,7 @@ code> & "D:\Development_Tools\anaconda3\envs\EFYOLO\python.exe" common/split_dat
 三模态(RGB+IR+Depth)是**空间对齐**的；训练时的数据增强必须保证**几何逐像素一致**，
 否则随机各翻各的会立刻破坏对齐、毁掉跨模态互补。
 
-增援策略（核心口径）：
+增强策略（核心口径）：
 - **几何操作(改像素位置)**：flip / crop / letterbox / scale 对 RGB/IR/Depth **共享同一组参数**——
   要么一起都被增广、要么都不，保证三张图仍一一对应。
 - **颜色/光度(不改位置)**：HSV 抖动**只作用于 RGB**；IR/Depth 永不参与，避免伪造温度/距离语义。
@@ -100,11 +112,12 @@ code> & "D:\Development_Tools\anaconda3\envs\EFYOLO\python.exe" common/split_dat
 可用原语（`import common` 后直接可用）：
 - `common.flip_lr_consistent` / `common.letterbox_consistent` / `common.hsv_only_rgb`
 - `common.consistent_augment_full`   —— flip→仅RGB-Hsv→同步letterbox 的一次性组合
-- `common.build_consistent_aug_5ch`  —— dataset 侧统一入口：读三模态→同步增强→拼 (5,H,W)+标 box
+- `common.build_consistent_aug_5ch`  —— dataset 侧统一入口：读三模态→同步增强→拼 (6,H,W)+标 box
+  （`in_channels=5` 可作无掩码消融；训练/验证/推理共用此入口保证几何一致）
 
-> 现状与边界：ultralytics 内建 DataLoader 面向“单图固定通道”，无法直接对三张对齐图同步增广；
-> 因此这套一致性原语先作为 **common 层接口**落地，供实验模型/基线2阶段的自定义训练循环引用
-> （届时在 DataLoader 里每次 `build_consistent_aug_5ch` 即可保持几何一致）。
+> 深度对齐（Step0）：`models_config.AlignConfig`（`mode/shift_x/y/ref_size/scale_with_res`）
+> 控制 Depth 固定平移，平移量按**原始图宽**等比换算（-22px@1920 → VDT 640 约 -7px、赛题 1024 约 -12px）；
+> 数据/训练/验证/推理全链路统一接入，`mode="none"` 即关闭。
 
 ## vendor 源码（实验模型1 源码级改造基础）
 
@@ -138,20 +151,19 @@ print(ultralytics.__file__)                 # 应显示 ...\code\vendor\ultralyt
 
 可把任意"三模态+bbox txt"数据集接入（如 VDT-2048 的 V/T/D/labels_multi 目录布局）。
 **数据路径不写死**：优先 `$MULTIMODAL_DATA_ROOT`（或 `MC.DATA_ROOT`），也可用 CLI `--data-root` 覆盖。
+目录布局（V/T/D + labels_multi）无需手动加 `--layout`——训练/预测入口的
+`scan_samples_auto()` 在默认扫描为 0 样本时自动回退（实测 VDT Train 1048 组全部配对）。
 
 ```bash
-# 1) 目录布局模式扫描（VDT：V/T/D 按目录名配对）+ 自定义 45 类 names → data.yaml
+# 1) 扫描 + 生成数据清单（--layout 显式指定亦可；45 类 VDT 用 --names）
 python common/scan_data.py --layout \
     --root "…/VDT-2048 dataset/Train" \
     --names "…/vdt2048_meta/classes.txt" \
     --out "…/framework_data/data.yaml"
 
-# 2) 训练（类数由 --class-num 或配置覆盖，VDT 为 45）
-python 基线模型2/main.py train --data-root "…/VDT-2048 dataset/Train" --data-yaml "…/data.yaml"
+# 2) 训练（类数由 ModelConfig.class_num 控制；VDT 为 45 需在 models_config 覆盖）
+python 基线模型2/main.py train --data-root "…/VDT-2048 dataset/Train" --data-yaml "…/data.yaml" --imgsz 640
 ```
-
-> 扫描支持两种布局：① 文件名带模态后缀（`xxx_rgb.png` 等，自动识别）；
-> ② `--layout` 目录布局（V/T/D 或 visible/infrared/depth 子目录 + labels/labels_multi）。
 
 ## 进阶提示（实验模型1 起点）
 - 参考竞赛细则「解题思路」：数据增强；抽取网络特征；合理超参 + 自划验证集。
