@@ -6,6 +6,81 @@
 
 ---
 
+## 0. 当前状态：AIC2026 赛题适配（已完成训练）
+
+本教程对应的项目现已**完成赛题适配，并已用官方 12 类数据训练出可用模型**。
+
+### 0.1 已完成事项
+
+| 项目 | 状态 |
+|---|---|
+| 数据集配置 | ✅ 新增 `ultralytics/cfg/datasets/aic2026-rgbtd.yaml`（12 类，指向数据盘） |
+| 训练脚本 | ✅ `train_RGBTD.py` 已改为赛题版（12 类 + 全量训练集 + 三模态增强） |
+| 验证脚本 | ✅ `val_RGBTD.py` 已升级为赛题版（参数化路径、深度对齐参数与训练一致） |
+| 模型训练 | ✅ 300 epoch 跑完，最优 `best.pt` 已备份到本地 |
+| 核心代码 | ✅ 本地与服务器逐文件 md5 一致（base/loaders/build/augment/utils/conv/tasks/predictor 等） |
+
+### 0.2 训练成果（已下载到本地）
+
+```
+训练成果备份/AIC2026_12类_yolo11x-rgbtd/
+├── best.pt     209.7 MB  ⭐ 最优权重（md5 a9c7980b674f71390f21024e01d54f31）
+├── last.pt     209.7 MB
+├── results.csv / args.yaml / results.png / confusion_matrix*.png
+└── train_aic2026.log
+```
+
+| 指标 | 值（val_split，同源子集） |
+|---|---|
+| mAP50-95（最优） | 0.9065（epoch 290） |
+| mAP50（最优） | 0.9867（epoch 284） |
+| 训练耗时 | 19,932 秒 ≈ 5.54 小时（RTX 4090） |
+
+> ⚠️ **口径提醒**：`val_split` 是从训练集切出的 200 张**同源**样本，指标天然偏高。
+> 官方独立测试集（1000 张、无标签）上的真实分数预计在 **0.78~0.86**，须以平台评测为准。
+
+### 0.3 赛题数据格式（官方）
+
+```
+初赛数据集-面向城市场景的多模态目标检测/
+├── 训练集/AIC2026_Train_2000/
+│   ├── visible/    2000 张  8bit RGB（.png/.jpg 混存，640×360 与 1920×1080 混存）
+│   ├── infrared/   2000 张  8bit RGB（红外灰度堆叠 3 通道），与 visible 同名同扩展名
+│   ├── depth/      2000 张  16bit 单通道灰度 PNG，与 visible 同名同扩展名
+│   └── labels/     2000 个 YOLO txt（12 类，越界框已 clamp）
+└── 测试集/AIC2026_PHASE_1_1000/   visible/infrared/depth 各 1000 张，**无标签**
+```
+
+**12 类名（class_id 0–11）**：
+```
+person, boat, animal, seat, sign, bicycle, car, ball, light, garbage_can, uav, tricycle
+```
+
+### 0.4 服务器训练时的关键配置（`train_RGBTD.py`）
+
+```python
+model = YOLO("yolo11x-RGBTD-pretrained.pt")   # 复用迁移后的三模态预训练权重
+model.train(
+    data="ultralytics/cfg/datasets/aic2026-rgbtd.yaml",
+    imgsz=640, epochs=300, batch=8,           # 9 通道显存约为 RGB 的 3 倍
+    close_mosaic=10, workers=8, device="0", optimizer="SGD", seed=0,
+    use_simotm="RGBTD",                       # 三模态
+    channels=9,                               # BGR(3)+IR(3)+Depth(3)
+    pairs_rgb_ir=["visible", "infrared", "depth"],
+    depth_shift_x=0, depth_shift_y=0,         # 官方数据已对齐，平移量为 0
+    rgb_drop_prob=0.2, rgb_drop_mode="zero",  # RGB 随机失效，防单一模态依赖
+    ir_gain=0.15, ir_bias=5.0,                # 红外增益/偏置抖动
+    depth_noise=0.02,                         # 深度乘性噪声
+    depth_jitter_x=[-25, 5], depth_jitter_y=[-5, 5], depth_jitter_prob=1.0,
+    cache=False,                              # 三模态增强须在加载期随机执行
+)
+```
+
+> **两处易错点**：① `depth_shift_x` 必须与数据实际对齐情况匹配（本赛题官方数据为 0）；
+> ② 训练 / 验证 / 推理三处的三模态参数必须**完全一致**，否则会出现通道误判或指标失真。
+
+---
+
 ## 1. 模型使用环境
 
 与原有 RGBT 项目完全相同，无需额外改动：
@@ -215,32 +290,49 @@ python transfer_pretrained.py --src yolo11x.pt --out yolo11x-RGBTD-pretrained.pt
 ## 5. 模型使用教程（完整流程）
 
 ```bash
-# 步骤 0：准备数据（见第 3 节），改好数据集 YAML 的 path/nc/names
+# 步骤 0：准备数据 —— 赛题 12 类配置已写好（ultralytics/cfg/datasets/aic2026-rgbtd.yaml）
+#         只需把该 YAML 里的 path 改成你数据集的绝对路径
 
 # 步骤 1：迁移预训练权重（复用现有模型参数，简化训练）
+#         赛题部署时已生成 yolo11x-RGBTD-pretrained.pt，可直接跳到步骤 2
 python transfer_pretrained.py --src yolo11x.pt --out yolo11x-RGBTD-pretrained.pt
 
-# 步骤 2：训练（编辑 train_RGBTD.py 里的 data 路径与 pairs_rgb_ir 目录名）
+# 步骤 2：训练（脚本已适配赛题：12 类 + 全量训练集 + 三模态增强，直接跑）
 python train_RGBTD.py
 
-# 步骤 3：验证 / 测试（编辑 val_RGBTD.py 里的 data 路径与权重路径）
-python val_RGBTD.py
+# 步骤 3：验证 / 测试（参数化，默认即赛题配置）
+python val_RGBTD.py                    # 常规验证
+python val_RGBTD.py --tta              # 额外跑一次 TTA（多尺度 + 翻转）
+python val_RGBTD.py --weights "训练成果备份/AIC2026_12类_yolo11x-rgbtd/best.pt"
 ```
 
-**train_RGBTD.py 关键配置**：
+**train_RGBTD.py 关键配置（AIC2026 赛题版，已落地）**：
 
 ```python
 model = YOLO("yolo11x-RGBTD-pretrained.pt")   # 从迁移后的预训练权重开始
 model.train(
-    data=R"ultralytics/cfg/datasets/coco8-rgbtd.yaml",  # 你的数据集
-    imgsz=640,          # 显存允许可调 1280
-    epochs=300,
-    batch=8,            # 9 通道显存占用大，按 GPU 调整
+    data="ultralytics/cfg/datasets/aic2026-rgbtd.yaml",  # 赛题 12 类数据集
+    imgsz=640, epochs=300, batch=8,   # 9 通道显存约 RGB 的 3 倍；OOM 就降到 6
+    close_mosaic=10, workers=8, device="0", optimizer="SGD", seed=0,
     use_simotm="RGBTD",
     channels=9,
     pairs_rgb_ir=["visible", "infrared", "depth"],  # 按实际目录名改
+    depth_shift_x=0, depth_shift_y=0,  # 官方数据已对齐；换数据集需重新校准
+    rgb_drop_prob=0.2, ir_gain=0.15, ir_bias=5.0, depth_noise=0.02,
+    cache=False,                       # 三模态增强须在加载期随机执行
 )
 ```
+
+**val_RGBTD.py 支持的命令行参数**（升级后）：
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `--weights` | `runs/RGBTD/aic2026-yolo11x-rgbtd/weights/best.pt` | 权重路径 |
+| `--data` | `ultralytics/cfg/datasets/aic2026-rgbtd.yaml` | 数据集 YAML |
+| `--imgsz` / `--batch` / `--device` | 640 / 8 / `0` | 与训练保持一致 |
+| `--tta` | 关闭 | 开启测试时增强（先确认赛题是否允许） |
+
+也可用环境变量 `RGBTD_WEIGHTS` / `RGBTD_DATA` 覆盖默认路径。
 
 **若目录名不是 `visible/infrared/depth`**：改 `pairs_rgb_ir` 即可，例如 `["rgb", "ir", "depth"]` 或 `["images", "images_ir", "images_depth"]`。
 
@@ -251,29 +343,44 @@ model.train(
 ### 6.1 验证集评估（推荐，比赛用 mAP）
 
 ```bash
-python val_RGBTD.py
+python val_RGBTD.py                    # 常规验证
+python val_RGBTD.py --tta              # 附带 TTA
 ```
 
 脚本内包含两种模式：
 
-1. **常规验证**：`model.val(data=..., use_simotm="RGBTD", channels=9, ...)` → 输出 mAP50 / mAP50-95；
+1. **常规验证**：`model.val(data=..., use_simotm="RGBTD", channels=9, depth_shift_x=0, ...)` → 输出 mAP50 / mAP50-95；
 2. **TTA 验证**：`model.val(..., augment=True)` → 测试时增强（多尺度 + 翻转），零训练成本提升 0.5~1.5 点。
+
+> ⚠️ **必须一致**：验证时的 `use_simotm / channels / pairs_rgb_ir / depth_shift_x` 必须与训练完全相同，
+> 否则会出现"9 通道被当成 1 通道"的报错，或指标失真（这是实测踩过的坑）。
+>
+> ⚠️ **赛题测试集（`AIC2026_PHASE_1_1000`）没有标签**，无法在本地计算 mAP。
+> 它只能用于"推理 + 按平台格式产出预测结果文件"提交评测；要拿真实分数须以平台反馈为准。
 
 ### 6.2 单图 / 目录推理
 
 ```python
 from ultralytics import YOLO
-model = YOLO("runs/RGBTD/RGBTD-yolo11x-midfusion/weights/best.pt")
-# 预测时同样需指定三模态参数
+
+# 服务器训练产出，或本地备份：训练成果备份/AIC2026_12类_yolo11x-rgbtd/best.pt
+model = YOLO("runs/RGBTD/aic2026-yolo11x-rgbtd/weights/best.pt")
+
+# 预测时同样需指定三模态参数（与训练一致）
 results = model.predict(
     source="path/to/visible/image_or_dir",
     imgsz=640,
     use_simotm="RGBTD",
     channels=9,
     pairs_rgb_ir=["visible", "infrared", "depth"],
+    depth_shift_x=0,
+    depth_shift_y=0,
     save=True,
 )
 ```
+
+> 推理走的是 `ultralytics/data/loaders.py` 的 `LoadImagesAndVideos`，
+> 其中的深度对齐参数由 `predictor.py → build.py` 从配置透传，与训练共享同一套预处理。
 
 ---
 

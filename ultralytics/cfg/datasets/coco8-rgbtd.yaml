@@ -1,22 +1,55 @@
-# RGBTD（可见光 + 红外 + 深度）三模态数据集配置模板
-# 赛题：2026AIC 全球校园人工智能算法精英大赛 · 面向城市场景的视觉多模态目标检测
-#
-# 目录结构（与官方样例一致：四个同级目录，文件名一一对应，已空间对齐）：
-#   <path>/
-#     ├── visible/    # 可见光 RGB，8bit 3 通道，.png / .jpg 混存
-#     ├── infrared/   # 红外，8bit 3 通道（单通道灰度堆叠 3 份），.png / .jpg 混存
-#     ├── depth/      # 深度，16bit 单通道灰度，.png（样例中混有少量 8bit 3 通道 jpg 可视化图）
-#     └── labels/     # YOLO 标注：<class_id> <cx> <cy> <w> <h>（坐标归一化到 [0,1]）
-#
-# 赛题仅提供 train / test，无独立 val。本地验证请从 train 切分出一部分作为 val，
-# 避免 train 与 val 指向同一批数据（否则验证指标虚高，无法反映真实泛化）。
-
-path: /path/to/dataset        # TODO: 改成你的数据集根目录绝对路径
-train: visible                # 可见光训练目录（红外/深度按目录名替换自动定位，标签在 labels/）
-val: visible                  # TODO: 建议从 train 切分出 val 子集后，改成如 visible/val
+# RGBTD 三模态数据集配置（竞赛实际数据，45 类）
+path: /root/rgbtd_data
+train: visible/train
+val: visible/val
 
 # 类别数
-nc: 12
+nc: 45
 
-# 类别名（赛题 12 类，按 class_id 0-11 顺序）
-names: ["person", "boat", "animal", "seat", "sign", "bicycle", "car", "ball", "light", "garbage_can", "uav", "tricycle"]
+# 类别名（class_id 0-44，与 label_context 中文名对应）
+names:
+  0: bottle
+  1: pen
+  2: cup
+  3: kettle
+  4: scissors
+  5: unknown
+  6: book
+  7: pliers
+  8: cigarette_box
+  9: candy
+  10: spoon
+  11: comb
+  12: toothpaste
+  13: screwdriver
+  14: mouse
+  15: key
+  16: router
+  17: hammer
+  18: keyboard
+  19: can
+  20: stapler
+  21: badminton_racket
+  22: table_tennis_racket
+  23: banana
+  24: power_strip
+  25: glasses
+  26: apple
+  27: knife
+  28: packaging_box
+  29: drill
+  30: cable_reel
+  31: utility_knife
+  32: wrench
+  33: glue_gun
+  34: toy
+  35: dragon_fruit
+  36: switch
+  37: packaging_bag
+  38: orange
+  39: fuse
+  40: dumbbell
+  41: pear
+  42: card
+  43: lighter
+  44: glassware

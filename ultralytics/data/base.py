@@ -309,8 +309,12 @@ class BaseDataset(Dataset):
         线性拉伸出伪值；最后 clip 到 [0,255] 保证无越界。
         """
         if im_depth.ndim == 3:
-            # 3 通道深度可视化图 → 转单通道灰度（近似深度），避免 cvtColor(GRAY2BGR) 崩溃
-            im_depth = cv2.cvtColor(im_depth, cv2.COLOR_BGR2GRAY)
+            if im_depth.shape[2] == 1:
+                # (H,W,1) 单通道但带通道维度 → 压平为 (H,W)，避免 cvtColor 报 scn=1 错误
+                im_depth = im_depth[:, :, 0]
+            else:
+                # 3 通道深度可视化图 → 转单通道灰度（近似深度），避免 cvtColor(GRAY2BGR) 崩溃
+                im_depth = cv2.cvtColor(im_depth, cv2.COLOR_BGR2GRAY)
         im_depth = im_depth.astype(np.float32)
         mask_invalid = im_depth < 1e-3  # 无效深度空洞
         valid = im_depth[~mask_invalid]
