@@ -400,7 +400,7 @@ def adapt_depth_checkpoint_state(state: dict, model: MMYOLO) -> tuple:
 def iter_prefetch(loader, depth: int = 3, stop: Optional["threading.Event"] = None):
     """在后台线程里取数据（含 worker 进程启动），主线程只做 GPU 计算。
 
-    动机（实测 `diagnose/io_gpu_profile.py`，三模态 batch4/544×960）：
+    动机（三模态 batch4/544×960 的 I/O/GPU 实测）：
         取数据 314 ms/step，GPU 348 ms/step → 串行 662 ms/step
         完全重叠后 = max(314, 348) ≈ 348 ms/step，**实测加速 1.39×**
     这在 `workers=0` 时是唯一能抢回来的算力（受限环境里 worker 进程起不来），

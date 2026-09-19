@@ -1,18 +1,5 @@
 # -*- coding: utf-8 -*-
-"""
-trainer —— 封装训练入口（统一读取 models_config 超参）。
-
-分两种情形：
-  * 3 通道（基线模型1，单模态 RGB）：可直接喂给 ultralytics 内建训练器，
-    使用 common.scan_data.build_data_yaml() 生成的 ultralytics data.yaml。
-  * 5 通道（基线模型2/实验模型1，三模态前期融合）：ultralytics 内建 DataLoader
-    只支持"单图固定通道"，无法直接返回融合张量；因此正确定位是：
-        - 先在本框架构造 5 通道模型（见基线模型2/model_builder.py 改首层）
-        - 再以自定义 Dataset(common.dataset.MultimodalDetectionDataset) 喂训练。
-      本模块提供对应 hook，具体在主程序里接线（见各实例 README）。
-
-建议执行环境：EFYOLO conda 环境（已装 ultralytics + CUDA）。
-"""
+"""正式 RGB 训练所需的 Ultralytics 参数、验证器和梯度审计。"""
 
 from __future__ import annotations
 

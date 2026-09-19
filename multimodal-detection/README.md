@@ -1,215 +1,67 @@
-# 面向城市场景的视觉多模态目标检测 —— 训练框架 (code/)
+# 面向城市场景的三模态目标检测
 
-本目录是一个"多版本分离"的 YOLO 训练/推理骨架，用于赛题：
-**三模态（RGB + Infrared + Depth）12 类目标检测，指标 mAP@50-95**。
+当前代码只保留两条正式链路：一个可审计的 RGB 上限模型，以及一个真正进行
+RGB + Infrared + Depth 特征交互的空间记忆模型。早期基线、旧实验队列和一次性诊断脚本
+已经移除；历史实现仍可从 Git 提交记录恢复。
 
-## 目录结构
+## 目录
 
-```
-code/
-├── models_config.py          ★ 唯一版本注册表（基线与正式实验配置统一登记）
-├── train_rgb.py              ★ 正式 RGB 高质量训练入口（本机/服务器同一份）
-├── common/                   共享代码层（不掺实例逻辑）
-│   ├── __init__.py           sys.path 引导 + 公共 API
-│   ├── scan_data.py          数据布局探测（默认/目录布局自动回退）+ 生成 data.yaml
-│   ├── split_data.py         train/val/test 划分（设种子 + 类别分层）+ 清单/yaml
-│   ├── dataset.py            三/五/六通道读取与拼装；标签/预测 txt 读写
-│   ├── multimodal_augment.py 三模态一致性增强（几何同步 + 仅RGB变色 + Depth最近邻）
-│   ├── model_utils.py        YOLO 首层 3→6 改造 / 类头设定 / 权重继承
-│   ├── train_loop.py         自定义训练循环（DataLoader 多进程读图 + EMA + mAP 评估 + 辅助损失）
-│   ├── evaluate.py           mAP@50-95 赛题口径评估（逐类 IoU 贪心匹配）
-│   ├── trainer.py            训练超参封装（从 models_config 读）
-│   └── inference.py          推理 + 输出赛题同名预测 txt
-├── legacy/                   历史基线1/基线2/实验1入口（保留用于复现）
-│   ├── 基线模型1/            3 通道原版 YOLO（单模态 RGB 对照）
-│   ├── model_builder.py  dataset_adapter.py  main.py  README.md  __init__.py
-├── 基线模型2/                6 通道早期融合（RGB3 + IR1 + Depth2[距离+有效掩码]）
-│   ├── 同基线模型1 的对称四件套
-├── 实验模型1/                RGB 主流 + IR/Depth 轻辅助流 + P3/P4/P5 分级融合
-│   ├── （ModalDropout + MEGA 边缘注意力 + 每模态辅助头；config/selfcheck/train/predict 齐全）
-└── vendor/ultralytics/       本地钉死的 ultralytics 8.4.138 源码（与 EFYOLO 运行时同版本）
-                             实验模型1 源码级改造时使用；基线1/2 继续用 pip 版，互不影响
+```text
+multimodal-detection/
+├── train_rgb.py             # 正式 RGB YOLO11m 训练
+├── models_config.py         # RGB 配方
+├── common/trainer.py        # RGB trainer、逐图 NMS、梯度监测
+├── configs/split_s42.json   # 固定 1600/400 划分
+├── mm_yolo/                 # 正式三模态模型
+│   ├── config.py            # 自描述结构配置
+│   ├── data.py              # 三模态读取、Depth 表示、同步增强
+│   ├── align.py             # 跨模态对齐
+│   ├── fusion.py            # 局部匹配与门控融合
+│   ├── memory_fusion.py     # 跨尺度空间记忆
+│   ├── model.py             # 三路编码器、融合与 YOLO neck/head
+│   ├── train.py             # 训练与严格 checkpoint 恢复
+│   ├── eval.py              # 完整验证
+│   ├── submit.py            # 单模型提交生成及校验
+│   └── run_spatial_memory.py# 本机/服务器统一启动器
+└── vendor/ultralytics/      # 固定版本运行时
 ```
 
-依赖运行环境建议：EFYOLO conda（已装 ultralytics + CUDA），部署依赖清单见 `deploy_requirements.txt`。
-
-## 三版本差异（消融对照表）
-
-| 版本 cfg key | 目录 | 输入 | 融合 | 首层 | enabled | 说明 |
-|---|---|---|---|---|---|---|
-| `baseline1_3ch` | 基线模型1 | RGB 3ch | 无 | 3(原版) | ✅ | 只读 RGB 的对照基线 |
-| `rgb_hq_11m` | `train_rgb.py` | RGB 3ch | 无 | YOLO11m 原版 | ✅ | 高分辨率正式 RGB 模型；原生 loss/EMA + 稀有类追加 + 定位精修 |
-| `baseline2_5ch` | 基线模型2 | RGB3+IR1+Depth2 共 6ch | 前期(cat) | 3→6 | ✅ | 三模态拼接的最小融合基线；`in_channels=5` 可作无掩码消融 |
-| `experiment1`  | 实验模型1 | 三路：rgb(3)/ir(1)/depth(2) | P3/P4/P5 分级 | 各流独立首层 | ✅ | 轻量辅助流 + ModalDropout + MEGA + 每模态辅助头（Step0-4 方案） |
-
-> 对分数来源的取向（见讨论）：**融合模块设计 > 输入分辨率 > 网络规格(n/s/m/l/x)**；
-> 在 2000 组、12 类、mAP@50-95 的高框精度需求下，优先 s/m + 高 imgsz + 扎实验证融合。
-
-## 使用流程
-
-### 正式 RGB 高质量模型（推荐先建立可靠单模态上限）
-
-配置统一登记在 `models_config.py` 的 `rgb_hq_11m`，实现由 `train_rgb.py` 驱动。
-它不经过多模态自定义训练循环；训练仍使用 Ultralytics 原生检测 loss、AdamW、AMP、
-EMA、有效 batch/weight-decay 缩放和完整 checkpoint 恢复。默认本机配置为
-YOLO11m、960、batch=4、200 轮，最后 25 轮关闭 Mosaic/MixUp 并减弱几何与颜色增强。
-
-```powershell
-& "D:\Development_Tools\anaconda3\envs\EFYOLO\python.exe" multimodal-detection\train_rgb.py `
-  --data-root "<数据集>\train_extracted" `
-  --labels "<数据集>\训练集\new_labels_2000" `
-  --split-file "multimodal-detection\configs\split_s42.json"
-```
-
-服务器使用完全相同入口，只覆盖资源参数，例如：
+## RGB 正式训练
 
 ```bash
-python multimodal-detection/train_rgb.py --data-root /data/train_extracted \
+python train_rgb.py \
+  --data-root /data/train_extracted \
   --labels /data/new_labels_2000 \
-  --split-file multimodal-detection/configs/split_s42.json \
-  --weights /weights/yolo11m.pt --device 0 --batch 16 --workers 12
+  --split-file configs/split_s42.json \
+  --weights /weights/yolo11m.pt \
+  --device 0 --batch 16 --workers 12
 ```
 
-一次启动包含两个有明确边界的阶段：先在固定 1600/400 划分上训练并选择 `best.pt`；
-再从该权重新建优化器和 EMA，用全部 2000 张图低学习率精修 18 轮。第二阶段因为验证图
-已经进入训练，其验证数字不再当泛化成绩，最终提交权重由 `final_model.json` 唯一指向。
-每轮训练清单保证 1600 张唯一图全部出现，再追加少量稀有类图；不会以替换采样漏掉常见类。
+默认模型为 YOLO11m，输入画布为 **960×960 正方形**。原图按长宽比缩放后
+letterbox 补边，并非拉伸成正方形。训练先使用固定 1600/400 划分选择 `best.pt`，
+随后用全部 2000 张图低学习率精修 18 轮。中断后在完全相同的命令末尾加
+`--resume`，以恢复 optimizer、GradScaler 和 EMA。
 
-日志统一为 UTF-8，可在 PowerShell 实时查看：
-
-```powershell
-Get-Content "multimodal-detection\runs\rgb_hq_11m_s42\train.log" -Encoding UTF8 -Wait -Tail 30
-```
-
-中断后在原命令末尾添加 `--resume`，会恢复 optimizer、GradScaler 和 EMA；不得直接把
-`best.pt` 当作“续训”权重。运行前可加 `--prepare-only` 只检查数据，或加 `--smoke`
-使用少量真实图验证显存和训练链路。
-
-### 历史多模态入口
-
-```powershell
-$env:MULTIMODAL_DATA_ROOT = "填你自己的赛题数据根"   # 或改 models_config.py 的 DATA_ROOT
-
-# ① 建模型骨架环境（已在 EFYOLO 装好 ultralytics/cuda；权重 yolo11s.pt 必须放 code/ 根）
-code> & "D:\Development_Tools\anaconda3\envs\EFYOLO\python.exe" -c "import ultralytics, torch; print(torch.cuda.is_available())"
-
-# ② 探测数据根布局、按命名自动配对三模态+标签、生成 data.yaml
-#    支持两种布局：文件名带模态后缀（xxx_rgb.png 等）与目录布局（V/T/D 或
-#    visible/infrared/depth 子目录 + labels/labels_multi）——训练主入口会自动回退探测
-code> & "D:\Development_Tools\anaconda3\envs\EFYOLO\python.exe" common/scan_data.py --root $env:MULTIMODAL_DATA_ROOT --out data.yaml
-
-# ③ 查看各版本配置 / 自检
-code> & "D:\Development_Tools\anaconda3\envs\EFYOLO\python.exe" 基线模型2/main.py config
-code> & "D:\Development_Tools\anaconda3\envs\EFYOLO\python.exe" 实验模型1/main.py selfcheck   # 构建+dummy前向
-
-# ④ 训练（无现成 val 时自动从 train 抽 10%；扫描到 0 样本立即报错）
-code> & "D:\Development_Tools\anaconda3\envs\EFYOLO\python.exe" 基线模型2/main.py train --data-root $env:MULTIMODAL_DATA_ROOT --imgsz 640
-code> & "D:\Development_Tools\anaconda3\envs\EFYOLO\python.exe" 实验模型1/main.py train --data-root $env:MULTIMODAL_DATA_ROOT --imgsz 640
-
-# ⑤ 预测（--weights 传训练产物 best.pt；自动识别自定义/原生 checkpoint；--imgsz 与训练一致）
-code> & "D:\Development_Tools\anaconda3\envs\EFYOLO\python.exe" 基线模型2/main.py predict --weights runs/experiment1/weights/best.pt --data-root $env:MULTIMODAL_DATA_ROOT --imgsz 640 --out pred_baseline2
-```
-
-训练保存的 checkpoint 是自定义格式（`{"model_state":..., "cfg_key":...}`），预测入口统一走
-`common/train_loop.load_custom_checkpoint()` 回填（同时兼容 ultralytics 原生权重）。**离线环境注意**：
-`yolo11s.pt` 必须提前放到 code/ 根（缺失时 `MC.resolve_pretrained_weights` 直接报错，不会联网下载）。
-
-## 训练 / 验证 / 测试 划分接口（common/split_data.py）
-
-赛题 2000 组默认不分 train/val/test，落地前需先划分。本模块提供，**可设种子复现、近似按类别分层**：
-
-```powershell
-# 把数据根目录扫描到的样本划分为 train/val/test=8:1:1，并生成图片清单 + data.yaml
-code> & "D:\Development_Tools\anaconda3\envs\EFYOLO\python.exe" common/split_data.py `
-      --root $env:MULTIMODAL_DATA_ROOT --ratios 0.8,0.1,0.1 --seed 42 --out splits
-
-# 常用参数
-#   --seed       随机种子（默认 42）—— 同一数据 + 同一种子 = 同一划分（可复现实）
-#   --ratios     train,val,test 比例（默认 0.8,0.1,0.1）
-#   --no-stratify 关闭按类别分层，退化为纯随机切分
-#   --split-dirs 只划分根目录下指定子目录（如不分组用默认把所有样本并入一份划分）
-#   --out        清单/yaml 输出目录（默认 <数据根>/splits，产出 train.txt/val.txt/test.txt/data.yaml）
-```
-
-是否真正分层取决于你数据里每张图的类别数：
-- 多数情形图片内含单类目标多框 → 分层效果好；
-- 若单图常含多个类（多标签）→ 用 `--no-stratify` 纯随机即可，代码已对两种都支持。
-
-> 早停说明：`models_config.HyperParams` 里 `epochs` 是"轮数上限"，
-> `patience` 才是决定停止的早停窗口
-> （验证指标连续 N 轮不升自动停止并保留最优权重 `best.pt`）。提交/评估应优先用 `best.pt` 而非 `last.pt`。
-
-## 三模态一致性增强（common/multimodal_augment.py）
-
-三模态(RGB+IR+Depth)是**空间对齐**的；训练时的数据增强必须保证**几何逐像素一致**，
-否则随机各翻各的会立刻破坏对齐、毁掉跨模态互补。
-
-增强策略（核心口径）：
-- **几何操作(改像素位置)**：flip / crop / letterbox / scale 对 RGB/IR/Depth **共享同一组参数**——
-  要么一起都被增广、要么都不，保证三张图仍一一对应。
-- **颜色/光度(不改位置)**：HSV 抖动**只作用于 RGB**；IR/Depth 永不参与，避免伪造温度/距离语义。
-- **Depth 特殊性**：插值用 `INTER_NEAREST`(最近邻)，letterbox 无效区填 0，
-  防止在“0=无效”与“有效 mm”边界因插值引入伪值。
-- **bbox 同步**：翻转 `cx→1-cx`；letterbox 按同一 scale+pad 把归一化框映射到新画布。
-
-可用原语（`import common` 后直接可用）：
-- `common.flip_lr_consistent` / `common.letterbox_consistent` / `common.hsv_only_rgb`
-- `common.consistent_augment_full`   —— flip→仅RGB-Hsv→同步letterbox 的一次性组合
-- `common.build_consistent_aug_5ch`  —— dataset 侧统一入口：读三模态→同步增强→拼 (6,H,W)+标 box
-  （`in_channels=5` 可作无掩码消融；训练/验证/推理共用此入口保证几何一致）
-
-> 深度对齐（Step0）：`models_config.AlignConfig`（`mode/shift_x/y/ref_size/scale_with_res`）
-> 控制 Depth 固定平移，平移量按**原始图宽**等比换算（-22px@1920 → VDT 640 约 -7px、赛题 1024 约 -12px）；
-> 数据/训练/验证/推理全链路统一接入，`mode="none"` 即关闭。
-
-## vendor 源码（实验模型1 源码级改造基础）
-
-`code/vendor/ultralytics/` 是从 EFYOLO 环境**复制并钉死**的 ultralytics 8.4.138 源码
-（与运行时版本完全一致，防止 pip 升级悄悄破坏你的改动）。
-
-**何时用 vendor**：只改配置/通道数/数据（基线1、2）不需要它；一旦要动网络结构
-（三流 backbone、逐 stage 融合、模态 dropout、改训练循环），建议在 vendor 上改。
-
-**如何启用 vendor（替换 pip 版）**：在训练/改造入口的最前面注入 sys.path 即可，
-之后所有 `import ultralytics` 都会命中 vendor 源码：
-
-```python
-import sys
-sys.path.insert(0, r"C:\...\code\vendor")   # 放在 import ultralytics 之前
-import ultralytics
-print(ultralytics.__file__)                 # 应显示 ...\code\vendor\ultralytics\__init__.py
-```
-
-验证过：注入 vendor 后加载路径指向 `code/vendor`（版本 8.4.138，C2f/SPPF/Detect/DetectionModel
-均可导入）；不注入时仍走 EFYOLO site-packages 的 pip 版，两者互不影响。
-
-**改造守则（强烈建议）**
-1. 官方文件**只做最小必要微调**，且改动处加 `# MOD: <说明>` 注释，便于对照上游与写技术报告；
-2. 新增的融合模块/多流网络/自定义 DataLoader 一律放在**你自己的目录**（如 `实验模型1/`），
-   通过 `from ultralytics.nn.modules import C2f, ...` 复用官方组件，避免整包"改花"；
-3. vendor 目录属于**交付物**（半决赛要交代码），改动历史可写入各模型 README；
-4. 想恢复官方行为：删掉 sys.path 注入即回到 pip 版，无需卸载/重装。
-
-## 练手数据集接入（非赛题，验证框架上限）
-
-可把任意"三模态+bbox txt"数据集接入（如 VDT-2048 的 V/T/D/labels_multi 目录布局）。
-**数据路径不写死**：优先 `$MULTIMODAL_DATA_ROOT`（或 `MC.DATA_ROOT`），也可用 CLI `--data-root` 覆盖。
-目录布局（V/T/D + labels_multi）无需手动加 `--layout`——训练/预测入口的
-`scan_samples_auto()` 在默认扫描为 0 样本时自动回退（实测 VDT Train 1048 组全部配对）。
+## 三模态正式训练
 
 ```bash
-# 1) 扫描 + 生成数据清单（--layout 显式指定亦可；45 类 VDT 用 --names）
-python common/scan_data.py --layout \
-    --root "…/VDT-2048 dataset/Train" \
-    --names "…/vdt2048_meta/classes.txt" \
-    --out "…/framework_data/data.yaml"
-
-# 2) 训练（类数由 ModelConfig.class_num 控制；VDT 为 45 需在 models_config 覆盖）
-python 基线模型2/main.py train --data-root "…/VDT-2048 dataset/Train" --data-yaml "…/data.yaml" --imgsz 640
+python mm_yolo/run_spatial_memory.py \
+  --root /data/train_extracted \
+  --labels /data/new_labels_2000 \
+  --split-file /data/split_s42.json \
+  --weights /weights/yolo11s.pt
 ```
 
-## 进阶提示（实验模型1 起点）
-- 参考竞赛细则「解题思路」：数据增强；抽取网络特征；合理超参 + 自划验证集。
-- 输出要求：每图同名 txt、`class_id cx cy w h confidence`、conf 缺失即无效、每图≤100 框。
-- 禁止：测试集手工标注、投票/平均式简单集成、使用非官方扩展数据（允许 COCO 预训练）。
-- 复赛提交：测试 tc、训练模型、环境说明；半决赛：再加技术报告 PDF。
+该模型保持 RGB、IR 和 Depth 的独立证据路径，在 P3/P4/P5 做局部匹配、拒绝不可靠
+对应、独立残差门控和两轮互补读取；模态记忆及共享记忆随尺度更新，最后回写 YOLO
+neck。Depth 输入保留相对深度、绝对米制距离、有效掩码和米制可用标志。
+
+默认三模态画布是 **608×1088 长方形**，以 RGB 网格为坐标参考；三模态执行完全相同的
+几何变换，Depth 距离与有效掩码采用一致的有效性重采样。
+
+## 约束
+
+- 只使用一个模型、一个权重、一次前向和一次标准 NMS；不使用投票、WBF 或 TTA。
+- 数据和预训练权重不纳入仓库，所有入口均接受本机或服务器绝对路径。
+- checkpoint 保存结构及预处理版本；结构不匹配时禁止静默续训。
+- 当前有效的正确性检查位于 `mm_yolo/tests/`。
