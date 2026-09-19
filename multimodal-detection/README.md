@@ -9,6 +9,7 @@ RGB + Infrared + Depth 特征交互的空间记忆模型。早期基线、旧实
 ```text
 multimodal-detection/
 ├── train_rgb.py             # 正式 RGB YOLO11m 训练
+├── predict_rgb.py           # RGB 测试集推理、严格校验与提交压缩包
 ├── models_config.py         # RGB 配方
 ├── common/trainer.py        # RGB trainer、逐图 NMS、梯度监测
 ├── configs/split_s42.json   # 固定 1600/400 划分
@@ -41,6 +42,14 @@ python train_rgb.py \
 letterbox 补边，并非拉伸成正方形。训练先使用固定 1600/400 划分选择 `best.pt`，
 随后用全部 2000 张图低学习率精修 18 轮。中断后在完全相同的命令末尾加
 `--resume`，以恢复 optimizer、GradScaler 和 EMA。
+
+生成 RGB 提交包：
+
+```bash
+python predict_rgb.py --weights /runs/phase2_full/weights/last.pt \
+  --source /data/test_extracted/visible --out /runs/submission_txt \
+  --zip /runs/submission.zip --imgsz 544x960 --device 0 --batch 16 --half
+```
 
 ## 三模态正式训练
 
