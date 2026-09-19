@@ -23,7 +23,7 @@ ultralytics==8.4.138          # 必须 >=8.4.138；建议锁定，防止行为�
 ultralytics-thop==2.1.6
 
 # ---- 图像 / 数值 ----
-opencv-python==5.0.0
+opencv-python==5.0.0.93
 numpy==2.5.2
 pillow==12.3.0
 
