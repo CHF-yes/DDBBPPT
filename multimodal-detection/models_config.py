@@ -123,6 +123,12 @@ class AugmentParams:
     mosaic_p: float = 0.0            # 4 图拼接概率（0=关；与基线1 对齐用 1.0）
     close_mosaic_epochs: int = 10    # 最后 N 轮关闭 mosaic（0=不关）
     close_mosaic_frac: float = 0.0   # 按比例关闭：最后 frac×epochs 轮关 mosaic（与上一项取较大者）
+    degrees: float = 0.0             # 随机旋转角度（城市目标默认不做大角度旋转）
+    shear: float = 0.0               # 随机错切角度
+    perspective: float = 0.0         # 透视强度
+    mixup_p: float = 0.0             # mixup 概率
+    cutmix_p: float = 0.0            # cutmix 概率
+    copy_paste_p: float = 0.0        # 检测框任务默认关闭，避免制造跨场景伪遮挡
     # ---- RGB 光度 ----
     hsv_rgb: bool = True             # 是否启用 RGB HSV
     hsv_h: float = 0.015
@@ -198,6 +204,20 @@ class HyperParams:
     seed: int = 42
     patience: int = 30                    # 早停
     pretrained_weights: str = "yolo11s.pt"  # COCO 预训练(允许)；换规格改此键
+    momentum: float = 0.937
+    nbs: int = 64                         # Ultralytics 用于累积与 weight decay 缩放的名义 batch
+    cos_lr: bool = False
+    deterministic: bool = True
+    cache: object = False                 # False | "disk" | "ram"
+    multi_scale: float = 0.0              # 0=关；正数表示相对 imgsz 的变化范围
+    box: float = 7.5
+    cls: float = 0.5
+    dfl: float = 1.5
+    grad_clip_norm: Optional[float] = 10.0  # None/0=不裁剪；由统一 RGB trainer 接管
+    rare_target_images: int = 0           # 每类每轮希望至少出现的图像数；0=不追加采样
+    rare_max_repeat: int = 1              # 单图每轮最大总出现次数（含原始一次）
+    full_finetune_epochs: int = 0         # >0 时在固定划分训练后用全量数据低 LR 精修
+    full_finetune_lr: float = 1e-4
 
     # ---- Depth 对齐（可插拔配置；兼容旧 depth_shift_x/y 读取）----
     align: AlignConfig = field(default_factory=AlignConfig)
@@ -215,6 +235,9 @@ class HyperParams:
     per_modality_gate: bool = True  # 逐模态 × 逐位置门控（含 depth 有效性掩码先验）
     aux_depth_head: bool = True     # 稀疏距离辅助头（深度图自监督）
     aux_dist_head_src: str = "ir"   # 距离头挂在哪个流：ir（跨模态推断，默认）| dep
+    aux_edge_head: bool = False     # Step4b 真边缘头（GT 框边界 BCE 监督；取代固定 Sobel 门控）
+    edge_head_src: str = "ir"       # 边缘头挂在哪个流（默认 IR）
+    aux_edge_lambda: float = 1.0    # 边缘损失相对辅助 λ 的倍率
 
     # ---- 统一数据增强（三模态全覆盖；各版本可覆写）----
     aug: AugmentParams = field(default_factory=AugmentParams)
@@ -268,6 +291,60 @@ BASELINE1_3CH = ModelConfig(
     enabled=True,
     hyper=HyperParams(pretrained_weights="yolo11s.pt"),
     data_prep="仅读取 RGB 三通道并归一化；Depth/IR 不参与该版本。",
+)
+
+# ---- 正式 RGB 高质量模型：保持原生 YOLO 训练语义，供本机/服务器统一启动 ----
+RGB_HQ_11M = ModelConfig(
+    key="rgb_hq_11m",
+    name="RGB高质量模型",
+    description=("YOLO11m COCO 预训练的 RGB 单模态主模型；高分辨率、完整遍历+稀有类追加采样、"
+                 "无硬梯度裁剪并在末段关闭强增强做定位精修。"),
+    in_channels=3,
+    modality=Modality.RGB_ONLY,
+    fusion=FusionScheme.NONE_EARLY,
+    enabled=True,
+    hyper=HyperParams(
+        pretrained_weights="yolo11m.pt",
+        epochs=200,
+        imgsz=960,
+        batch=4,                    # 6GB 本机实测 m@960 峰值约 4.64GiB；服务器通过 CLI 覆盖
+        workers=4,
+        optimizer="AdamW",
+        lr0=8e-4,
+        weight_decay=5e-4,
+        warmup_epochs=5.0,
+        lrf=0.01,
+        patience=50,
+        momentum=0.937,
+        nbs=64,
+        cos_lr=True,
+        grad_clip_norm=None,        # 旧版固定 10 几乎步步触发；改为监测但不硬裁剪
+        rare_target_images=80,
+        rare_max_repeat=6,
+        full_finetune_epochs=18,
+        full_finetune_lr=1.5e-4,
+        aug=AugmentParams(
+            flip_p=0.5,
+            scale=0.45,
+            translate=0.10,
+            mosaic_p=0.80,
+            close_mosaic_epochs=25,
+            hsv_rgb=True,
+            hsv_h=0.015,
+            hsv_s=0.60,
+            hsv_v=0.35,
+            degrees=0.0,
+            shear=0.0,
+            perspective=0.0,
+            mixup_p=0.05,
+            cutmix_p=0.0,
+            copy_paste_p=0.0,
+            rgb_drop_prob=0.0,
+        ),
+    ),
+    notes=("严格单模型、单权重、单次前向和一次标准 NMS；不含 TTA/WBF/投票。"
+           "本机默认 batch=1，服务器只覆盖 batch/workers/device，不改变训练语义。"),
+    data_prep="仅 RGB；使用固定 group-aware 1600/400 划分和修正版标签。",
 )
 
 # ---- 基线模型2：6 通道早期融合（RGB3 + IR 1 + Depth 2 [距离+掩码]）----
@@ -327,7 +404,7 @@ EXPERIMENT1 = ModelConfig(
            "训练/推理见 实验模型1/main.py；checkpoint 见 common.train_loop.load_custom_checkpoint。"),
 )
 
-_MODELS: List[ModelConfig] = [BASELINE1_3CH, BASELINE2_5CH, EXPERIMENT1]
+_MODELS: List[ModelConfig] = [BASELINE1_3CH, RGB_HQ_11M, BASELINE2_5CH, EXPERIMENT1]
 MODELS: Dict[str, ModelConfig] = {cfg.key: cfg for cfg in _MODELS}
 
 

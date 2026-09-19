@@ -38,9 +38,21 @@ _imread_codec = {"cv2": None}
 
 
 def _read(path, flags: int):
+    """读图（**兼容中文/非 ASCII 路径**）。
+
+    赛题数据根目录含中文，`cv2.imread` 在 Windows 上对该类路径一律返回 None
+    （实测 2000/2000 全失败）→ 统一走 `np.fromfile` + `cv2.imdecode`。
+    """
     import cv2
-    img = cv2.imread(str(path), flags)
-    return img
+    import numpy as _np
+    p = str(path)
+    try:
+        buf = _np.fromfile(p, dtype=_np.uint8)
+    except OSError:
+        return None
+    if buf.size == 0:
+        return None
+    return cv2.imdecode(buf, flags)
 
 
 # ------------------------------------------------------------

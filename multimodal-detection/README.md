@@ -7,7 +7,8 @@
 
 ```
 code/
-├── models_config.py          ★ 唯一版本注册表（改配置就改这一处）
+├── models_config.py          ★ 唯一版本注册表（基线与正式实验配置统一登记）
+├── train_rgb.py              ★ 正式 RGB 高质量训练入口（本机/服务器同一份）
 ├── common/                   共享代码层（不掺实例逻辑）
 │   ├── __init__.py           sys.path 引导 + 公共 API
 │   ├── scan_data.py          数据布局探测（默认/目录布局自动回退）+ 生成 data.yaml
@@ -19,7 +20,8 @@ code/
 │   ├── evaluate.py           mAP@50-95 赛题口径评估（逐类 IoU 贪心匹配）
 │   ├── trainer.py            训练超参封装（从 models_config 读）
 │   └── inference.py          推理 + 输出赛题同名预测 txt
-├── 基线模型1/                3 通道原版 YOLO（单模态 RGB 对照）
+├── legacy/                   历史基线1/基线2/实验1入口（保留用于复现）
+│   ├── 基线模型1/            3 通道原版 YOLO（单模态 RGB 对照）
 │   ├── model_builder.py  dataset_adapter.py  main.py  README.md  __init__.py
 ├── 基线模型2/                6 通道早期融合（RGB3 + IR1 + Depth2[距离+有效掩码]）
 │   ├── 同基线模型1 的对称四件套
@@ -36,6 +38,7 @@ code/
 | 版本 cfg key | 目录 | 输入 | 融合 | 首层 | enabled | 说明 |
 |---|---|---|---|---|---|---|
 | `baseline1_3ch` | 基线模型1 | RGB 3ch | 无 | 3(原版) | ✅ | 只读 RGB 的对照基线 |
+| `rgb_hq_11m` | `train_rgb.py` | RGB 3ch | 无 | YOLO11m 原版 | ✅ | 高分辨率正式 RGB 模型；原生 loss/EMA + 稀有类追加 + 定位精修 |
 | `baseline2_5ch` | 基线模型2 | RGB3+IR1+Depth2 共 6ch | 前期(cat) | 3→6 | ✅ | 三模态拼接的最小融合基线；`in_channels=5` 可作无掩码消融 |
 | `experiment1`  | 实验模型1 | 三路：rgb(3)/ir(1)/depth(2) | P3/P4/P5 分级 | 各流独立首层 | ✅ | 轻量辅助流 + ModalDropout + MEGA + 每模态辅助头（Step0-4 方案） |
 
@@ -43,6 +46,46 @@ code/
 > 在 2000 组、12 类、mAP@50-95 的高框精度需求下，优先 s/m + 高 imgsz + 扎实验证融合。
 
 ## 使用流程
+
+### 正式 RGB 高质量模型（推荐先建立可靠单模态上限）
+
+配置统一登记在 `models_config.py` 的 `rgb_hq_11m`，实现由 `train_rgb.py` 驱动。
+它不经过多模态自定义训练循环；训练仍使用 Ultralytics 原生检测 loss、AdamW、AMP、
+EMA、有效 batch/weight-decay 缩放和完整 checkpoint 恢复。默认本机配置为
+YOLO11m、960、batch=4、200 轮，最后 25 轮关闭 Mosaic/MixUp 并减弱几何与颜色增强。
+
+```powershell
+& "D:\Development_Tools\anaconda3\envs\EFYOLO\python.exe" multimodal-detection\train_rgb.py `
+  --data-root "<数据集>\train_extracted" `
+  --labels "<数据集>\训练集\new_labels_2000" `
+  --split-file "multimodal-detection\configs\split_s42.json"
+```
+
+服务器使用完全相同入口，只覆盖资源参数，例如：
+
+```bash
+python multimodal-detection/train_rgb.py --data-root /data/train_extracted \
+  --labels /data/new_labels_2000 \
+  --split-file multimodal-detection/configs/split_s42.json \
+  --weights /weights/yolo11m.pt --device 0 --batch 16 --workers 12
+```
+
+一次启动包含两个有明确边界的阶段：先在固定 1600/400 划分上训练并选择 `best.pt`；
+再从该权重新建优化器和 EMA，用全部 2000 张图低学习率精修 18 轮。第二阶段因为验证图
+已经进入训练，其验证数字不再当泛化成绩，最终提交权重由 `final_model.json` 唯一指向。
+每轮训练清单保证 1600 张唯一图全部出现，再追加少量稀有类图；不会以替换采样漏掉常见类。
+
+日志统一为 UTF-8，可在 PowerShell 实时查看：
+
+```powershell
+Get-Content "multimodal-detection\runs\rgb_hq_11m_s42\train.log" -Encoding UTF8 -Wait -Tail 30
+```
+
+中断后在原命令末尾添加 `--resume`，会恢复 optimizer、GradScaler 和 EMA；不得直接把
+`best.pt` 当作“续训”权重。运行前可加 `--prepare-only` 只检查数据，或加 `--smoke`
+使用少量真实图验证显存和训练链路。
+
+### 历史多模态入口
 
 ```powershell
 $env:MULTIMODAL_DATA_ROOT = "填你自己的赛题数据根"   # 或改 models_config.py 的 DATA_ROOT

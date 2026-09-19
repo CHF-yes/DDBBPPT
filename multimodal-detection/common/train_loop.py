@@ -294,6 +294,13 @@ def train_custom(
                                         scale_mm=float(getattr(h.preprocess, "depth_scale_mm", 20000.0)))
                 loss = loss + lam * dl
                 items["dist_loss"] = float(dl.detach())
+            # Step4b: 边缘头损失（GT 框边界 + BCE；λ 与辅助头同源，可用 aux_edge_lambda 缩放）
+            if (getattr(model, "edge_enabled", False) and model.training
+                    and getattr(model, "_aux_edge_logits", None) is not None):
+                el = _aux_edge_loss(model._aux_edge_logits, batch, pos_weight=5.0)
+                lam_e = lam * float(getattr(h, "aux_edge_lambda", 1.0))
+                loss = loss + lam_e * el
+                items["edge_loss"] = float(el.detach())
             scaler.scale(loss).backward()
             scale_before = scaler.get_scale()
             scaler.step(opt)
@@ -347,7 +354,15 @@ def train_custom(
 
 
 def save_ckpt(path, ema, epoch, best_map, cfg: MC.ModelConfig, model_type: str) -> None:
-    """保存可复现的 checkpoint：state_dict + 训练/模型元数据（不再是裸 state_dict）。"""
+    """保存可复现的 checkpoint：state_dict + 训练元数据 + **结构自描述**。
+
+    `structure` 由模型自己的 `structure_kwargs()` 提供（实验模型1 会给出
+    mega / per_modality_gate / aux_depth_head / dist_head_src / aux_ch / gamma_init 等）——
+    这些开关决定 state_dict 的键集合，必须随权重一起保存，否则加载方按默认配置重建
+    会静默错配（历史教训：--no-mega 训练的 checkpoint 缺 12 个 MEGA 张量）。
+    """
+    src = getattr(ema.ema, "structure_kwargs", None)
+    structure = src() if callable(src) else {}
     torch.save({
         "model_state": ema.ema.state_dict(),
         "epoch": epoch,
@@ -357,19 +372,27 @@ def save_ckpt(path, ema, epoch, best_map, cfg: MC.ModelConfig, model_type: str) 
         "in_channels": cfg.in_channels,
         "model_type": model_type,                 # DetectionModel / Experiment1Model 等
         "class_names": MC.CLASS_NAMES,
+        "structure": structure,                   # ★ 结构自描述（重建模型用）
     }, path)
-    print(f"[train_loop] saved checkpoint (ep {epoch}) -> {path}")
+    print(f"[train_loop] saved checkpoint (ep {epoch}) -> {path}"
+          + (f"  structure={ {k: v for k, v in structure.items() if k != 'weights'} }"
+             if structure else ""))
 
 
-def load_custom_checkpoint(path, model: nn.Module, strict: bool = True) -> dict:
+def load_custom_checkpoint(path, model: nn.Module, strict: bool = True,
+                           allow_partial: bool = False) -> dict:
     """
     统一自定义 checkpoint 加载协议（P0-4）——训练保存的 best.pt/last.pt
     不是 ultralytics 原生格式，YOLO() 无法直接 load；必须先构建结构再回填权重。
 
     支持三种格式：
-      1) 本框架自定义格式 {"model_state": ..., ...}（save_ckpt 产出）；
+      1) 本框架自定义格式 {"model_state": ..., "structure": ...}（save_ckpt 产出）；
       2) ultralytics 原生训练产物（含 "ema"/"model" 键，如 YOLO.train 的 best.pt）；
       3) 裸 state_dict（旧版兼容）。
+    **结构校验**：本框架格式且带 `structure` 时，若 missing/unexpected 非空则直接报错
+    （除非 allow_partial=True）——防止"结构对不上却静默加载"（实验模型1 的
+    mega/per_modality_gate/aux_depth_head/dist_head_src 会改变 state_dict 键集合）。
+    实验模型1 建议改用 `model_builder.load_experiment1_checkpoint`（按 structure 自动重建）。
     返回 checkpoint dict（含 epoch/best_map/cfg_key 等元数据，供打印）。
     """
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
@@ -389,6 +412,15 @@ def load_custom_checkpoint(path, model: nn.Module, strict: bool = True) -> dict:
     if state is None:
         raise KeyError(f"[load_ckpt] {path} 中找不到可加载的 state_dict 键")
     missing, unexpected = model.load_state_dict(state, strict=strict)
+    st = ckpt.get("structure") or {}
+    if (missing or unexpected) and not (strict or allow_partial):
+        raise RuntimeError(
+            f"[load_ckpt] 结构不匹配：missing={len(missing)} unexpected={len(unexpected)}\n"
+            f"  checkpoint 记录的 structure: { {k: v for k, v in st.items() if k != 'weights'} }\n"
+            f"  missing 前几个: {list(missing)[:6]}\n"
+            f"  unexpected 前几个: {list(unexpected)[:6]}\n"
+            f"  → 请按 checkpoint 的 structure 重建模型（实验模型1 用 "
+            f"model_builder.load_experiment1_checkpoint），或显式传 allow_partial=True。")
     meta = {k: ckpt.get(k) for k in ("epoch", "best_map", "cfg_key", "class_num",
                                      "in_channels", "model_type") if k in ckpt}
     print(f"[load_ckpt] {path} 加载完成: {meta}"
@@ -476,6 +508,50 @@ def _aux_center_loss(logits: dict, batch: Dict, keep_masks: Optional[dict] = Non
         total = total + (pos_loss + neg_loss) / num_pos
         used_modalities += 1
     return total / max(used_modalities, 1)
+
+
+def _box_edge_target(batch: Dict, B: int, H: int, W: int, device, tol: float = 1.0):
+    """GT 框**边界**软标签 (B,1,H,W)：在特征网格上取框的"外框 - 内框"环带。
+
+    为什么用框边界而不是 depth 梯度：框边界是**标签信息**（输入里没有），
+    能逼辅助流学"目标在哪里有边界"；depth 梯度是输入里已有的信息，容易变成抄任务。
+    用 outer & ~inner 生成环带，等价于固定宽度（2·tol 个格子）的边界带。
+    """
+    tgt = torch.zeros(B, 1, H, W, device=device)
+    if batch.get("bboxes") is None or len(batch["bboxes"]) == 0:
+        return tgt
+    cx = batch["bboxes"][:, 0].to(device)
+    cy = batch["bboxes"][:, 1].to(device)
+    bw = batch["bboxes"][:, 2].to(device)
+    bh = batch["bboxes"][:, 3].to(device)
+    bi = batch["batch_idx"].to(device).long()
+    xs = torch.arange(W, device=device).view(1, -1).float()
+    ys = torch.arange(H, device=device).view(-1, 1).float()
+    for k in range(len(bi)):
+        b = int(bi[k])
+        if b < 0 or b >= B:
+            continue
+        x0, x1 = (cx[k] - bw[k] / 2) * W, (cx[k] + bw[k] / 2) * W
+        y0, y1 = (cy[k] - bh[k] / 2) * H, (cy[k] + bh[k] / 2) * H
+        outer = (xs >= x0 - tol) & (xs <= x1 + tol) & (ys >= y0 - tol) & (ys <= y1 + tol)
+        inner = (xs > x0 + tol) & (xs < x1 - tol) & (ys > y0 + tol) & (ys < y1 - tol)
+        ring = (outer & ~inner).float()
+        tgt[b, 0] = torch.maximum(tgt[b, 0], ring)
+    return tgt
+
+
+def _aux_edge_loss(logits: torch.Tensor, batch: Dict, pos_weight: float = 5.0):
+    """Step4b 边缘头损失：GT 框边界软标签 + BCEWithLogits（正样本稀疏 → pos_weight）。
+
+    logits: (B,1,H4,W4) 边缘 logits（来自辅助流，梯度不回主干）
+    """
+    B, _, H, W = logits.shape
+    tgt = _box_edge_target(batch, B, H, W, logits.device)
+    if float(tgt.sum()) <= 0:                       # 本 batch 无框 → 只推 logits 向负
+        return F.binary_cross_entropy_with_logits(
+            logits.float(), tgt, pos_weight=logits.new_tensor(pos_weight))
+    w = torch.full_like(tgt, float(pos_weight))
+    return F.binary_cross_entropy_with_logits(logits.float(), tgt, pos_weight=w)
 
 
 def _aux_distance_loss(logits: torch.Tensor, batch: Dict, depth_input: torch.Tensor,
