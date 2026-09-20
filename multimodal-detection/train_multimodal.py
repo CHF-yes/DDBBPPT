@@ -39,6 +39,7 @@ def main():
         "cross_modal_nce_weight": 0.0,
         "nce_temperature": 0.10,
         "p2_match_refine": False,
+        "val_every": 1,
         "run_full_refit": True,
     }.items():
         cfg.setdefault(key, value)
@@ -67,7 +68,8 @@ def main():
             "freeze_epochs","warmup","lrf","grad_clip","calibrate_clip_steps","mosaic","close_aug_frac",
             "scale_min","scale_max","translate","target_crop_p","misalign_px","degrade_p","rgb_color_p",
             "ir_noise_p","ir_gain_p","depth_hole_p","rgb_dropout","aux_dropout","dropout_start_epoch",
-            "branch_aux_weight","flow_supervision_weight","cross_modal_nce_weight","nce_temperature","seed")
+            "branch_aux_weight","flow_supervision_weight","cross_modal_nce_weight","nce_temperature",
+            "val_every","seed")
     if cfg["checkpoint_encoder"]:
         common += ["--checkpoint-encoder"]
     stages = ["dev"] if (a.smoke or not cfg.get("run_full_refit", True)) else ["dev","full_refit"]
@@ -78,17 +80,17 @@ def main():
         extra = []
         if stage == "dev":
             if a.smoke:
-                options.update(epochs=2,warmup=0,freeze_epochs=0,calibrate_clip_steps=2)
-                extra += ["--limit","24","--val-every","1"]
+                options.update(epochs=2,warmup=0,freeze_epochs=0,calibrate_clip_steps=2,val_every=1)
+                extra += ["--limit","24"]
             else:
-                extra += ["--split-file",str(Path(a.split_file).resolve()),"--val-every","1"]
+                extra += ["--split-file",str(Path(a.split_file).resolve())]
         else:
             options.update(epochs=cfg["refit_epochs"],lr=.00006,freeze_epochs=0,warmup=1,lrf=.1,
                            mosaic=0,close_aug_frac=.5,scale_min=.95,scale_max=1.05,translate=.02,
                            target_crop_p=0,misalign_px=0,degrade_p=.02,depth_hole_p=0,
                            rgb_color_p=.10,ir_noise_p=.02,ir_gain_p=.05,
-                           rgb_dropout=0,aux_dropout=0,calibrate_clip_steps=32)
-            extra += ["--full-data","--val-every","0"]
+                           rgb_dropout=0,aux_dropout=0,calibrate_clip_steps=32,val_every=0)
+            extra += ["--full-data"]
         cmd = common + ["--name",stage]
         for k,v in options.items():
             cmd += ["--"+k.replace("_","-"),str(v)]

@@ -6,6 +6,7 @@
   "batch": 6,
   "accum": 3,
   "workers": 8,
+  "val_every": 5,
   "precision": "bf16",
   "checkpoint_encoder": true,
   "lr": 0.0005,
