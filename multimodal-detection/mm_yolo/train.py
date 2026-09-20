@@ -65,7 +65,11 @@ MEMORY_RECIPE = "coverage_spatial_memory_v1"
 
 def recipe_for(args):
     if getattr(args, "architecture", "") == "independent_p2_memory_v3":
-        return "independent_p2_memory_v3"
+        semantic = (getattr(args, "branch_aux_weight", 0) > 0 or
+                    getattr(args, "flow_supervision_weight", 0) > 0 or
+                    getattr(args, "cross_modal_nce_weight", 0) > 0 or
+                    getattr(args, "p2_match_refine", False))
+        return "independent_p2_semantic_v1" if semantic else "independent_p2_memory_v3"
     if getattr(args, "memory_control", "unbounded_v1") == "bounded_v2":
         return "coverage_spatial_memory_v2"
     return MEMORY_RECIPE if getattr(args, "architecture", "legacy_hook_v1") == "spatial_memory_v1" else TRAINER_RECIPE
@@ -259,6 +263,32 @@ def accumulation_loss(loss_vec: torch.Tensor, nominal_samples: int) -> torch.Ten
     return loss_vec.sum() / float(nominal_samples)
 
 
+def subset_detection_batch(preds: dict, targets: dict, active: torch.Tensor) -> tuple[dict, dict]:
+    """Select observed samples and remap target indices for one auxiliary modality."""
+    ids = active.nonzero(as_tuple=True)[0]
+    if not ids.numel():
+        raise ValueError("subset_detection_batch requires an observed sample")
+    mapping = torch.full((active.numel(),), -1, dtype=torch.long, device=active.device)
+    mapping[ids] = torch.arange(ids.numel(), device=active.device)
+    if targets["batch_idx"].numel():
+        target_keep = active.index_select(0, targets["batch_idx"].long())
+    else:
+        target_keep = active.new_zeros(0)
+    sub_targets = {
+        "batch_idx": mapping.index_select(0, targets["batch_idx"][target_keep].long()).float(),
+        "cls": targets["cls"][target_keep],
+        "bboxes": targets["bboxes"][target_keep],
+        "imgsz": targets["imgsz"],
+        "batch_size": int(ids.numel()),
+    }
+    sub_preds = {
+        "boxes": preds["boxes"].index_select(0, ids),
+        "scores": preds["scores"].index_select(0, ids),
+        "feats": [x.index_select(0, ids) for x in preds["feats"]],
+    }
+    return sub_preds, sub_targets
+
+
 def ensure_finite_state(model: nn.Module, label: str = "model") -> None:
     """拒绝保存被 NaN/Inf 污染的参数或 BN buffer。
 
@@ -302,6 +332,11 @@ def validate_checkpoint(ck: dict, model: MMYOLO, enabled, canvas, exact: bool = 
             structure["fusion"].setdefault("memory_tokens_per_modality", 4)
             structure["fusion"].setdefault("architecture", "legacy_hook_v1")
             structure["fusion"].setdefault("memory_control", "unbounded_v1")
+            structure["fusion"].setdefault("branch_aux_weight", 0.0)
+            structure["fusion"].setdefault("flow_supervision_weight", 0.0)
+            structure["fusion"].setdefault("cross_modal_nce_weight", 0.0)
+            structure["fusion"].setdefault("nce_temperature", 0.10)
+            structure["fusion"].setdefault("p2_match_refine", False)
     # B1 结构里还没有该字段，其实际语义就是 2ch。先规范化，保证历史
     # last.pt 仍可严格 --resume；B2 则显式记录 4ch。
     if "encoder" in saved_structure:
@@ -362,6 +397,8 @@ def validate_checkpoint(ck: dict, model: MMYOLO, enabled, canvas, exact: bool = 
                  "close_aug_frac", "bn_policy", "warmup", "lrf", "calibrate_clip_steps", "memory_control")
         keys += ("scale_min", "scale_max", "translate")
         keys += ("precision", "checkpoint_encoder", "mosaic", "full_data")
+        keys += ("branch_aux_weight", "flow_supervision_weight", "cross_modal_nce_weight",
+                 "nce_temperature", "p2_match_refine")
         legacy = {"depth_channels": 2, "depth_view": "both", "depth_init": "relative",
                   "misalign_px": 15.0, "degrade_p": 0.3, "rgb_color_p": 0.0,
                   "ir_noise_p": 0.0, "ir_gain_p": 0.0,
@@ -374,6 +411,8 @@ def validate_checkpoint(ck: dict, model: MMYOLO, enabled, canvas, exact: bool = 
                       close_aug_frac=0., bn_policy="legacy", warmup=3, lrf=.01, calibrate_clip_steps=0,
                       memory_control="unbounded_v1")
         legacy.update(precision="fp16", checkpoint_encoder=False, mosaic=0., full_data=False)
+        legacy.update(branch_aux_weight=0., flow_supervision_weight=0.,
+                      cross_modal_nce_weight=0., nce_temperature=.1, p2_match_refine=False)
         changed = [k for k in keys
                    if old.get(k, legacy.get(k)) != getattr(args, k, legacy.get(k))]
         if changed:
@@ -593,6 +632,15 @@ def main():
                     help="训练期验证用多少张（组感知 + 类别均衡子集；0=全量）")
     ap.add_argument("--val-conf", type=float, default=0.001,
                     help="训练期验证的置信度（0.01 快得多；正式 Test 报数用 0.001）")
+    ap.add_argument("--branch-aux-weight", type=float, default=0.0,
+                    help="training-only detector shared by RGB/IR/Depth common features")
+    ap.add_argument("--flow-supervision-weight", type=float, default=0.0,
+                    help="known canvas-shift supervision for Depth correspondence")
+    ap.add_argument("--cross-modal-nce-weight", type=float, default=0.0,
+                    help="GT-object cross-modal InfoNCE weight")
+    ap.add_argument("--nce-temperature", type=float, default=0.10)
+    ap.add_argument("--p2-match-refine", action="store_true",
+                    help="run an independent local correspondence refinement at P2")
     args = ap.parse_args()
     if args.reset_fusion_gates and (args.resume or not args.init_checkpoint):
         raise ValueError("--reset-fusion-gates requires --init-checkpoint in a new run")
@@ -608,6 +656,9 @@ def main():
         raise ValueError("invalid geometric augmentation range")
     if args.calibrate_clip_steps < 0 or args.val_batch < 1 or args.warmup < 0:
         raise ValueError("invalid calibration/validation/warmup settings")
+    if (min(args.branch_aux_weight, args.flow_supervision_weight, args.cross_modal_nce_weight) < 0
+            or args.nce_temperature <= 0):
+        raise ValueError("semantic loss weights must be nonnegative and temperature positive")
     if args.calibrate_clip_steps and args.grad_clip <= 0:
         raise ValueError("clip calibration requires a positive initial safety threshold")
     if args.architecture in ("spatial_memory_v1", "independent_p2_memory_v3") and args.sampler != "coverage":
@@ -788,6 +839,11 @@ def main():
     cfg.weights = args.weights
     cfg.fusion.architecture = args.architecture
     cfg.fusion.memory_control = args.memory_control
+    cfg.fusion.branch_aux_weight = float(args.branch_aux_weight)
+    cfg.fusion.flow_supervision_weight = float(args.flow_supervision_weight)
+    cfg.fusion.cross_modal_nce_weight = float(args.cross_modal_nce_weight)
+    cfg.fusion.nce_temperature = float(args.nce_temperature)
+    cfg.fusion.p2_match_refine = bool(args.p2_match_refine)
     cfg.depth_resampling = args.depth_resampling
     cfg.encoder.metric_branch = args.metric_branch
     cfg.encoder.checkpoint_encoder = args.checkpoint_encoder
@@ -946,6 +1002,7 @@ def main():
                     f"{'也冻结' if args.freeze_new_bn else '仍训练'}")
         opt.zero_grad(set_to_none=True)
         agg = {"loss": 0.0, "n": 0, "micro": 0, "group_samples": 0, "skipped": 0,
+               "branch_aux": 0.0, "flow_aux": 0.0, "nce_aux": 0.0,
                "grad_steps": 0, "grad_clipped": 0, "grad_norm_sum": 0.0,
                "grad_norm_max": 0.0, "amp_overflow": 0, "norms": [], "stems": set(), "draws": 0}
         health_sum, health_n = {}, 0
@@ -1048,6 +1105,32 @@ def main():
                 loss = accumulation_loss(loss_vec, nominal_samples)
                 if args.architecture == "independent_p2_memory_v3":
                     loss = loss + model.aux_loss * (rgb.shape[0] / nominal_samples)
+                    semantic = model.semantic_regularization(
+                        tgt,
+                        batch["alignment_shift"].to(dev, non_blocking=non_blocking),
+                        batch["alignment_supervised"].to(dev, non_blocking=non_blocking),
+                    )
+                    loss = loss + (args.flow_supervision_weight * semantic["flow"] +
+                                   args.cross_modal_nce_weight * semantic["nce"]) * (
+                                       rgb.shape[0] / nominal_samples)
+                    branch_total = loss.new_zeros(())
+                    branch_count = 0
+                    for mi, name in enumerate(("rgb", "ir", "dep")):
+                        if name not in model.semantic_branch_predictions:
+                            continue
+                        active = model.semantic_branch_present[:, mi]
+                        if not active.any():
+                            continue
+                        branch_preds, branch_targets = subset_detection_batch(
+                            model.semantic_branch_predictions[name], tgt, active)
+                        branch_vec, _ = crit(branch_preds, branch_targets)
+                        branch_total = branch_total + branch_vec.sum()
+                        branch_count += 1
+                    if branch_count:
+                        loss = loss + args.branch_aux_weight * branch_total / (
+                            nominal_samples * branch_count)
+                    else:
+                        branch_total = loss.new_zeros(())
             if not torch.isfinite(loss.detach()):
                 stems = batch.get("stems", [])
                 log(f"[train][FATAL] ep={ep+1} batch={bi} loss 非有限，"
@@ -1067,6 +1150,10 @@ def main():
             # 日志使用 criterion 自身的标度；不要记录为了梯度累积额外缩小后的
             # backward loss，否则只改 accum 也会让曲线失去可比性。
             agg["loss"] += sum(float(v) for v in loss_items.values())
+            if args.architecture == "independent_p2_memory_v3":
+                agg["branch_aux"] += float(branch_total.detach()) / max(1, rgb.shape[0] * max(1, branch_count))
+                agg["flow_aux"] += float(semantic["flow"].detach())
+                agg["nce_aux"] += float(semantic["nce"].detach())
             for k in ("box_loss", "cls_loss", "dfl_loss"):
                 agg[k] = agg.get(k, 0.0) + float(loss_items[k])
             agg["n"] += 1
@@ -1106,6 +1193,10 @@ def main():
                f" grad_p90={float(np.percentile(agg['norms'],90)) if agg['norms'] else 0:.2f}"
                f" clip_limit={clip_state['threshold']:.2f}"
                f"{mem} 用时 {(time.time()-t_ep)/60:.1f}min/轮 累计 {(time.time()-t0)/60:.1f}min")
+        if args.architecture == "independent_p2_memory_v3" and (
+                args.branch_aux_weight or args.flow_supervision_weight or args.cross_modal_nce_weight):
+            msg += (f" semantic_raw=branch:{agg['branch_aux']/n:.3f} "
+                    f"flow:{agg['flow_aux']/n:.4f} nce:{agg['nce_aux']/n:.3f}")
         if model.spatial_memory:
             if health_n:
                 log(f"[train] fusion epoch-mean={ {k: round(float(v/health_n),4) for k,v in health_sum.items()} }")

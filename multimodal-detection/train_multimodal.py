@@ -32,6 +32,16 @@ def main():
     p.add_argument("--dry-run",action="store_true")
     a = p.parse_args()
     cfg = json.loads(Path(a.config).read_text(encoding="utf-8"))
+    for key, value in {
+        "dropout_start_epoch": 5,
+        "branch_aux_weight": 0.0,
+        "flow_supervision_weight": 0.0,
+        "cross_modal_nce_weight": 0.0,
+        "nce_temperature": 0.10,
+        "p2_match_refine": False,
+        "run_full_refit": True,
+    }.items():
+        cfg.setdefault(key, value)
     for key in ("batch","accum","workers"):
         if getattr(a,key) is not None:
             cfg[key] = getattr(a,key)
@@ -56,10 +66,11 @@ def main():
     keys = ("architecture","imgsz","epochs","batch","accum","workers","precision","lr","backbone_lr_mult",
             "freeze_epochs","warmup","lrf","grad_clip","calibrate_clip_steps","mosaic","close_aug_frac",
             "scale_min","scale_max","translate","target_crop_p","misalign_px","degrade_p","rgb_color_p",
-            "ir_noise_p","ir_gain_p","depth_hole_p","rgb_dropout","aux_dropout","seed")
+            "ir_noise_p","ir_gain_p","depth_hole_p","rgb_dropout","aux_dropout","dropout_start_epoch",
+            "branch_aux_weight","flow_supervision_weight","cross_modal_nce_weight","nce_temperature","seed")
     if cfg["checkpoint_encoder"]:
         common += ["--checkpoint-encoder"]
-    stages = ["dev"] if a.smoke else ["dev","full_refit"]
+    stages = ["dev"] if (a.smoke or not cfg.get("run_full_refit", True)) else ["dev","full_refit"]
     for stage in stages:
         if state.get(stage+"_complete"):
             continue
@@ -81,6 +92,8 @@ def main():
         cmd = common + ["--name",stage]
         for k,v in options.items():
             cmd += ["--"+k.replace("_","-"),str(v)]
+        if cfg.get("p2_match_refine", False):
+            cmd += ["--p2-match-refine"]
         last = run/stage/"weights/last.pt"
         if a.resume and last.exists():
             extra += ["--resume"]

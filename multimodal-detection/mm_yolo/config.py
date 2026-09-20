@@ -101,6 +101,13 @@ class FusionCfg:
     slot_names: Tuple[str, ...] = ("rgb", "ir", "dep")
     spatial_dim: int = 64
     memory_tokens_per_modality: int = 4
+    # v4 semantic supervision is training-only. Zero weights preserve the exact
+    # v3 graph/state_dict; p2 matching is therefore an explicit structural flag.
+    branch_aux_weight: float = 0.0
+    flow_supervision_weight: float = 0.0
+    cross_modal_nce_weight: float = 0.0
+    nce_temperature: float = 0.10
+    p2_match_refine: bool = False
 
 
 @dataclass

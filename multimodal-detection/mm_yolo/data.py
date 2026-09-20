@@ -844,6 +844,10 @@ class MMDataset(Dataset):
             scene[:,y:y+hh,x:x+ww] = j+1
         out["quality"]["scene_id"] = scene
         out["prior"] = torch.zeros(4,max(4,h//self.prior_stride),max(4,w//self.prior_stride))
+        # A Mosaic contains four independently shifted Depth tiles, so there is
+        # no single global displacement target for flow supervision.
+        out["alignment_shift"] = torch.zeros(2, dtype=torch.float32)
+        out["alignment_supervised"] = torch.tensor(0.0, dtype=torch.float32)
         out["keep"] = {m: float(any(c["keep"][m] for c in children)) for m in ("rgb","ir","dep")}
         # Whole-modality dropout applies to the completed Mosaic, never ambiguous individual tiles.
         aug = scheduled_aug(self.aug,epoch)
@@ -1010,6 +1014,11 @@ class MMDataset(Dataset):
             "prior": torch.from_numpy(prior),
             "boxes": torch.from_numpy(out_boxes),          # 画布归一化 [cls,cx,cy,w,h]
             "M": torch.from_numpy(M.copy()),               # letterbox 仿射（2×3）
+            # jx/jy are CANVAS pixels: shift_M is left-multiplied after M.
+            # The model converts them to feature pixels using each actual map size.
+            "alignment_shift": torch.tensor([jx, jy], dtype=torch.float32),
+            "alignment_supervised": torch.tensor(
+                float(self.train and aug.misalign_px > 0), dtype=torch.float32),
             "orig_hw": torch.tensor([H, W], dtype=torch.float32),
             "stem": s["stem"],
             "keep": keep,
@@ -1109,6 +1118,8 @@ def collate(batch: List[Optional[dict]]) -> Optional[dict]:
                                     for b in batch]) for k in qkeys},
         "boxes": [b["boxes"] for b in batch],
         "M": torch.stack([b["M"] for b in batch]),
+        "alignment_shift": torch.stack([b.get("alignment_shift", torch.zeros(2)) for b in batch]),
+        "alignment_supervised": torch.stack([b.get("alignment_supervised", torch.tensor(0.0)) for b in batch]),
         "orig_hw": torch.stack([b["orig_hw"] for b in batch]),
         "stems": [b["stem"] for b in batch],
         "keep": {k: torch.tensor([b["keep"][k] for b in batch]) for k in ("rgb", "ir", "dep")},

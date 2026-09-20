@@ -91,7 +91,8 @@ class IndependentMMYOLO(nn.Module):
         for blocks in self.embeddings.values():
             for block in blocks[1:]:
                 block.common.load_state_dict(blocks[0].common.state_dict())
-        self.matchers = nn.ModuleDict({s: nn.ModuleList([LocalCorrespondence() for _ in range(2)]) for s in ("p3", "p4", "p5")})
+        matcher_scales = SCALES if cfg.fusion.p2_match_refine else ("p3", "p4", "p5")
+        self.matchers = nn.ModuleDict({s: nn.ModuleList([LocalCorrespondence() for _ in range(2)]) for s in matcher_scales})
         self.fusion = nn.ModuleDict({s: ComplementaryFusion(c, dim, md) for s,c in self.channels.items()})
         self.register_bus = CrossScaleMemory(self.channels, dim=md, heads=cfg.fusion.heads,
                                              tokens_per_modality=cfg.fusion.memory_tokens_per_modality)
@@ -115,6 +116,16 @@ class IndependentMMYOLO(nn.Module):
         det.cv3[0][-1].bias.data.fill_(math.log(5/self.nc/(640/4)**2))
         self.backbone.model[-1] = det
         self.backbone.stride = det.stride
+        self.semantic_adapters = None
+        self.semantic_detect = None
+        if cfg.fusion.branch_aux_weight > 0:
+            # One shared training-only detector sees the common representation
+            # from each modality. Sharing the head makes semantic compatibility
+            # operational rather than merely encouraging similar magnitudes.
+            self.semantic_adapters = nn.ModuleDict({
+                s: Conv(dim, c, 1) for s, c in zip(SCALES, self.neck_channels)
+            })
+            self.semantic_detect = copy.deepcopy(det)
         self.neck_memory = NeckMemoryRead(p2_ch, md, cfg.fusion.heads)
         self.localization = nn.ModuleList([Conv(self.channels[s], c, 1) for s,c in zip(SCALES,self.neck_channels)])
         self.loc_gain = nn.Parameter(torch.full((4,), math.log(.05/.95)))
@@ -125,6 +136,12 @@ class IndependentMMYOLO(nn.Module):
         self._struct = cfg.structure()
         self.aux_loss = torch.tensor(0.)
         self._last_register_state = None
+        self.semantic_branch_predictions = {}
+        self.semantic_branch_present = None
+        self._semantic_common = None
+        self._semantic_masks = None
+        self._semantic_flows = None
+        self.last_semantic_losses = {}
         self.train()
 
     @property
@@ -215,7 +232,7 @@ class IndependentMMYOLO(nn.Module):
             shape = raw[0][s].shape[-2:]
             flows[s], confidence[s] = [], [masks[s][0]]
             for m in range(1,3):
-                if s == "p2":
+                if s == "p2" and not self.cfg.fusion.p2_match_refine:
                     flow = resize_flow(previous[m-1],shape)
                     conf = F.interpolate(confidence["p3"][m],shape,mode="bilinear",align_corners=False)
                 else:
@@ -227,7 +244,7 @@ class IndependentMMYOLO(nn.Module):
                 flows[s].append(flow)
                 confidence[s].append(conf)
         state = None
-        fused, geometry = {}, {}
+        fused, geometry, aligned_common, aligned_masks = {}, {}, {}, {}
         alignment_loss = auxiliary.new_zeros(())
         for s in SCALES:
             own = [raw[m][s] for m in range(3)]
@@ -250,10 +267,20 @@ class IndependentMMYOLO(nn.Module):
                 weight = (confidence[s][m]*rel[m]).detach()
                 similarity = (F.normalize(c[0].detach().float(),dim=1)*F.normalize(c[m].float(),dim=1)).sum(1,keepdim=True)
                 alignment_loss = alignment_loss + ((1-similarity)*weight).sum()/weight.sum().clamp_min(1)/8
+            aligned_common[s], aligned_masks[s] = c, mask
             fused[s] = self.fusion[s](values,c,u,mask,confidence[s],rel,state,qual)
             # A separate dense, confidence-gated boundary bypass supports box regression.
             geometry[s] = values[0]*mask[0] + sum(values[m]*confidence[s][m]*rel[m] for m in (1,2))*.25
         self.aux_loss = .01*auxiliary + .005*alignment_loss if self.training else auxiliary.detach()*0
+        self.semantic_branch_predictions = {}
+        self.semantic_branch_present = present
+        self._semantic_common = aligned_common
+        self._semantic_masks = aligned_masks
+        self._semantic_flows = flows
+        if self.training and self.semantic_detect is not None:
+            for m, name in enumerate(MODES):
+                branch_features = [self.semantic_adapters[s](aligned_common[s][m]) for s in SCALES]
+                self.semantic_branch_predictions[name] = self.semantic_detect(branch_features, branch_features)
         self._last_register_state = state.detach()
         layers = self.backbone.model
         p5 = fused["p5"]
@@ -267,3 +294,85 @@ class IndependentMMYOLO(nn.Module):
         features = [p2,p3,p4,p5]
         loc = [x+self.loc_gain[i].sigmoid()*self.localization[i](geometry[s]) for i,(s,x) in enumerate(zip(SCALES,features))]
         return self.model[-1](features,loc)
+
+    @staticmethod
+    def _object_vectors(feature, valid, targets, grid_size=3):
+        """Differentiable object-region pooling in normalized canvas coordinates."""
+        batch_idx = targets["batch_idx"].long()
+        boxes = targets["bboxes"].float()
+        if not batch_idx.numel():
+            return feature.new_zeros((0, feature.shape[1])), feature.new_zeros(0, dtype=torch.bool)
+        axis = torch.linspace(-.3, .3, grid_size, device=feature.device, dtype=boxes.dtype)
+        yy, xx = torch.meshgrid(axis, axis, indexing="ij")
+        cx, cy, bw, bh = boxes.unbind(1)
+        gx = cx[:, None, None] + xx[None] * bw[:, None, None]
+        gy = cy[:, None, None] + yy[None] * bh[:, None, None]
+        grid = torch.stack((gx * 2 - 1, gy * 2 - 1), -1)
+        selected = feature.index_select(0, batch_idx)
+        selected_valid = valid.index_select(0, batch_idx)
+        with torch.autocast(feature.device.type, enabled=False):
+            values = F.grid_sample(selected.float(), grid.float(), align_corners=False)
+            observed = F.grid_sample(selected_valid.float(), grid.float(), align_corners=False)
+        weights = observed.clamp(0, 1)
+        vector = (values * weights).sum((2, 3)) / weights.sum((2, 3)).clamp_min(1e-4)
+        return F.normalize(vector, dim=1), weights.mean((1, 2, 3)) > .5
+
+    def semantic_regularization(self, targets, alignment_shift, alignment_supervised):
+        """Return unweighted flow/NCE losses for the current forward pass."""
+        zero = next(self.parameters()).new_zeros((), dtype=torch.float32)
+        result = {"flow": zero, "nce": zero}
+        if not self.training or self._semantic_common is None:
+            self.last_semantic_losses = {k: v.detach() for k, v in result.items()}
+            return result
+
+        if self.cfg.fusion.flow_supervision_weight > 0:
+            terms = []
+            shift = alignment_shift.float()
+            supervised = alignment_supervised.float()[:, None, None, None]
+            for s in SCALES:
+                pred = self._semantic_flows[s][1].float()  # Depth -> RGB source-sampling flow
+                fh, fw = pred.shape[-2:]
+                sx = float(self.infer_canvas[1] if hasattr(self, "infer_canvas") else 0) / fw
+                sy = float(self.infer_canvas[0] if hasattr(self, "infer_canvas") else 0) / fh
+                if sx <= 0 or sy <= 0:
+                    # Training sets infer_canvas from the real canvas before the first forward.
+                    raise RuntimeError("semantic flow supervision requires model.infer_canvas")
+                target = torch.stack((shift[:, 0] / sx, shift[:, 1] / sy), 1)[:, :, None, None]
+                target = target.expand_as(pred)
+                mask = self._semantic_masks[s][0].float() * supervised
+                # The shifted Depth must be observable at the target sampling position.
+                mask = mask * warp(self._semantic_masks[s][2].float(), target).clamp(0, 1)
+                error = F.smooth_l1_loss(pred, target, reduction="none", beta=.25).mean(1, keepdim=True)
+                terms.append((error * mask).sum() / mask.sum().clamp_min(1))
+            result["flow"] = torch.stack(terms).mean() if terms else zero
+
+        if self.cfg.fusion.cross_modal_nce_weight > 0:
+            terms, classes = [], targets["cls"].long()
+            temperature = float(self.cfg.fusion.nce_temperature)
+            for s in ("p3", "p4", "p5"):
+                vectors, observed = [], []
+                for m in range(3):
+                    z, ok = self._object_vectors(self._semantic_common[s][m], self._semantic_masks[s][m], targets)
+                    vectors.append(z)
+                    observed.append(ok)
+                for a, b in ((0, 1), (0, 2), (1, 2)):
+                    keep = observed[a] & observed[b]
+                    if not keep.any():
+                        continue
+                    qa, kb, cls = vectors[a][keep], vectors[b][keep], classes[keep]
+                    if len(qa) == 1:
+                        terms.append(1 - (qa * kb).sum(1).mean())
+                        continue
+                    logits = qa @ kb.t() / temperature
+                    # Other instances of the same class are neither negatives nor
+                    # forced positives; the diagonal is the same physical object.
+                    same_class = cls[:, None].eq(cls[None, :])
+                    diagonal = torch.eye(len(cls), dtype=torch.bool, device=cls.device)
+                    logits = logits.masked_fill(same_class & ~diagonal, -1e4)
+                    labels = torch.arange(len(cls), device=cls.device)
+                    terms.append((F.cross_entropy(logits, labels) +
+                                  F.cross_entropy(logits.t(), labels)) * .5)
+            result["nce"] = torch.stack(terms).mean() if terms else zero
+
+        self.last_semantic_losses = {k: v.detach() for k, v in result.items()}
+        return result

@@ -11,7 +11,8 @@ MM = Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(MM))
 from config import default_config
 from model import MMYOLO, save_mm_checkpoint, load_mm_checkpoint
-from train import build_optimizer, set_encoder_frozen, apply_bn_policy, make_targets
+from train import (build_optimizer, set_encoder_frozen, apply_bn_policy, make_targets,
+                   subset_detection_batch)
 from data import MMDataset, AugCfg, collate, scheduled_aug
 from independent_fusion import warp, resize_flow, LocalCorrespondence
 from ultralytics.utils.loss import v8DetectionLoss
@@ -132,6 +133,32 @@ class IndependentV3Tests(unittest.TestCase):
         (flow.square().mean()+conf.sum()).backward()
         self.assertEqual(float(conf.sum()),0.)
         self.assertTrue(torch.isfinite(query.grad).all() and torch.isfinite(key.grad).all())
+
+    def test_semantic_heads_flow_and_object_nce_backward(self):
+        c = config()
+        c.fusion.branch_aux_weight = .15
+        c.fusion.flow_supervision_weight = .05
+        c.fusion.cross_modal_nce_weight = .03
+        c.fusion.p2_match_refine = True
+        m = MMYOLO(c).train()
+        m.infer_canvas = (64,96)
+        rgb,ir,dep = self.inputs()
+        out = m(rgb,ir,dep)
+        batch = {"boxes":[torch.tensor([[0.,.5,.5,.2,.2]]),
+                          torch.tensor([[1.,.4,.4,.3,.2]])]}
+        targets = make_targets(batch,(64,96),torch.device("cpu"))
+        semantic = m.semantic_regularization(
+            targets, torch.tensor([[4.,0.],[0.,-4.]]), torch.ones(2))
+        self.assertTrue(torch.isfinite(semantic["flow"]) and torch.isfinite(semantic["nce"]))
+        active = m.semantic_branch_present[:,1]
+        pred,tgt = subset_detection_batch(m.semantic_branch_predictions["ir"],targets,active)
+        branch,_ = v8DetectionLoss(m)(pred,tgt)
+        total = out["scores"].sum()*0 + branch.sum()/2 + semantic["flow"] + semantic["nce"]
+        total.backward()
+        self.assertTrue(any(p.grad is not None and p.grad.abs().sum()>0
+                            for p in m.semantic_detect.parameters()))
+        self.assertTrue(any(p.grad is not None and p.grad.abs().sum()>0
+                            for p in m.matchers["p2"].parameters()))
 
 
 if __name__ == "__main__":
