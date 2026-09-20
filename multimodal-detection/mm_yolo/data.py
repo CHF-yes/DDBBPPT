@@ -241,6 +241,7 @@ class AugCfg:
     depth_resampling: str = "legacy_bilinear_v1"
     total_epochs: int = 0
     close_aug_frac: float = 0.0
+    mosaic_p: float = 0.0
 
 
 def scheduled_aug(base: AugCfg, epoch: int) -> AugCfg:
@@ -250,7 +251,8 @@ def scheduled_aug(base: AugCfg, epoch: int) -> AugCfg:
     start = base.total_epochs * (1.0 - base.close_aug_frac)
     t = float(np.clip((epoch - start) / max(1.0, base.total_epochs - 1 - start), 0, 1))
     mix = lambda a, b: a + (b - a) * t
-    return replace(base, scale_range=(mix(base.scale_range[0], .95), mix(base.scale_range[1], 1.05)),
+    return replace(base, mosaic_p=0.0 if epoch >= start else base.mosaic_p,
+                   scale_range=(mix(base.scale_range[0], .95), mix(base.scale_range[1], 1.05)),
                    translate=mix(base.translate, .02), target_crop_p=base.target_crop_p * (1-t),
                    misalign_px=base.misalign_px * (1-t),
                    degrade_p=base.degrade_p * (1-.8*t), rgb_color_p=base.rgb_color_p * (1-.5*t),
@@ -789,6 +791,78 @@ class MMDataset(Dataset):
         return np.zeros((h, w), np.float32), np.zeros((h, w), bool)
 
     def __getitem__(self, idx: int) -> Optional[dict]:
+        self._load_epoch_file()
+        index, draw, epoch = idx if isinstance(idx, tuple) else (idx, 0, self.epoch)
+        self.epoch = epoch
+        aug = scheduled_aug(self.aug, epoch) if self.train else self.aug
+        rng = self._rng(index, draw)
+        if self.train and aug.mosaic_p > 0 and rng.random() < aug.mosaic_p:
+            return self._mosaic_item(index, draw, epoch, rng)
+        return self._single_item(idx)
+
+    def _mosaic_item(self, index, draw, epoch, rng):
+        """Four synchronized source scenes; no distance blending or cross-scene matches."""
+        import torch.nn.functional as tf
+        h, w = self.canvas
+        cy, cx = int(h*rng.uniform(.4,.6)), int(w*rng.uniform(.4,.6))
+        rects = [(0,0,cy,cx),(0,cx,cy,w-cx),(cy,0,h-cy,cx),(cy,cx,h-cy,w-cx)]
+        sources = [index] + [rng.randrange(len(self)) for _ in range(3)]
+        original_canvas, original_aug = self.canvas, self.aug
+        children = []
+        try:
+            self.aug = replace(self.aug, mosaic_p=0, rgb_drop_p=0, aux_drop_p=0)
+            for j,(source,(_,_,hh,ww)) in enumerate(zip(sources,rects)):
+                self.canvas = (hh,ww)
+                children.append(self._single_item((source,draw*5+j+1,epoch)))
+        finally:
+            self.canvas, self.aug = original_canvas, original_aug
+        if any(x is None for x in children):
+            raise OSError("unreadable Mosaic source")
+        out = dict(children[0])
+        for key in ("rgb","ir","depth"):
+            out[key] = torch.cat((torch.cat((children[0][key],children[1][key]),2),
+                                  torch.cat((children[2][key],children[3][key]),2)),1)
+        boxes = []
+        for item,(y,x,hh,ww) in zip(children,rects):
+            bb = item["boxes"].clone()
+            bb[:,1] = (bb[:,1]*ww+x)/w
+            bb[:,2] = (bb[:,2]*hh+y)/h
+            bb[:,3] *= ww/w
+            bb[:,4] *= hh/h
+            boxes.append(bb)
+        out["boxes"] = torch.cat(boxes)
+        out["quality"] = {}
+        for key in set().union(*(c["quality"] for c in children)):
+            tiles = []
+            for item,(_,_,hh,ww) in zip(children,rects):
+                value = item["quality"].get(key, torch.zeros(3,1,1))
+                tiles.append(tf.interpolate(value[None],size=(hh,ww),mode="nearest")[0])
+            value = torch.cat((torch.cat(tiles[:2],2),torch.cat(tiles[2:],2)),1)
+            out["quality"][key] = value if key == "availability" else tf.interpolate(value[None],size=(max(4,h//8),max(4,w//8)),mode="area")[0]
+        scene = torch.zeros(1,h,w)
+        for j,(y,x,hh,ww) in enumerate(rects):
+            scene[:,y:y+hh,x:x+ww] = j+1
+        out["quality"]["scene_id"] = scene
+        out["prior"] = torch.zeros(4,max(4,h//self.prior_stride),max(4,w//self.prior_stride))
+        out["keep"] = {m: float(any(c["keep"][m] for c in children)) for m in ("rgb","ir","dep")}
+        # Whole-modality dropout applies to the completed Mosaic, never ambiguous individual tiles.
+        aug = scheduled_aug(self.aug,epoch)
+        if self._use_dropout and epoch >= aug.dropout_start_epoch:
+            original = dict(out["keep"])
+            for m,p in (("rgb",aug.rgb_drop_p),("ir",aug.aux_drop_p),("dep",aug.aux_drop_p)):
+                if rng.random() < p:
+                    out["keep"][m] = 0.
+            if not any(out["keep"].values()):
+                m = rng.choice([m for m in original if original[m]])
+                out["keep"][m] = 1.
+        for j,m in enumerate(("rgb","ir","dep")):
+            if not out["keep"][m]:
+                out["quality"]["availability"][j].zero_()
+                out["quality"].pop(m,None)
+        out["stem"] = self.samples[index]["stem"]
+        return out
+
+    def _single_item(self, idx: int) -> Optional[dict]:
         self._load_epoch_file()                # worker 侧惰性同步 epoch（见 __init__ 注释）
         draw = 0
         if isinstance(idx, tuple):
@@ -924,6 +998,9 @@ class MMDataset(Dataset):
 
         rel_depth = relative_depth(dep_w, valid_w)
         abs_depth = absolute_metric_depth(dep_w, valid_w, metric_available)
+        spatial = _warp(np.ones((H,W),np.uint8), M, self.canvas, nearest=True).astype(np.float32)
+        quality["availability"] = np.stack((spatial*keep["rgb"], spatial*keep["ir"],valid_w*keep["dep"])).astype(np.float32)
+        quality["scene_id"] = np.ones((1,*self.canvas),np.float32)
         return {
             "rgb": torch.from_numpy(rgb_w.transpose(2, 0, 1).copy()).float() / 255.0,
             "ir": torch.from_numpy(ir_w[None].copy()).float() / 255.0,
@@ -1037,6 +1114,10 @@ def collate(batch: List[Optional[dict]]) -> Optional[dict]:
         "keep": {k: torch.tensor([b["keep"][k] for b in batch]) for k in ("rgb", "ir", "dep")},
         "enabled": enabled,
     }
+    for key, channels in (("availability",3),("scene_id",1)):
+        if any(key in b["quality"] for b in batch):
+            shape = (channels,*batch[0]["rgb"].shape[-2:])
+            out["quality"][key] = torch.stack([b["quality"].get(key,torch.ones(shape)) for b in batch])
     # 缺失模态整路置零（承重配方）。⚠️ 这里只清图像；质量描述子/先验在 __getitem__ 里就已按 keep 清除。
     for m in ("rgb", "ir"):
         out[m] = out[m] * out["keep"][m].view(-1, 1, 1, 1)

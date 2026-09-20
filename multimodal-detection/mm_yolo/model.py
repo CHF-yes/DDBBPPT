@@ -65,6 +65,12 @@ def _cls_name_index(tgt_names, src_names):
 class MMYOLO(nn.Module):
     """三模态 YOLO11：共享 stem + 可配置共享度编码器 + 承重式融合。"""
 
+    def __new__(cls, cfg=None, *args, **kwargs):
+        if cls is MMYOLO and cfg is not None and cfg.fusion.architecture == "independent_p2_memory_v3":
+            from independent_model import IndependentMMYOLO
+            return IndependentMMYOLO(cfg)
+        return super().__new__(cls)
+
     def __init__(self, cfg: Optional[MMConfig] = None, class_names=None, nc: Optional[int] = None,
                  weights: Optional[str] = None):
         super().__init__()

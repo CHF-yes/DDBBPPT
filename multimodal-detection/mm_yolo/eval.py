@@ -227,7 +227,7 @@ def evaluate_model(model: MMYOLO, root: Path, samples: List[dict], imgsz=960,
     ds = MMDataset(Path(root), samples, imgsz=imgsz, train=False,
                    aug=AugCfg(imgsz=imgsz,
                               depth_resampling=getattr(getattr(model, "cfg", None), "depth_resampling", "legacy_bilinear_v1"),
-                              legacy_lowlight=int(model.dep_adapter.in_channels) == 2),
+                              legacy_lowlight=int(model.cfg.encoder.depth_input_channels) == 2),
                    enabled={"rgb": ("rgb",), "ir": ("ir",), "dep": ("dep",),
                             "rgb_ir": ("rgb", "ir"),
                             "rgb_dep": ("rgb", "dep"),
@@ -259,7 +259,7 @@ def evaluate_model(model: MMYOLO, root: Path, samples: List[dict], imgsz=960,
         if modalities in ("all", "rgb_ir", "rgb_dep"):
             modes["no_rgb"] = ["rgb"]
     if ablate_absolute:
-        if int(model.dep_adapter.in_channels) != 4 or modalities not in ("all", "rgb_dep", "dep"):
+        if int(model.cfg.encoder.depth_input_channels) != 4 or modalities not in ("all", "rgb_dep", "dep"):
             raise ValueError("绝对距离通道消融只支持启用 Depth 的 4ch checkpoint")
         modes["no_absolute"] = []
     sl = {"lum": [], "crowd": [], "dvalid": []}
@@ -285,7 +285,7 @@ def evaluate_model(model: MMYOLO, root: Path, samples: List[dict], imgsz=960,
                 rgb = batch["rgb"]
                 sl["lum"] += rgb.mean(dim=(1, 2, 3)).tolist()
                 sl["crowd"] += [float(len(b["boxes"])) for b in chunk]
-                valid_channel = 2 if int(model.dep_adapter.in_channels) == 4 else 1
+                valid_channel = 2 if int(model.cfg.encoder.depth_input_channels) == 4 else 1
                 sl["dvalid"] += batch["depth"][:, valid_channel].mean(dim=(1, 2)).tolist()
         return out, list(gts)
 

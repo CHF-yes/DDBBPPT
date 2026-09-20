@@ -67,6 +67,7 @@ class EncoderCfg:
     depth_view: str = "both"           # both / relative / metric_fallback / metric_log_fallback
     depth_init: str = "relative"       # relative / balanced / metric_fallback；只改变初始化
     metric_branch: bool = False         # independent absolute-distance feature path (v1)
+    checkpoint_encoder: bool = False   # v3: recomputation preserves BN buffers
 
 
 @dataclass
@@ -98,6 +99,8 @@ class FusionCfg:
     prior_film: bool = True       # 用 depth 几何先验做 FiLM（逆深度/法线）
     prior_channels: int = 4       # depth 先验通道数（逆深度/有效/法线x/法线y）
     slot_names: Tuple[str, ...] = ("rgb", "ir", "dep")
+    spatial_dim: int = 64
+    memory_tokens_per_modality: int = 4
 
 
 @dataclass

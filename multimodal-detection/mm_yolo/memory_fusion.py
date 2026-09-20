@@ -34,7 +34,8 @@ class CrossScaleMemory(nn.Module):
         self.dim, self.pool, self.k = dim, pool, tokens_per_modality
         self.seed = nn.Parameter(torch.randn(1, 4, self.k, dim) * .02)
         self.identity = nn.Parameter(torch.randn(3, dim) * .02)
-        self.scale = nn.Parameter(torch.randn(3, dim) * .02)
+        self.scales = tuple(channels)
+        self.scale = nn.Parameter(torch.randn(len(channels), dim) * .02)
         self.project = nn.ModuleDict({s: nn.Linear(c, dim) for s, c in channels.items()})
         self.position = nn.Linear(5, dim, bias=False)  # x,y,sin(pi*x),sin(pi*y),valid fraction
         self.read_norm = nn.LayerNorm(dim)
@@ -61,7 +62,7 @@ class CrossScaleMemory(nn.Module):
             observed = fraction.flatten(1) > 0
             xyf = torch.cat((pos[None].expand(b, -1, -1, -1), fraction.permute(0, 2, 3, 1)), -1)
             tokens = self.project[scale](pooled.flatten(2).transpose(1, 2))
-            tokens = tokens + self.position(xyf.flatten(1, 2)) + self.identity[m] + self.scale[("p3", "p4", "p5").index(scale)]
+            tokens = tokens + self.position(xyf.flatten(1, 2)) + self.identity[m] + self.scale[self.scales.index(scale)]
             update = safe_read(self.own_read, self.read_norm(old), self.read_norm(tokens), observed)
             current = old + update
             current = current + .1 * self.ffn(current)

@@ -64,6 +64,8 @@ MEMORY_RECIPE = "coverage_spatial_memory_v1"
 
 
 def recipe_for(args):
+    if getattr(args, "architecture", "") == "independent_p2_memory_v3":
+        return "independent_p2_memory_v3"
     if getattr(args, "memory_control", "unbounded_v1") == "bounded_v2":
         return "coverage_spatial_memory_v2"
     return MEMORY_RECIPE if getattr(args, "architecture", "legacy_hook_v1") == "spatial_memory_v1" else TRAINER_RECIPE
@@ -73,7 +75,8 @@ def apply_bn_policy(model, policy, frozen=False):
     """Small-batch adaptive stats; affine parameters still follow optimizer groups."""
     if policy not in ("adaptive", "adaptive_no_tail"):
         raise ValueError(policy)
-    encoder_bn = {id(m) for m in model.backbone.model[:11].modules() if isinstance(m, BN_TYPES)}
+    encoders = model.encoder_modules() if hasattr(model, "encoder_modules") else [model.backbone.model[:11]]
+    encoder_bn = {id(m) for enc in encoders for m in enc.modules() if isinstance(m, BN_TYPES)}
     for name, m in model.named_modules():
         if isinstance(m, BN_TYPES):
             m.momentum = .03
@@ -179,7 +182,7 @@ def prevent_sleep(enable: bool = True) -> bool:
 
 def set_encoder_frozen(model: MMYOLO, frozen: bool) -> None:
     """两阶段：先冻编码器（主干 0–10 + 辅助 stem + 适配器），只训融合/颈部/头。"""
-    targets = [model.backbone.model[:11]]
+    targets = model.encoder_modules() if hasattr(model, "encoder_modules") else [model.backbone.model[:11]]
     if hasattr(model, "dep_stem"):
         targets.append(model.dep_stem)
     if hasattr(model, "aux_stages"):
@@ -209,6 +212,8 @@ def build_optimizer(model: MMYOLO, lr: float, backbone_mult: float, wd: float = 
     若再按名字遍历一遍会把同一参数放进两个 group → AdamW 对同一参数更新两次。
     """
     encoder_ids = {id(p) for p in model.backbone.model[:11].parameters()}
+    if hasattr(model, "encoder_modules"):
+        encoder_ids = {id(p) for module in model.encoder_modules() for p in module.parameters()}
     # Depth stem 是从 COCO RGB stem 深拷贝得到的预训练编码器，不是随机初始化任务层。
     # 把它留在 task 组会让副本以 10× 学习率漂移，而来源相同的 RGB stem 只拿
     # encoder LR。IR/Depth 的 1x1 输入 adapter 是新建层，仍应留在 task 组。
@@ -291,7 +296,10 @@ def validate_checkpoint(ck: dict, model: MMYOLO, enabled, canvas, exact: bool = 
     for structure in (saved_structure, current_structure):
         structure.setdefault("depth_resampling", "legacy_bilinear_v1")
         structure.get("encoder", {}).setdefault("metric_branch", False)
+        structure.get("encoder", {}).setdefault("checkpoint_encoder", False)
         if isinstance(structure.get("fusion"), dict):
+            structure["fusion"].setdefault("spatial_dim", 64)
+            structure["fusion"].setdefault("memory_tokens_per_modality", 4)
             structure["fusion"].setdefault("architecture", "legacy_hook_v1")
             structure["fusion"].setdefault("memory_control", "unbounded_v1")
     # B1 结构里还没有该字段，其实际语义就是 2ch。先规范化，保证历史
@@ -353,6 +361,7 @@ def validate_checkpoint(ck: dict, model: MMYOLO, enabled, canvas, exact: bool = 
         keys += ("architecture", "depth_resampling", "metric_branch", "sampler", "rare_extra_frac",
                  "close_aug_frac", "bn_policy", "warmup", "lrf", "calibrate_clip_steps", "memory_control")
         keys += ("scale_min", "scale_max", "translate")
+        keys += ("precision", "checkpoint_encoder", "mosaic", "full_data")
         legacy = {"depth_channels": 2, "depth_view": "both", "depth_init": "relative",
                   "misalign_px": 15.0, "degrade_p": 0.3, "rgb_color_p": 0.0,
                   "ir_noise_p": 0.0, "ir_gain_p": 0.0,
@@ -364,6 +373,7 @@ def validate_checkpoint(ck: dict, model: MMYOLO, enabled, canvas, exact: bool = 
                       metric_branch=False, sampler="legacy", rare_extra_frac=.1,
                       close_aug_frac=0., bn_policy="legacy", warmup=3, lrf=.01, calibrate_clip_steps=0,
                       memory_control="unbounded_v1")
+        legacy.update(precision="fp16", checkpoint_encoder=False, mosaic=0., full_data=False)
         changed = [k for k in keys
                    if old.get(k, legacy.get(k)) != getattr(args, k, legacy.get(k))]
         if changed:
@@ -480,7 +490,11 @@ def main():
     ap.add_argument("--epochs", type=int, default=300)
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--rgb-batch", type=int, default=0, help="仅 RGB 模式的物理 batch 覆盖；累积另设")
-    ap.add_argument("--architecture", default="legacy_hook_v1", choices=["legacy_hook_v1", "spatial_memory_v1"])
+    ap.add_argument("--architecture", default="legacy_hook_v1", choices=["legacy_hook_v1", "spatial_memory_v1", "independent_p2_memory_v3"])
+    ap.add_argument("--precision", choices=["fp16", "bf16"], default="fp16")
+    ap.add_argument("--checkpoint-encoder", action="store_true")
+    ap.add_argument("--mosaic", type=float, default=0.)
+    ap.add_argument("--full-data", action="store_true", help="final refit; all labeled data, no validation claims")
     ap.add_argument("--memory-control", default="unbounded_v1", choices=["unbounded_v1", "bounded_v2"])
     ap.add_argument("--reset-fusion-gates", action="store_true", help="explicit v1->v2 warm-start, not exact resume")
     ap.add_argument("--depth-resampling", default="legacy_bilinear_v1", choices=["legacy_bilinear_v1", "nearest_valid_v2"])
@@ -582,7 +596,7 @@ def main():
     args = ap.parse_args()
     if args.reset_fusion_gates and (args.resume or not args.init_checkpoint):
         raise ValueError("--reset-fusion-gates requires --init-checkpoint in a new run")
-    if args.memory_control != "unbounded_v1" and args.architecture != "spatial_memory_v1":
+    if args.memory_control != "unbounded_v1" and args.architecture not in ("spatial_memory_v1", "independent_p2_memory_v3"):
         raise ValueError("memory-control applies only to spatial memory")
     if args.bn_policy == "adaptive_no_tail" and args.sampler != "coverage":
         raise ValueError("no-tail BN requires coverage sampler")
@@ -596,7 +610,7 @@ def main():
         raise ValueError("invalid calibration/validation/warmup settings")
     if args.calibrate_clip_steps and args.grad_clip <= 0:
         raise ValueError("clip calibration requires a positive initial safety threshold")
-    if args.architecture == "spatial_memory_v1" and args.sampler != "coverage":
+    if args.architecture in ("spatial_memory_v1", "independent_p2_memory_v3") and args.sampler != "coverage":
         raise ValueError("new recipe requires --sampler coverage")
     if args.batch < 1 or args.accum < 1 or args.epochs < 1 or args.save_every < 1:
         raise ValueError("batch/accum/epochs/save-every 必须为正整数")
@@ -668,7 +682,16 @@ def main():
     split_path = out_dir / "split.json"
     if args.resume and not split_path.exists():
         raise FileNotFoundError(f"精确续训缺少 split.json：{split_path}")
-    if args.split_file:
+    if args.full_data:
+        if args.val_every or args.eval_initial or args.split_file:
+            raise ValueError("full-data refit must disable validation and split-file")
+        tr, va = list(idx), []
+        if args.resume:
+            old_tr, old_va = load_split(split_path,idx)
+            if [s["stem"] for s in old_tr] != [s["stem"] for s in tr] or old_va:
+                raise ValueError("full-data resume split differs")
+        log(f"[train] FINAL REFIT: {len(tr)} labeled images; NO held-out validation")
+    elif args.split_file:
         reference = Path(args.split_file)
         if not reference.is_file():
             raise FileNotFoundError(f"--split-file 不存在：{reference}")
@@ -711,6 +734,7 @@ def main():
                  legacy_lowlight=args.depth_channels == 2,
                  depth_resampling=args.depth_resampling, total_epochs=args.epochs,
                  close_aug_frac=args.close_aug_frac,
+                 mosaic_p=args.mosaic,
                  dropout_start_epoch=max(0, args.dropout_start_epoch))
     if args.modalities == "rgb" or args.no_dropout:
         aug.rgb_drop_p = 0.0
@@ -730,7 +754,7 @@ def main():
     log(f"[train] 全量 val 逐类框数 {cls_va}")
     log(f"[train] 验证子集逐类框数 {cls_sub}")
     miss_cls = [c for c, v in cls_sub.items() if v == 0]
-    if miss_cls:
+    if miss_cls and not args.full_data:
         log(f"[train] [!] 验证子集缺少类别 {miss_cls} → 这些类的 AP 记为 nan，"
             f"若要完整 12 类报数请用 --val-limit 0（全量验证）")
     g = torch.Generator()
@@ -766,6 +790,10 @@ def main():
     cfg.fusion.memory_control = args.memory_control
     cfg.depth_resampling = args.depth_resampling
     cfg.encoder.metric_branch = args.metric_branch
+    cfg.encoder.checkpoint_encoder = args.checkpoint_encoder
+    if args.architecture == "independent_p2_memory_v3":
+        cfg.fusion.bus_dim = 128
+        cfg.fusion.memory_tokens_per_modality = 4
     cfg.imgsz = int(canvas[0])   # 记录用；真实画布由数据侧 (H,W) 决定
     cfg.fusion.tier = args.fusion_tier
     cfg.encoder.share_tier = args.share_tier
@@ -784,6 +812,7 @@ def main():
     model.infer_modalities = tuple(enabled)
     model.infer_canvas = tuple(canvas)
     pr = model.param_report()
+    log(f"[train] parameter_groups={pr}")
     log(f"[train] 参数 总 {pr['total']/1e6:.2f}M（预训练 {pr['pretrained']/1e6:.2f}M + 新增 {pr['new']/1e6:.3f}M）"
         f" | 模态 {args.modalities}")
 
@@ -822,7 +851,10 @@ def main():
 
     ema = ModelEMA(model)
     ema.enabled = True
-    scaler = torch.amp.GradScaler("cuda", enabled=bool(args.amp) and dev.type == "cuda",
+    if args.precision == "bf16" and dev.type == "cuda" and not torch.cuda.is_bf16_supported():
+        raise RuntimeError("requested bf16 is unsupported on this GPU")
+    amp_dtype = torch.bfloat16 if args.precision == "bf16" else torch.float16
+    scaler = torch.amp.GradScaler("cuda", enabled=bool(args.amp) and dev.type == "cuda" and args.precision == "fp16",
                                  init_scale=1024.0 if model.spatial_memory else 65536.0)
     # 精确续训必须恢复与 optimizer 对应的原始模型权重，不能用 EMA 代替。
     if args.resume:
@@ -853,6 +885,10 @@ def main():
                                        "reset_fusion_gates": args.reset_fusion_gates}
     elif args.resume and ck.get("meta", {}).get("initialization"):
         meta_base["initialization"] = ck["meta"]["initialization"]
+    deployment = _CODE / "v3_deployment.json"
+    if args.architecture == "independent_p2_memory_v3" and deployment.is_file():
+        source_manifest = json.loads(deployment.read_text(encoding="utf-8"))["files"]
+        meta_base["source_manifest_sha256"] = hashlib.sha256(json.dumps(source_manifest,sort_keys=True).encode()).hexdigest()
 
     clip_state = {"threshold": args.grad_clip, "norms": [], "calibrated": args.calibrate_clip_steps == 0}
     if args.resume:
@@ -916,7 +952,7 @@ def main():
         schedule = scheduled_aug(aug, ep)
         log(f"[train] 开始 ep {ep+1}/{args.epochs} samples={len(sampler) if sampler is not None else len(ds_tr)} "
             f"bn={args.bn_policy} clip_limit={clip_state['threshold']:.2f} "
-            f"scale={schedule.scale_range} translate={schedule.translate:.3f} crop={schedule.target_crop_p:.3f}")
+            f"scale={schedule.scale_range} translate={schedule.translate:.3f} crop={schedule.target_crop_p:.3f} mosaic={schedule.mosaic_p:.3f}")
         accum = max(1, args.accum)
         nominal_samples = args.batch * accum
 
@@ -931,10 +967,12 @@ def main():
                         p.grad.mul_(nominal_samples / actual_samples)
             scaler.unscale_(opt)
             threshold = clip_state["threshold"]
-            clip_limit = threshold if threshold > 0 else float("inf")
-            grad_norm_t = torch.nn.utils.clip_grad_norm_(
-                [p for p in model.parameters() if p.requires_grad], clip_limit)
+            parameters = [p for p in model.parameters() if p.grad is not None]
+            grad_norm_t = torch.linalg.vector_norm(torch.stack([torch.linalg.vector_norm(p.grad.detach().float()) for p in parameters]))
             grad_norm = float(grad_norm_t.detach())
+            if math.isfinite(grad_norm) and threshold > 0 and grad_norm > threshold:
+                # Never multiply non-finite gradients by an inf/inf clipping coefficient.
+                torch.nn.utils.clip_grad_norm_(parameters, threshold, error_if_nonfinite=True)
             agg["grad_steps"] += 1
             if math.isfinite(grad_norm):
                 agg["grad_norm_sum"] += grad_norm
@@ -946,7 +984,7 @@ def main():
                     clip_state["norms"].append(grad_norm)
                     if len(clip_state["norms"]) >= args.calibrate_clip_steps:
                         p90 = float(np.percentile(clip_state["norms"], 90))
-                        clip_state["threshold"] = float(np.clip(1.5*p90, 20, 200))
+                        clip_state["threshold"] = float(np.clip(1.5*p90, 20, 1000 if args.architecture == "independent_p2_memory_v3" else 200))
                         clip_state["calibrated"] = True
                         log(f"[train] 梯度校准 N={len(clip_state['norms'])} P90={p90:.2f} "
                             f"threshold={clip_state['threshold']:.2f}（仅限尖峰保护，不代表最优分数）")
@@ -1003,11 +1041,13 @@ def main():
             prior = (None if (args.no_prior or "dep" not in enabled)
                      else batch["prior"].to(dev, non_blocking=non_blocking))
             tgt = make_targets(batch, canvas, dev)
-            with torch.autocast("cuda", enabled=bool(args.amp) and dev.type == "cuda"):
+            with torch.autocast("cuda", enabled=bool(args.amp) and dev.type == "cuda", dtype=amp_dtype):
                 preds = model(rgb, ir, dep, quality=qual, prior=prior, keep=keep)
                 # 本版 ultralytics 的 v8DetectionLoss 返回 (loss*bs 的三分量向量, 分量字典)
                 loss_vec, loss_items = crit(preds, tgt)
                 loss = accumulation_loss(loss_vec, nominal_samples)
+                if args.architecture == "independent_p2_memory_v3":
+                    loss = loss + model.aux_loss * (rgb.shape[0] / nominal_samples)
             if not torch.isfinite(loss.detach()):
                 stems = batch.get("stems", [])
                 log(f"[train][FATAL] ep={ep+1} batch={bi} loss 非有限，"
