@@ -92,7 +92,9 @@ def main():
 
     # V4.2 is an explicit two-stage dev pipeline.  Stage A teaches IR/Depth to
     # enter the established detector space with RGB/neck/head frozen.  Stage B
-    # warm-starts from Stage A's final EMA and jointly fine-tunes at a low LR.
+    # warm-starts from Stage A's best validation checkpoint and jointly fine-tunes
+    # at a low LR.  Stage A can regress after its peak, so last.pt is not a safe
+    # hand-off checkpoint for model selection pipelines.
     if cfg.get("pipeline") == "v42_two_stage":
         phases = ["stage_a", "stage_b"]
         if not a.init_checkpoint and not a.resume:
@@ -123,9 +125,9 @@ def main():
                     raise FileNotFoundError("Stage A 没有 checkpoint 可恢复，也未提供 --init-checkpoint")
                 cmd += ["--init-checkpoint",str(Path(a.init_checkpoint).resolve())]
             else:
-                source = run/"stage_a"/"weights"/"last.pt"
+                source = run/"stage_a"/"weights"/"best.pt"
                 if not source.is_file():
-                    raise FileNotFoundError(f"Stage B 缺少 Stage A last.pt: {source}")
+                    raise FileNotFoundError(f"Stage B 缺少 Stage A best.pt: {source}")
                 cmd += ["--init-checkpoint",str(source)]
             if a.dry_run:
                 print(json.dumps(cmd,ensure_ascii=False)); continue
