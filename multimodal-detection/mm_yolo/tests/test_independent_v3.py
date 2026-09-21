@@ -12,9 +12,12 @@ sys.path.insert(0,str(MM))
 from config import default_config
 from model import MMYOLO, save_mm_checkpoint, load_mm_checkpoint
 from train import (build_optimizer, set_encoder_frozen, apply_bn_policy, make_targets,
-                   subset_detection_batch)
+                   subset_detection_batch, set_aux_adaptation_mode,
+                   enable_trainable_defaults)
 from data import MMDataset, AugCfg, collate, scheduled_aug
-from independent_fusion import warp, resize_flow, LocalCorrespondence
+from independent_fusion import (warp, resize_flow, identity_residual_align,
+                                LocalCorrespondence)
+from independent_model import depth_reliability_map
 from ultralytics.utils.loss import v8DetectionLoss
 
 
@@ -43,6 +46,7 @@ class IndependentV3Tests(unittest.TestCase):
 
     def test_independence_pretraining_optimizer_and_freeze(self):
         m = MMYOLO(config())
+        enable_trainable_defaults(m)
         rgb,ir,dep = m.encoder_modules()
         sets = [{p.data_ptr() for p in module.parameters()} for module in (rgb,ir,dep)]
         self.assertFalse(sets[0]&sets[1] or sets[0]&sets[2] or sets[1]&sets[2])
@@ -57,6 +61,7 @@ class IndependentV3Tests(unittest.TestCase):
         self.assertFalse(any(p.requires_grad for p in ir.parameters()))
         set_encoder_frozen(m,False)
         self.assertTrue(all(p.requires_grad for p in ir.parameters()))
+        self.assertTrue(any(p.requires_grad for p in m.backbone.model[13].parameters()))
 
     def test_real_loss_gradients_checkpoint_bn_and_p2(self):
         m = MMYOLO(config(checkpoint=True)).train()
@@ -124,6 +129,28 @@ class IndependentV3Tests(unittest.TestCase):
         self.assertTrue(torch.allclose(warp(x,flow)[...,:-1],x[...,1:],atol=1e-6))
         self.assertTrue(torch.allclose(resize_flow(flow,(8,12))[:,0],torch.full((1,8,12),2.)))
 
+    def test_identity_residual_alignment_endpoints(self):
+        x = torch.arange(6.).view(1,1,1,6).expand(1,1,4,6)
+        flow = torch.zeros(1,2,4,6)
+        flow[:,0] = 1
+        zero = torch.zeros(1,1,4,6)
+        one = torch.ones_like(zero)
+        self.assertTrue(torch.equal(identity_residual_align(x,flow,zero),x))
+        self.assertTrue(torch.allclose(identity_residual_align(x,flow,one),warp(x,flow)))
+
+    def test_v42_depth_edges_remain_reliable(self):
+        valid = torch.ones(2,1,64,96)
+        flat = torch.full_like(valid,.2)
+        edged = flat.clone()
+        edged[:,:,:,48:] = .8
+        metric = valid.clone()
+        flat_rel = depth_reliability_map(valid,flat,metric,"valid_support_v2")
+        edge_rel = depth_reliability_map(valid,edged,metric,"valid_support_v2")
+        # All depth pixels are valid. A large metric edge therefore remains
+        # fully reliable instead of falling to the old 0.35 floor.
+        self.assertTrue(torch.equal(flat_rel,edge_rel))
+        self.assertGreater(float(edge_rel.mean()), .98)
+
     def test_all_invalid_correspondence_has_finite_zero_gradients(self):
         match = LocalCorrespondence()
         query = torch.randn(2,32,8,12,requires_grad=True)
@@ -159,6 +186,22 @@ class IndependentV3Tests(unittest.TestCase):
                             for p in m.semantic_detect.parameters()))
         self.assertTrue(any(p.grad is not None and p.grad.abs().sum()>0
                             for p in m.matchers["p2"].parameters()))
+
+    def test_aux_adaptation_freezes_rgb_detector_but_trains_ir_depth(self):
+        c = config()
+        c.fusion.branch_aux_weights = (0.,.3,.25)
+        c.fusion.alignment_mode = "identity_residual_v2"
+        c.fusion.depth_reliability = "valid_support_v2"
+        m = MMYOLO(c).train()
+        set_aux_adaptation_mode(m)
+        rgb,ir,dep = self.inputs()
+        out = m(rgb,ir,dep)
+        out["scores"].mean().backward()
+        self.assertFalse(any(p.grad is not None for p in m.backbone.parameters()))
+        self.assertTrue(any(p.grad is not None and p.grad.abs().sum()>0
+                            for p in m.aux_encoders["ir"].parameters()))
+        self.assertTrue(any(p.grad is not None and p.grad.abs().sum()>0
+                            for p in m.aux_encoders["dep"].parameters()))
 
 
 if __name__ == "__main__":

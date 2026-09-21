@@ -15,12 +15,29 @@ from torch.utils.checkpoint import checkpoint
 from ultralytics import YOLO
 from ultralytics.nn.modules import Conv, C3k2, Detect
 from ultralytics.cfg import DEFAULT_CFG
-from independent_fusion import EvidenceEmbedding, LocalCorrespondence, ComplementaryFusion, warp, resize_flow
+from independent_fusion import (EvidenceEmbedding, LocalCorrespondence,
+                                ComplementaryFusion, identity_residual_align,
+                                warp, resize_flow)
 from memory_fusion import CrossScaleMemory, NeckMemoryRead, masked_pool
 
 SCALES = ("p2", "p3", "p4", "p5")
 INDICES = (2, 4, 6, 10)
 MODES = ("rgb", "ir", "dep")
+
+
+def depth_reliability_map(valid, absolute, metric_valid, mode):
+    """Return sampling reliability without confusing geometry with corruption."""
+    valid = valid.float()
+    if mode == "valid_support_v2":
+        support = F.avg_pool2d(valid, 5, 1, 2)
+        return valid * (.60 + .40 * support)
+    if mode == "legacy_edge_v1":
+        local = (F.avg_pool2d(absolute.float(), 3, 1, 1) /
+                 F.avg_pool2d(metric_valid.float(), 3, 1, 1).clamp_min(1e-6))
+        consistency = torch.exp(-10 * (absolute.float() - local).abs())
+        return valid * torch.where(
+            metric_valid > 0, .35 + .65 * consistency, torch.ones_like(consistency))
+    raise ValueError(f"unknown depth reliability: {mode}")
 
 
 @contextmanager
@@ -118,7 +135,8 @@ class IndependentMMYOLO(nn.Module):
         self.backbone.stride = det.stride
         self.semantic_adapters = None
         self.semantic_detect = None
-        if cfg.fusion.branch_aux_weight > 0:
+        if (cfg.fusion.branch_aux_weight > 0 or
+                any(float(v) > 0 for v in cfg.fusion.branch_aux_weights)):
             # One shared training-only detector sees the common representation
             # from each modality. Sharing the head makes semantic compatibility
             # operational rather than merely encouraging similar magnitudes.
@@ -206,11 +224,13 @@ class IndependentMMYOLO(nn.Module):
             raw[2][s] = raw[2][s] + .1*self.metric_encoder[s](values) * (fraction>0)
         masks, commons, privates, reliabilities = {}, {}, {}, {}
         auxiliary = rgb.new_zeros((), dtype=torch.float32)
-        # Depth continuity is only a SOFT uncertainty cue: real edges remain usable.
+        # Depth validity and reliability are different concepts.  The hard mask
+        # removes invalid distance samples.  V4.2 reliability only reflects how
+        # much valid support exists nearby; a real object-boundary depth jump is
+        # useful geometry and must not be treated as sensor failure.
         valid_d = depth[:,2:3].float()
-        local = F.avg_pool2d(absolute.float(),3,1,1) / F.avg_pool2d(metric_valid.float(),3,1,1).clamp_min(1e-6)
-        consistency = torch.exp(-10*(absolute.float()-local).abs())
-        reliability_d = valid_d * torch.where(metric_valid>0, .35+.65*consistency, torch.ones_like(consistency))
+        reliability_d = depth_reliability_map(
+            valid_d, absolute, metric_valid, self.cfg.fusion.depth_reliability)
         for s in SCALES:
             shape = raw[0][s].shape[-2:]
             masks[s] = [present[:,i,None,None,None].to(rgb.dtype).expand(-1,1,*shape) for i in range(3)]
@@ -237,6 +257,10 @@ class IndependentMMYOLO(nn.Module):
                 else:
                     scene = None if not quality or "scene_id" not in quality else F.interpolate(quality["scene_id"].float(),shape,mode="nearest")
                     flow,conf = self.matchers[s][m-1](commons[s][0],commons[s][m],masks[s][0],masks[s][m],previous[m-1],scene)
+                if (self.cfg.fusion.alignment_mode == "legacy_gate_v1" and
+                        self.cfg.fusion.match_floor > 0):
+                    # 只抬下限，不改变匹配置信度的排序：真实高置信对应仍保留原值。
+                    conf = conf.clamp_min(float(self.cfg.fusion.match_floor))
                 # Without RGB observations use nominal geometric coordinates, not hallucinated matches.
                 flow = flow * masks[s][0]
                 previous[m-1] = flow
@@ -256,20 +280,50 @@ class IndependentMMYOLO(nn.Module):
                 vm = warp(masks[s][m],flow).clamp(0,1)
                 if scene is not None:
                     vm = vm * ((warp(scene,flow)-scene).abs()<.01)
-                if qual[m] is not None:
-                    qual[m] = warp(qual[m],flow)*vm
-                c.append(warp(commons[s][m],flow)*vm)
-                u.append(warp(privates[s][m],flow)*vm)
-                mask.append(vm)
-                rel.append(warp(reliabilities[s][m],flow)*vm)
-                values.append(warp(own[m],flow)*vm)
-                weight = (confidence[s][m]*rel[m]).detach()
+                conf = confidence[s][m]
+                if self.cfg.fusion.alignment_mode == "identity_residual_v2":
+                    # The data are nominally registered.  Confidence determines
+                    # how much residual motion to accept, never whether the
+                    # modality exists.  All branches use the same interpolation.
+                    am = (masks[s][m].float() + conf.float() *
+                          (vm.float() - masks[s][m].float())).clamp(0, 1)
+                    ac = identity_residual_align(commons[s][m], flow, conf, vm) * am
+                    au = identity_residual_align(privates[s][m], flow, conf, vm) * am
+                    ar = identity_residual_align(reliabilities[s][m], flow, conf, vm).clamp(0, 1) * am
+                    av = identity_residual_align(own[m] * masks[s][m], flow, conf, vm) * am
+                    if qual[m] is not None:
+                        qual[m] = identity_residual_align(
+                            qual[m] * masks[s][m], flow, conf, vm) * am
+                elif self.cfg.fusion.alignment_mode == "legacy_gate_v1":
+                    am = vm
+                    ac = warp(commons[s][m], flow) * vm
+                    au = warp(privates[s][m], flow) * vm
+                    ar = warp(reliabilities[s][m], flow) * vm
+                    av = warp(own[m], flow) * vm
+                    if qual[m] is not None:
+                        qual[m] = warp(qual[m], flow) * vm
+                else:
+                    raise ValueError(f"unknown alignment mode: {self.cfg.fusion.alignment_mode}")
+                c.append(ac)
+                u.append(au)
+                mask.append(am)
+                rel.append(ar)
+                values.append(av)
+                weight = (rel[m] if self.cfg.fusion.alignment_mode == "identity_residual_v2"
+                          else confidence[s][m] * rel[m]).detach()
                 similarity = (F.normalize(c[0].detach().float(),dim=1)*F.normalize(c[m].float(),dim=1)).sum(1,keepdim=True)
                 alignment_loss = alignment_loss + ((1-similarity)*weight).sum()/weight.sum().clamp_min(1)/8
             aligned_common[s], aligned_masks[s] = c, mask
             fused[s] = self.fusion[s](values,c,u,mask,confidence[s],rel,state,qual)
-            # A separate dense, confidence-gated boundary bypass supports box regression.
-            geometry[s] = values[0]*mask[0] + sum(values[m]*confidence[s][m]*rel[m] for m in (1,2))*.25
+            self.fusion[s].last_health["ir_flow_rms"] = flows[s][0].detach().float().square().mean().sqrt()
+            self.fusion[s].last_health["dep_flow_rms"] = flows[s][1].detach().float().square().mean().sqrt()
+            # values are already identity/residual aligned in V4.2, so match must
+            # not suppress the high-resolution localization path a second time.
+            if self.cfg.fusion.alignment_mode == "identity_residual_v2":
+                geometry[s] = values[0]*mask[0] + sum(values[m]*rel[m] for m in (1,2))*.25
+            else:
+                geometry[s] = values[0]*mask[0] + sum(
+                    values[m]*confidence[s][m]*rel[m] for m in (1,2))*.25
         self.aux_loss = .01*auxiliary + .005*alignment_loss if self.training else auxiliary.detach()*0
         self.semantic_branch_present = present
         self._semantic_common = aligned_common
@@ -302,7 +356,7 @@ class IndependentMMYOLO(nn.Module):
         feats = [self.semantic_adapters[s](self._semantic_common[s][m]) for s in SCALES]
         return self.semantic_detect(feats, feats)
     @staticmethod
-    def _object_vectors(feature, valid, targets, grid_size=3):
+    def _object_vectors(feature, valid, targets, grid_size=3, min_observed=.5):
         """Differentiable object-region pooling in normalized canvas coordinates."""
         batch_idx = targets["batch_idx"].long()
         boxes = targets["bboxes"].float()
@@ -321,7 +375,7 @@ class IndependentMMYOLO(nn.Module):
             observed = F.grid_sample(selected_valid.float(), grid.float(), align_corners=False)
         weights = observed.clamp(0, 1)
         vector = (values * weights).sum((2, 3)) / weights.sum((2, 3)).clamp_min(1e-4)
-        return F.normalize(vector, dim=1), weights.mean((1, 2, 3)) > .5
+        return F.normalize(vector, dim=1), weights.mean((1, 2, 3)) >= min_observed
 
     def semantic_regularization(self, targets, alignment_shift, alignment_supervised):
         """Return unweighted flow/NCE losses for the current forward pass."""
@@ -335,6 +389,7 @@ class IndependentMMYOLO(nn.Module):
             terms = []
             shift = alignment_shift.float()
             supervised = alignment_supervised.float()[:, None, None, None]
+            identity_weight = float(self.cfg.fusion.flow_identity_weight)
             for s in SCALES:
                 pred = self._semantic_flows[s][1].float()  # Depth -> RGB source-sampling flow
                 fh, fw = pred.shape[-2:]
@@ -345,7 +400,8 @@ class IndependentMMYOLO(nn.Module):
                     raise RuntimeError("semantic flow supervision requires model.infer_canvas")
                 target = torch.stack((shift[:, 0] / sx, shift[:, 1] / sy), 1)[:, :, None, None]
                 target = target.expand_as(pred)
-                mask = self._semantic_masks[s][0].float() * supervised
+                sample_weight = supervised + (1 - supervised) * identity_weight
+                mask = self._semantic_masks[s][0].float() * sample_weight
                 # The shifted Depth must be observable at the target sampling position.
                 mask = mask * warp(self._semantic_masks[s][2].float(), target).clamp(0, 1)
                 error = F.smooth_l1_loss(pred, target, reduction="none", beta=.25).mean(1, keepdim=True)
@@ -358,7 +414,9 @@ class IndependentMMYOLO(nn.Module):
             for s in ("p3", "p4", "p5"):
                 vectors, observed = [], []
                 for m in range(3):
-                    z, ok = self._object_vectors(self._semantic_common[s][m], self._semantic_masks[s][m], targets)
+                    z, ok = self._object_vectors(
+                        self._semantic_common[s][m], self._semantic_masks[s][m], targets,
+                        min_observed=.30 if m == 2 else .50)
                     vectors.append(z)
                     observed.append(ok)
                 for a, b in ((0, 1), (0, 2), (1, 2)):

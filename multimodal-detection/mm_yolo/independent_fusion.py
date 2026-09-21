@@ -1,9 +1,10 @@
-"""V3: spatial common/private evidence with rejectable, coarse-to-fine matching.
+"""V4.2: identity-preserving spatial fusion with residual correspondence.
 
 Distances are never interpolated here: grid_sample operates on learned features.
-Unknown correspondence is not evidence of an absent object. Private evidence can
-support semantics with a conservative geometric prior; localization uses stricter
-matching confidence. The decomposition is operational, not identifiable semantics.
+The three sensors already share a nominal image grid.  A low descriptor match is
+therefore not evidence that an auxiliary modality is useless: it means that the
+learned residual warp is uncertain.  Uncertain matches fall back to the identity
+grid, while confident matches interpolate towards the warped feature.
 """
 from __future__ import annotations
 
@@ -29,6 +30,21 @@ def warp(x, flow):
     with torch.autocast(x.device.type, enabled=False):
         out = F.grid_sample(x.float(), grid.float(), align_corners=False, padding_mode="zeros")
     return out.to(x.dtype)
+
+
+def identity_residual_align(x, flow, confidence, warped_valid=None):
+    """Blend from the nominal sensor grid towards a residual warp.
+
+    ``confidence=0`` is exactly the unwarped input and ``confidence=1`` is the
+    warped input.  This is deliberately different from multiplying evidence by
+    match confidence: an uncertain descriptor must not erase an already aligned
+    IR/Depth observation.
+    """
+    confidence = confidence.float().clamp(0, 1)
+    moved = warp(x, flow)
+    if warped_valid is not None:
+        moved = moved * warped_valid.to(moved.dtype)
+    return x + confidence.to(x.dtype) * (moved - x)
 
 
 class EvidenceEmbedding(nn.Module):
@@ -120,9 +136,11 @@ class ComplementaryFusion(nn.Module):
                 u = private[m] + self.identity[m][None, :, None, None] * valid[m]
                 qual = q.new_zeros(q.shape[0],3,*q.shape[-2:]) if quality is None or quality[m] is None else quality[m]
                 g = self.gates[m](torch.cat((q, common[m], u, valid[m], match[m], reliable[m],qual), 1)).float().sigmoid()
-                gc = g[:, :1] * match[m] * reliable[m] * valid[m]
-                # Unknown match can retain modest private SEMANTIC support; no claim of precise localization.
-                gu = g[:, 1:] * (.2 + .8*match[m]) * reliable[m] * valid[m]
+                # Match confidence already chose how far to move the feature
+                # towards its residual warp.  It must not gate evidence a second
+                # time: the nominal sensor grids are valid fallbacks.
+                gc = g[:, :1] * reliable[m] * valid[m]
+                gu = g[:, 1:] * reliable[m] * valid[m]
                 residual = self.outputs[m](torch.cat((common[m]*gc, u*gu), 1).to(state.dtype))
                 # Keep a random branch from overwhelming the pretrained spatial signal.
                 bound = state.detach().float().square().mean(1, keepdim=True).sqrt().clamp_min(.1)
@@ -132,4 +150,6 @@ class ComplementaryFusion(nn.Module):
             state = state + update / self.rounds
         self.last_stats = stats
         self.last_health = {"context_rms": context.detach().square().mean().sqrt()}
+        for m in range(3):
+            self.last_health[f"{m}_reliable"] = reliable[m].detach().float().mean()
         return state

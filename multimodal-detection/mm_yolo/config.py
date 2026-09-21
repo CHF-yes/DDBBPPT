@@ -108,6 +108,21 @@ class FusionCfg:
     cross_modal_nce_weight: float = 0.0
     nce_temperature: float = 0.10
     p2_match_refine: bool = False
+    # legacy_gate_v1: match 同时抑制证据；identity_residual_v2: match 只控制
+    # 从原坐标到残差 warp 的插值比例，低置信度自动回退到原坐标。
+    alignment_mode: str = "legacy_gate_v1"
+    # legacy_edge_v1 会把真实深度跳变当不可靠；valid_support_v2 只根据
+    # 无效深度邻域降低采样可靠性，保留物体边缘。
+    depth_reliability: str = "legacy_edge_v1"
+    # 没有人为错位监督（如 Mosaic/末段精修）时，flow 的弱零位移先验。
+    flow_identity_weight: float = 0.0
+    # 匹配相似度是在"尚未对齐的特征空间"里算出来的：RGB 自匹配约 0.91，
+    # IR 约 0.12、Depth 约 0.09。它在 gc = g * match * reliable * valid 里
+    # 被当成可用性开关，于是共享通路被二次压死。match_floor 给一个下限，
+    # 把"相似度"与"是否可用"解耦；0 表示沿用旧行为。
+    match_floor: float = 0.0
+    # 按模态的共享辅助检测支路权重 (rgb, ir, dep)；空表示三个都用 branch_aux_weight。
+    branch_aux_weights: Tuple[float, ...] = ()
 
 
 @dataclass

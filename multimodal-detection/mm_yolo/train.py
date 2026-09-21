@@ -65,7 +65,10 @@ MEMORY_RECIPE = "coverage_spatial_memory_v1"
 
 def recipe_for(args):
     if getattr(args, "architecture", "") == "independent_p2_memory_v3":
+        if getattr(args, "alignment_mode", "legacy_gate_v1") == "identity_residual_v2":
+            return "independent_p2_identity_v2"
         semantic = (getattr(args, "branch_aux_weight", 0) > 0 or
+                    bool(getattr(args, "branch_aux_weights", None)) or
                     getattr(args, "flow_supervision_weight", 0) > 0 or
                     getattr(args, "cross_modal_nce_weight", 0) > 0 or
                     getattr(args, "p2_match_refine", False))
@@ -194,6 +197,71 @@ def set_encoder_frozen(model: MMYOLO, frozen: bool) -> None:
     for mod in targets:
         for p in mod.parameters():
             p.requires_grad_(not frozen)
+
+
+def enable_trainable_defaults(model: MMYOLO) -> None:
+    """Undo checkpoint-side freezes before applying this trainer's stage policy.
+
+    Ultralytics checkpoints may retain ``requires_grad=False`` on pretrained
+    neck/head tensors.  The old trainer only toggled encoder layers 0..10, so
+    roughly 4.8M neck/detection parameters never adapted to this dataset.  The
+    trainer owns freeze policy: start from all trainable, then keep only fixed
+    integral DFL projections frozen.
+    """
+    for p in model.parameters():
+        p.requires_grad_(True)
+    detectors = [model.model[-1]]
+    semantic = getattr(model, "semantic_detect", None)
+    if semantic is not None:
+        detectors.append(semantic)
+    for detector in detectors:
+        dfl = getattr(detector, "dfl", None)
+        if dfl is not None:
+            dfl.requires_grad_(False)
+
+
+def set_aux_adaptation_mode(model: MMYOLO) -> None:
+    """Stage A: keep the pretrained RGB detector fixed and adapt auxiliary evidence.
+
+    The frozen detector/neck remains differentiable with respect to its inputs, so
+    the main detection loss still teaches IR/Depth features to fit the established
+    decision space.  Only auxiliary encoders, their embeddings, residual matching,
+    auxiliary fusion projections, and cross-scale memory are trainable.
+    """
+    for p in model.parameters():
+        p.requires_grad_(False)
+
+    trainable = []
+    for name in ("aux_encoders", "metric_encoder", "matchers",
+                 "register_bus", "neck_memory"):
+        module = getattr(model, name, None)
+        if module is not None:
+            trainable.append(module)
+    for module in trainable:
+        for p in module.parameters():
+            p.requires_grad_(True)
+
+    if hasattr(model, "embeddings"):
+        for blocks in model.embeddings.values():
+            for block in blocks[1:]:
+                for p in block.parameters():
+                    p.requires_grad_(True)
+    if hasattr(model, "fusion"):
+        for block in model.fusion.values():
+            # Preserve the RGB anchor/query and the calibrated global gain.  Only
+            # IR/Depth content paths learn during auxiliary adaptation.
+            for module in list(block.gates[1:]) + list(block.outputs[1:]):
+                for p in module.parameters():
+                    p.requires_grad_(True)
+
+
+def set_frozen_bn_eval(model: nn.Module) -> None:
+    """Frozen affine BN parameters must not keep changing population statistics."""
+    for module in model.modules():
+        if isinstance(module, BN_TYPES):
+            local = list(module.parameters(recurse=False))
+            if local and not any(p.requires_grad for p in local):
+                module.eval()
 
 
 def build_optimizer(model: MMYOLO, lr: float, backbone_mult: float, wd: float = 5e-4):
@@ -360,6 +428,17 @@ def validate_checkpoint(ck: dict, model: MMYOLO, enabled, canvas, exact: bool = 
             if ck.get("meta", {}).get("split_digest") != split_digest:
                 raise ValueError("repair must retain the source train/validation split")
             old_f["memory_control"] = "bounded_v2"
+    # 损失权重与匹配下限是训练超参，不改变 state_dict 的形状：warm-start
+    # （--init-checkpoint）必须允许在保留权重的前提下调整它们。精确 --resume
+    # 仍由下方 args 白名单拒绝超参变更。p2_match_refine 会改变匹配器数量，
+    # 属于真实结构差异，继续保留在比较里。
+    for structure in (saved_structure, current_structure):
+        fusion = structure.get("fusion")
+        if isinstance(fusion, dict):
+            for key in ("branch_aux_weight", "branch_aux_weights", "flow_supervision_weight",
+                        "cross_modal_nce_weight", "nce_temperature", "match_floor",
+                        "alignment_mode", "depth_reliability", "flow_identity_weight"):
+                fusion.pop(key, None)
     if saved_structure != current_structure:
         raise ValueError("checkpoint 结构与当前模型不一致（fusion/share/late-bus 等）")
     meta = ck.get("meta") or {}
@@ -398,7 +477,10 @@ def validate_checkpoint(ck: dict, model: MMYOLO, enabled, canvas, exact: bool = 
         keys += ("scale_min", "scale_max", "translate")
         keys += ("precision", "checkpoint_encoder", "mosaic", "full_data")
         keys += ("branch_aux_weight", "flow_supervision_weight", "cross_modal_nce_weight",
-                 "nce_temperature", "p2_match_refine")
+                 "nce_temperature", "p2_match_refine", "match_floor", "branch_aux_weights",
+                 "branch_aux_end_weights", "flow_supervision_end_weight",
+                 "cross_modal_nce_end_weight", "alignment_mode", "depth_reliability",
+                 "flow_identity_weight", "train_stage")
         legacy = {"depth_channels": 2, "depth_view": "both", "depth_init": "relative",
                   "misalign_px": 15.0, "degrade_p": 0.3, "rgb_color_p": 0.0,
                   "ir_noise_p": 0.0, "ir_gain_p": 0.0,
@@ -413,6 +495,10 @@ def validate_checkpoint(ck: dict, model: MMYOLO, enabled, canvas, exact: bool = 
         legacy.update(precision="fp16", checkpoint_encoder=False, mosaic=0., full_data=False)
         legacy.update(branch_aux_weight=0., flow_supervision_weight=0.,
                       cross_modal_nce_weight=0., nce_temperature=.1, p2_match_refine=False)
+        legacy.update(match_floor=0., branch_aux_weights=None, branch_aux_end_weights=None,
+                      flow_supervision_end_weight=None, cross_modal_nce_end_weight=None,
+                      alignment_mode="legacy_gate_v1", depth_reliability="legacy_edge_v1",
+                      flow_identity_weight=0., train_stage="standard")
         changed = [k for k in keys
                    if old.get(k, legacy.get(k)) != getattr(args, k, legacy.get(k))]
         if changed:
@@ -571,6 +657,8 @@ def main():
                     help="全局梯度范数上限；0=关闭。现有稳定范数约 32–41，60 只拦较大尖峰；"
                          "旧 optfix_v3 权重精确续训须显式设为 10")
     ap.add_argument("--freeze-epochs", type=int, default=5, help="前 N 轮冻结编码器")
+    ap.add_argument("--train-stage", default="standard", choices=["standard", "aux_adapt"],
+                    help="aux_adapt 冻结 RGB/主 neck/head，只训练 IR/Depth 证据、匹配与融合入口")
     ap.add_argument("--fusion-tier", default="L2", choices=["L0", "L1", "L2", "L3"])
     ap.add_argument("--share-tier", default="c", choices=["a", "b", "c"])
     ap.add_argument("--register-bus", dest="register_bus", action="store_true", default=True,
@@ -641,7 +729,30 @@ def main():
     ap.add_argument("--nce-temperature", type=float, default=0.10)
     ap.add_argument("--p2-match-refine", action="store_true",
                     help="run an independent local correspondence refinement at P2")
+    ap.add_argument("--match-floor", type=float, default=0.0,
+                    help="匹配置信度下限（0 = 旧行为）。IR/Depth 的 match 只有约 0.1，"
+                         "却被当作共享通路的开关；抬高下限可把相似度与可用性解耦")
+    ap.add_argument("--alignment-mode", default="legacy_gate_v1",
+                    choices=["legacy_gate_v1", "identity_residual_v2"],
+                    help="V4.2 用 match 在原坐标与残差 warp 间插值，而不是抑制整路证据")
+    ap.add_argument("--depth-reliability", default="legacy_edge_v1",
+                    choices=["legacy_edge_v1", "valid_support_v2"],
+                    help="V4.2 仅按无效深度邻域降权，不惩罚真实深度边缘")
+    ap.add_argument("--flow-identity-weight", type=float, default=0.0,
+                    help="没有人工位移标签时的弱零 flow 先验权重")
+    ap.add_argument("--branch-aux-weights", type=float, nargs=3, default=None,
+                    metavar=("RGB", "IR", "DEP"),
+                    help="按模态指定共享辅助检测支路权重；缺省时三路都用 --branch-aux-weight")
+    ap.add_argument("--branch-aux-end-weights", type=float, nargs=3, default=None,
+                    metavar=("RGB", "IR", "DEP"),
+                    help="末轮辅助分支权重；给出后从起始权重线性退火")
+    ap.add_argument("--flow-supervision-end-weight", type=float, default=None)
+    ap.add_argument("--cross-modal-nce-end-weight", type=float, default=None)
     args = ap.parse_args()
+    if args.branch_aux_weights is not None:
+        args.branch_aux_weights = tuple(float(v) for v in args.branch_aux_weights)
+    if args.branch_aux_end_weights is not None:
+        args.branch_aux_end_weights = tuple(float(v) for v in args.branch_aux_end_weights)
     if args.reset_fusion_gates and (args.resume or not args.init_checkpoint):
         raise ValueError("--reset-fusion-gates requires --init-checkpoint in a new run")
     if args.memory_control != "unbounded_v1" and args.architecture not in ("spatial_memory_v1", "independent_p2_memory_v3"):
@@ -657,12 +768,22 @@ def main():
     if args.calibrate_clip_steps < 0 or args.val_batch < 1 or args.warmup < 0:
         raise ValueError("invalid calibration/validation/warmup settings")
     if (min(args.branch_aux_weight, args.flow_supervision_weight, args.cross_modal_nce_weight) < 0
+            or args.match_floor < 0
+            or (args.branch_aux_weights is not None and min(args.branch_aux_weights) < 0)
+            or (args.branch_aux_end_weights is not None and min(args.branch_aux_end_weights) < 0)
+            or (args.flow_supervision_end_weight is not None and args.flow_supervision_end_weight < 0)
+            or (args.cross_modal_nce_end_weight is not None and args.cross_modal_nce_end_weight < 0)
+            or not 0 <= args.flow_identity_weight <= 1
             or args.nce_temperature <= 0):
         raise ValueError("semantic loss weights must be nonnegative and temperature positive")
     if args.calibrate_clip_steps and args.grad_clip <= 0:
         raise ValueError("clip calibration requires a positive initial safety threshold")
     if args.architecture in ("spatial_memory_v1", "independent_p2_memory_v3") and args.sampler != "coverage":
         raise ValueError("new recipe requires --sampler coverage")
+    if args.train_stage == "aux_adapt" and args.architecture != "independent_p2_memory_v3":
+        raise ValueError("aux_adapt 仅支持 independent_p2_memory_v3")
+    if args.alignment_mode == "identity_residual_v2" and args.match_floor != 0:
+        raise ValueError("identity_residual_v2 不使用 match-floor；请保持 0")
     if args.batch < 1 or args.accum < 1 or args.epochs < 1 or args.save_every < 1:
         raise ValueError("batch/accum/epochs/save-every 必须为正整数")
     if args.nominal_batch < 1 or args.weight_decay < 0 or args.grad_clip < 0:
@@ -840,8 +961,20 @@ def main():
     cfg.fusion.architecture = args.architecture
     cfg.fusion.memory_control = args.memory_control
     cfg.fusion.branch_aux_weight = float(args.branch_aux_weight)
-    cfg.fusion.flow_supervision_weight = float(args.flow_supervision_weight)
-    cfg.fusion.cross_modal_nce_weight = float(args.cross_modal_nce_weight)
+    cfg.fusion.branch_aux_weights = (tuple(args.branch_aux_weights)
+                                     if args.branch_aux_weights else ())
+    cfg.fusion.match_floor = float(args.match_floor)
+    cfg.fusion.alignment_mode = args.alignment_mode
+    cfg.fusion.depth_reliability = args.depth_reliability
+    cfg.fusion.flow_identity_weight = float(args.flow_identity_weight)
+    # The model only needs to know whether a training-only branch exists.  Use
+    # the maximum scheduled weight so an end-heavy schedule cannot omit it.
+    flow_end = (args.flow_supervision_weight if args.flow_supervision_end_weight is None
+                else args.flow_supervision_end_weight)
+    nce_end = (args.cross_modal_nce_weight if args.cross_modal_nce_end_weight is None
+               else args.cross_modal_nce_end_weight)
+    cfg.fusion.flow_supervision_weight = float(max(args.flow_supervision_weight, flow_end))
+    cfg.fusion.cross_modal_nce_weight = float(max(args.cross_modal_nce_weight, nce_end))
     cfg.fusion.nce_temperature = float(args.nce_temperature)
     cfg.fusion.p2_match_refine = bool(args.p2_match_refine)
     cfg.depth_resampling = args.depth_resampling
@@ -864,6 +997,7 @@ def main():
     cfg.fusion.depth_scales = {"p4p5": (False, True, True), "all": (True, True, True),
                                "p3p4": (True, True, False), "p4": (False, True, False)}[args.depth_scales]
     model = MMYOLO(cfg).to(dev)
+    enable_trainable_defaults(model)
     model.modality_off = {"rgb", "ir", "dep"} - set(enabled)
     model.infer_modalities = tuple(enabled)
     model.infer_canvas = tuple(canvas)
@@ -985,7 +1119,11 @@ def main():
     for ep in range(start_ep, args.epochs):
         t_ep = time.time()
         frozen = ep < args.freeze_epochs
-        set_encoder_frozen(model, frozen)
+        if args.train_stage == "aux_adapt":
+            set_aux_adaptation_mode(model)
+            frozen = True
+        else:
+            set_encoder_frozen(model, frozen)
         lr = lr_at(ep, args.epochs, args.lr, warmup=args.warmup, lrf=args.lrf)
         for grp in opt.param_groups:
             grp["lr"] = lr * float(grp.get("lr_mult", 1.0))
@@ -1000,6 +1138,25 @@ def main():
             if ep == 0:
                 log(f"[train] freeze-bn：冻结 {nb} 个 BN；新建 BN "
                     f"{'也冻结' if args.freeze_new_bn else '仍训练'}")
+        if args.train_stage == "aux_adapt":
+            set_frozen_bn_eval(model)
+        if ep == start_ep:
+            trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            total = sum(p.numel() for p in model.parameters())
+            log(f"[train] stage={args.train_stage} trainable={trainable/1e6:.3f}M/{total/1e6:.3f}M")
+
+        progress = ep / max(1, args.epochs - 1)
+        aux_start = (tuple(args.branch_aux_weights) if args.branch_aux_weights
+                     else (float(args.branch_aux_weight),) * 3)
+        aux_end = (tuple(args.branch_aux_end_weights) if args.branch_aux_end_weights
+                   else aux_start)
+        aux_values = tuple(a + (b - a) * progress for a, b in zip(aux_start, aux_end))
+        aux_w = dict(zip(("rgb", "ir", "dep"), aux_values))
+        flow_weight = (args.flow_supervision_weight +
+                       (flow_end - args.flow_supervision_weight) * progress)
+        nce_weight = (args.cross_modal_nce_weight +
+                      (nce_end - args.cross_modal_nce_weight) * progress)
+        aux_w_log = "/".join(f"{v:.3g}" for v in aux_values)
         opt.zero_grad(set_to_none=True)
         agg = {"loss": 0.0, "n": 0, "micro": 0, "group_samples": 0, "skipped": 0,
                "branch_aux": 0.0, "flow_aux": 0.0, "nce_aux": 0.0,
@@ -1110,8 +1267,8 @@ def main():
                         batch["alignment_shift"].to(dev, non_blocking=non_blocking),
                         batch["alignment_supervised"].to(dev, non_blocking=non_blocking),
                     )
-                    loss = loss + (args.flow_supervision_weight * semantic["flow"] +
-                                   args.cross_modal_nce_weight * semantic["nce"]) * (
+                    loss = loss + (flow_weight * semantic["flow"] +
+                                   nce_weight * semantic["nce"]) * (
                                        rgb.shape[0] / nominal_samples)
                     # 显存修复：每步只跑一个辅助检测支路（原来的三支路同时在图上，
                     # 在 736x1280 / batch=4 时峰值 22.4G 并在第 2 轮 OOM）。按
@@ -1122,6 +1279,8 @@ def main():
                     branch_count = 0
                     for off in range(len(branch_names)):
                         name = branch_names[(ep + bi + off) % len(branch_names)]
+                        if aux_w[name] <= 0:
+                            continue
                         mi = branch_names.index(name)
                         active = model.semantic_branch_present[:, mi]
                         if not active.any():
@@ -1135,7 +1294,7 @@ def main():
                         branch_count = 1
                         break
                     if branch_count:
-                        loss = loss + args.branch_aux_weight * branch_total / nominal_samples
+                        loss = loss + aux_w[name] * branch_total / nominal_samples
                     else:
                         branch_total = loss.new_zeros(())
             if not torch.isfinite(loss.detach()):
@@ -1201,9 +1360,14 @@ def main():
                f" clip_limit={clip_state['threshold']:.2f}"
                f"{mem} 用时 {(time.time()-t_ep)/60:.1f}min/轮 累计 {(time.time()-t0)/60:.1f}min")
         if args.architecture == "independent_p2_memory_v3" and (
-                args.branch_aux_weight or args.flow_supervision_weight or args.cross_modal_nce_weight):
+                args.branch_aux_weight or args.branch_aux_weights
+                or args.branch_aux_end_weights or args.flow_supervision_weight
+                or args.cross_modal_nce_weight or args.flow_supervision_end_weight
+                or args.cross_modal_nce_end_weight):
             msg += (f" semantic_raw=branch:{agg['branch_aux']/n:.3f} "
-                    f"flow:{agg['flow_aux']/n:.4f} nce:{agg['nce_aux']/n:.3f}")
+                    f"flow:{agg['flow_aux']/n:.4f} nce:{agg['nce_aux']/n:.3f}"
+                    f" align:{args.alignment_mode} aux_w:{aux_w_log}"
+                    f" flow_w:{flow_weight:.3g} nce_w:{nce_weight:.3g}")
         if model.spatial_memory:
             if health_n:
                 log(f"[train] fusion epoch-mean={ {k: round(float(v/health_n),4) for k,v in health_sum.items()} }")
