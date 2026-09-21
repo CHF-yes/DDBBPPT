@@ -159,6 +159,8 @@ class IndependentMMYOLO(nn.Module):
         self._semantic_masks = None
         self._semantic_flows = None
         self.last_semantic_losses = {}
+        self.embedding_aux_losses = {"reconstruction": torch.tensor(0.),
+                                     "alignment": torch.tensor(0.)}
         self.train()
 
     @property
@@ -324,6 +326,11 @@ class IndependentMMYOLO(nn.Module):
             else:
                 geometry[s] = values[0]*mask[0] + sum(
                     values[m]*confidence[s][m]*rel[m] for m in (1,2))*.25
+        # Keep the two objectives separate.  Stage A benefits from information
+        # preservation, while a detection fine-tune must be able to anneal both
+        # terms instead of silently retaining the old fixed .01/.005 pressure.
+        self.embedding_aux_losses = {"reconstruction": auxiliary,
+                                     "alignment": alignment_loss}
         self.aux_loss = .01*auxiliary + .005*alignment_loss if self.training else auxiliary.detach()*0
         self.semantic_branch_present = present
         self._semantic_common = aligned_common

@@ -13,7 +13,7 @@ from config import default_config
 from model import MMYOLO, save_mm_checkpoint, load_mm_checkpoint
 from train import (build_optimizer, set_encoder_frozen, apply_bn_policy, make_targets,
                    subset_detection_batch, set_aux_adaptation_mode,
-                   enable_trainable_defaults)
+                   set_anchored_joint_mode, enable_trainable_defaults)
 from data import MMDataset, AugCfg, collate, scheduled_aug
 from independent_fusion import (warp, resize_flow, identity_residual_align,
                                 LocalCorrespondence)
@@ -202,6 +202,32 @@ class IndependentV3Tests(unittest.TestCase):
                             for p in m.aux_encoders["ir"].parameters()))
         self.assertTrue(any(p.grad is not None and p.grad.abs().sum()>0
                             for p in m.aux_encoders["dep"].parameters()))
+
+    def test_anchored_joint_keeps_rgb_reference_and_uses_role_lrs(self):
+        c = config()
+        c.fusion.branch_aux_weights = (0.,.03,.025)
+        m = MMYOLO(c).train()
+        enable_trainable_defaults(m)
+        set_anchored_joint_mode(m, detector_frozen=True)
+        self.assertFalse(any(p.requires_grad for p in m.backbone.model[:11].parameters()))
+        self.assertFalse(any(p.requires_grad for p in m.embeddings["p3"][0].parameters()))
+        self.assertTrue(any(p.requires_grad for p in m.embeddings["p3"][1].parameters()))
+        self.assertFalse(any(p.requires_grad for p in m.fusion["p3"].query.parameters()))
+        self.assertTrue(any(p.requires_grad for p in m.fusion["p3"].gates[1].parameters()))
+        self.assertFalse(any(p.requires_grad for p in m.backbone.model[13].parameters()))
+        self.assertTrue(any(p.requires_grad for p in m.p2_neck.parameters()))
+        self.assertTrue(any(p.requires_grad for p in m.model[-1].cv2[0].parameters()))
+        set_anchored_joint_mode(m, detector_frozen=False)
+        self.assertTrue(any(p.requires_grad for p in m.backbone.model[13].parameters()))
+        self.assertFalse(any(p.requires_grad for p in m.backbone.model[:11].parameters()))
+
+        mults = {"anchor":0., "aux_encoder":.4, "fusion":1.,
+                 "p2":.4, "detector":.16, "semantic":.4}
+        opt = build_optimizer(m, 2.5e-5, .4, role_mults=mults)
+        roles = {g["role"]:g["lr_mult"] for g in opt.param_groups}
+        self.assertEqual(roles["anchor"], 0.)
+        self.assertEqual(roles["fusion"], 1.)
+        self.assertEqual(roles["detector"], .16)
 
 
 if __name__ == "__main__":

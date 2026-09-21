@@ -28,6 +28,7 @@ python code/mm_yolo/train.py --root "<train_extracted>" --labels "<new_labels_20
 from __future__ import annotations
 
 import argparse
+import collections
 import copy
 import hashlib
 import json
@@ -65,6 +66,8 @@ MEMORY_RECIPE = "coverage_spatial_memory_v1"
 
 def recipe_for(args):
     if getattr(args, "architecture", "") == "independent_p2_memory_v3":
+        if getattr(args, "train_stage", "standard") == "anchored_joint":
+            return "independent_p2_anchored_joint_v1"
         if getattr(args, "alignment_mode", "legacy_gate_v1") == "identity_residual_v2":
             return "independent_p2_identity_v2"
         semantic = (getattr(args, "branch_aux_weight", 0) > 0 or
@@ -255,6 +258,61 @@ def set_aux_adaptation_mode(model: MMYOLO) -> None:
                     p.requires_grad_(True)
 
 
+def set_anchored_joint_mode(model: MMYOLO, detector_frozen: bool) -> None:
+    """V4.2c: retain a fixed RGB semantic coordinate system.
+
+    Stage A learned IR/Depth against a frozen RGB detector.  Unfreezing every
+    embedding, fusion query and detector tensor at once makes that coordinate
+    system move and caused immediate validation collapse.  This policy keeps the
+    RGB evidence/query/gain anchor fixed, learns auxiliary evidence plus the new
+    P2/localization path, then cautiously releases only the downstream detector.
+    """
+    for p in model.parameters():
+        p.requires_grad_(False)
+
+    def enable(module):
+        if module is not None:
+            for p in module.parameters():
+                p.requires_grad_(True)
+
+    for name in ("aux_encoders", "metric_encoder", "matchers",
+                 "register_bus", "neck_memory"):
+        enable(getattr(model, name, None))
+
+    # Modality 0 is the fixed RGB semantic anchor.  IR/Depth retain enough
+    # capacity to learn common/private evidence without rotating the reference.
+    if hasattr(model, "embeddings"):
+        for blocks in model.embeddings.values():
+            for block in blocks[1:]:
+                enable(block)
+    if hasattr(model, "fusion"):
+        for block in model.fusion.values():
+            for module in list(block.gates[1:]) + list(block.outputs[1:]):
+                enable(module)
+
+    # New high-resolution/localization modules may adapt from the beginning.
+    for name in ("p2_lateral", "p2_neck", "p2_down", "p3_refine", "localization"):
+        enable(getattr(model, name, None))
+    for name in ("neck_gain", "loc_gain"):
+        value = getattr(model, name, None)
+        if value is not None:
+            value.requires_grad_(True)
+    detector = model.model[-1]
+    for branch_name in ("cv2", "cv3"):
+        branches = getattr(detector, branch_name, None)
+        if branches is not None and len(branches):
+            enable(branches[0])
+
+    enable(getattr(model, "semantic_adapters", None))
+    enable(getattr(model, "semantic_detect", None))
+
+    if not detector_frozen:
+        enable(model.backbone.model[11:])
+    dfl = getattr(detector, "dfl", None)
+    if dfl is not None:
+        dfl.requires_grad_(False)
+
+
 def set_frozen_bn_eval(model: nn.Module) -> None:
     """Frozen affine BN parameters must not keep changing population statistics."""
     for module in model.modules():
@@ -264,7 +322,8 @@ def set_frozen_bn_eval(model: nn.Module) -> None:
                 module.eval()
 
 
-def build_optimizer(model: MMYOLO, lr: float, backbone_mult: float, wd: float = 5e-4):
+def build_optimizer(model: MMYOLO, lr: float, backbone_mult: float, wd: float = 5e-4,
+                    role_mults: dict | None = None):
     """按真实模块归属分组：仅预训练编码器用小 lr，其余部分用基础 lr。
 
     ``model.backbone`` 是完整的 Ultralytics DetectionModel，除了编码器还包含 Neck、
@@ -295,6 +354,71 @@ def build_optimizer(model: MMYOLO, lr: float, backbone_mult: float, wd: float = 
         encoder_ids.update(id(p) for p in model.aux_stages.parameters())
     if getattr(model, "spatial_memory", False) and hasattr(model, "bn_store"):
         encoder_ids.update(id(p) for p in model.bn_store.parameters())
+    if role_mults is not None:
+        role_ids = {name: set() for name in role_mults}
+
+        def add(role, module):
+            if module is not None and role in role_ids:
+                role_ids[role].update(id(p) for p in module.parameters())
+
+        add("anchor", model.backbone.model[:11])
+        add("aux_encoder", getattr(model, "aux_encoders", None))
+        add("aux_encoder", getattr(model, "metric_encoder", None))
+        add("fusion", getattr(model, "matchers", None))
+        add("fusion", getattr(model, "register_bus", None))
+        add("fusion", getattr(model, "neck_memory", None))
+        if hasattr(model, "embeddings"):
+            for blocks in model.embeddings.values():
+                add("anchor", blocks[0])
+                for block in blocks[1:]:
+                    add("fusion", block)
+        if hasattr(model, "fusion"):
+            for block in model.fusion.values():
+                add("anchor", block.query)
+                add("anchor", block.context)
+                role_ids.get("anchor", set()).update((id(block.identity), id(block.gain)))
+                add("anchor", block.gates[0])
+                add("anchor", block.outputs[0])
+                for module in list(block.gates[1:]) + list(block.outputs[1:]):
+                    add("fusion", module)
+        for name in ("p2_lateral", "p2_neck", "p2_down", "p3_refine", "localization"):
+            add("p2", getattr(model, name, None))
+        for name in ("neck_gain", "loc_gain"):
+            value = getattr(model, name, None)
+            if value is not None and "p2" in role_ids:
+                role_ids["p2"].add(id(value))
+        detector = model.model[-1]
+        for branch_name in ("cv2", "cv3"):
+            branches = getattr(detector, branch_name, None)
+            if branches is not None and len(branches):
+                add("p2", branches[0])
+        add("detector", model.backbone.model[11:])
+        add("semantic", getattr(model, "semantic_adapters", None))
+        add("semantic", getattr(model, "semantic_detect", None))
+
+        # Resolve aliases/overlap by priority: the new P2 head must not inherit
+        # the slower pretrained detector rate; the frozen anchor always wins.
+        priority = ("anchor", "p2", "semantic", "aux_encoder", "fusion", "detector")
+        owner = {}
+        for role in reversed(priority):
+            for pid in role_ids.get(role, ()):
+                owner[pid] = role
+        groups = collections.defaultdict(list)
+        seen = set()
+        for name, p in model.named_parameters():
+            if p is None or id(p) in seen:
+                continue
+            seen.add(id(p))
+            role = owner.get(id(p), "fusion")
+            no_decay = p.ndim == 1 or name.endswith(".bias")
+            groups[(role, no_decay)].append(p)
+        params = []
+        for (role, no_decay), tensors in groups.items():
+            mult = float(role_mults.get(role, 1.0))
+            params.append({"params": tensors, "lr": lr * mult, "lr_mult": mult,
+                           "role": role, "weight_decay": 0.0 if no_decay else wd})
+        return torch.optim.AdamW(params, betas=(0.9, 0.999))
+
     seen = set()
     groups = {"encoder_decay": [], "encoder_nodecay": [],
               "task_decay": [], "task_nodecay": []}
@@ -464,7 +588,8 @@ def validate_checkpoint(ck: dict, model: MMYOLO, enabled, canvas, exact: bool = 
     if args is not None:
         old = ts.get("args") or {}
         keys = ("modalities", "imgsz", "epochs", "batch", "accum", "lr",
-                "backbone_lr_mult", "freeze_epochs", "freeze_bn", "freeze_new_bn",
+                "backbone_lr_mult", "fusion_lr_mult", "p2_lr_mult", "detector_lr_mult",
+                "semantic_lr_mult", "freeze_epochs", "freeze_bn", "freeze_new_bn",
                 "fusion_tier", "share_tier", "register_bus", "late_bus", "depth_scales",
                 "no_quality", "no_prior", "no_deformable", "no_dropout",
                 "rgb_dropout", "aux_dropout", "dropout_start_epoch", "depth_channels",
@@ -480,7 +605,8 @@ def validate_checkpoint(ck: dict, model: MMYOLO, enabled, canvas, exact: bool = 
                  "nce_temperature", "p2_match_refine", "match_floor", "branch_aux_weights",
                  "branch_aux_end_weights", "flow_supervision_end_weight",
                  "cross_modal_nce_end_weight", "alignment_mode", "depth_reliability",
-                 "flow_identity_weight", "train_stage")
+                 "flow_identity_weight", "embedding_recon_weight", "embedding_recon_end_weight",
+                 "embedding_alignment_weight", "embedding_alignment_end_weight", "train_stage")
         legacy = {"depth_channels": 2, "depth_view": "both", "depth_init": "relative",
                   "misalign_px": 15.0, "degrade_p": 0.3, "rgb_color_p": 0.0,
                   "ir_noise_p": 0.0, "ir_gain_p": 0.0,
@@ -498,7 +624,10 @@ def validate_checkpoint(ck: dict, model: MMYOLO, enabled, canvas, exact: bool = 
         legacy.update(match_floor=0., branch_aux_weights=None, branch_aux_end_weights=None,
                       flow_supervision_end_weight=None, cross_modal_nce_end_weight=None,
                       alignment_mode="legacy_gate_v1", depth_reliability="legacy_edge_v1",
-                      flow_identity_weight=0., train_stage="standard")
+                      flow_identity_weight=0., embedding_recon_weight=.01,
+                      embedding_recon_end_weight=None, embedding_alignment_weight=.005,
+                      embedding_alignment_end_weight=None, fusion_lr_mult=1., p2_lr_mult=1.,
+                      detector_lr_mult=1., semantic_lr_mult=1., train_stage="standard")
         changed = [k for k in keys
                    if old.get(k, legacy.get(k)) != getattr(args, k, legacy.get(k))]
         if changed:
@@ -649,6 +778,14 @@ def main():
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--backbone-lr-mult", type=float, default=0.1)
+    ap.add_argument("--fusion-lr-mult", type=float, default=1.0,
+                    help="anchored_joint 中辅助融合/记忆相对基础 lr")
+    ap.add_argument("--p2-lr-mult", type=float, default=1.0,
+                    help="anchored_joint 中新 P2/定位路径相对基础 lr")
+    ap.add_argument("--detector-lr-mult", type=float, default=1.0,
+                    help="anchored_joint 中预训练 Neck/Detect 相对基础 lr")
+    ap.add_argument("--semantic-lr-mult", type=float, default=1.0,
+                    help="anchored_joint 中训练期辅助检测头相对基础 lr")
     ap.add_argument("--weight-decay", type=float, default=5e-4,
                     help="名义 batch 下的 AdamW 衰减；会按有效 batch/nominal-batch 缩放")
     ap.add_argument("--nominal-batch", type=int, default=64,
@@ -657,8 +794,9 @@ def main():
                     help="全局梯度范数上限；0=关闭。现有稳定范数约 32–41，60 只拦较大尖峰；"
                          "旧 optfix_v3 权重精确续训须显式设为 10")
     ap.add_argument("--freeze-epochs", type=int, default=5, help="前 N 轮冻结编码器")
-    ap.add_argument("--train-stage", default="standard", choices=["standard", "aux_adapt"],
-                    help="aux_adapt 冻结 RGB/主 neck/head，只训练 IR/Depth 证据、匹配与融合入口")
+    ap.add_argument("--train-stage", default="standard",
+                    choices=["standard", "aux_adapt", "anchored_joint"],
+                    help="aux_adapt 仅适配辅助证据；anchored_joint 固定 RGB 语义锚点并分组微调")
     ap.add_argument("--fusion-tier", default="L2", choices=["L0", "L1", "L2", "L3"])
     ap.add_argument("--share-tier", default="c", choices=["a", "b", "c"])
     ap.add_argument("--register-bus", dest="register_bus", action="store_true", default=True,
@@ -748,6 +886,12 @@ def main():
                     help="末轮辅助分支权重；给出后从起始权重线性退火")
     ap.add_argument("--flow-supervision-end-weight", type=float, default=None)
     ap.add_argument("--cross-modal-nce-end-weight", type=float, default=None)
+    ap.add_argument("--embedding-recon-weight", type=float, default=.01,
+                    help="common/private 信息重建起始权重；旧固定值为 .01")
+    ap.add_argument("--embedding-recon-end-weight", type=float, default=None)
+    ap.add_argument("--embedding-alignment-weight", type=float, default=.005,
+                    help="common 余弦对齐起始权重；旧固定值为 .005")
+    ap.add_argument("--embedding-alignment-end-weight", type=float, default=None)
     args = ap.parse_args()
     if args.branch_aux_weights is not None:
         args.branch_aux_weights = tuple(float(v) for v in args.branch_aux_weights)
@@ -773,6 +917,9 @@ def main():
             or (args.branch_aux_end_weights is not None and min(args.branch_aux_end_weights) < 0)
             or (args.flow_supervision_end_weight is not None and args.flow_supervision_end_weight < 0)
             or (args.cross_modal_nce_end_weight is not None and args.cross_modal_nce_end_weight < 0)
+            or min(args.embedding_recon_weight, args.embedding_alignment_weight) < 0
+            or (args.embedding_recon_end_weight is not None and args.embedding_recon_end_weight < 0)
+            or (args.embedding_alignment_end_weight is not None and args.embedding_alignment_end_weight < 0)
             or not 0 <= args.flow_identity_weight <= 1
             or args.nce_temperature <= 0):
         raise ValueError("semantic loss weights must be nonnegative and temperature positive")
@@ -780,14 +927,17 @@ def main():
         raise ValueError("clip calibration requires a positive initial safety threshold")
     if args.architecture in ("spatial_memory_v1", "independent_p2_memory_v3") and args.sampler != "coverage":
         raise ValueError("new recipe requires --sampler coverage")
-    if args.train_stage == "aux_adapt" and args.architecture != "independent_p2_memory_v3":
-        raise ValueError("aux_adapt 仅支持 independent_p2_memory_v3")
+    if args.train_stage in ("aux_adapt", "anchored_joint") and args.architecture != "independent_p2_memory_v3":
+        raise ValueError("aux_adapt/anchored_joint 仅支持 independent_p2_memory_v3")
     if args.alignment_mode == "identity_residual_v2" and args.match_floor != 0:
         raise ValueError("identity_residual_v2 不使用 match-floor；请保持 0")
     if args.batch < 1 or args.accum < 1 or args.epochs < 1 or args.save_every < 1:
         raise ValueError("batch/accum/epochs/save-every 必须为正整数")
     if args.nominal_batch < 1 or args.weight_decay < 0 or args.grad_clip < 0:
         raise ValueError("nominal-batch 须 >0，weight-decay/grad-clip 须 >=0")
+    if min(args.backbone_lr_mult, args.fusion_lr_mult, args.p2_lr_mult,
+           args.detector_lr_mult, args.semantic_lr_mult) < 0:
+        raise ValueError("所有学习率倍率必须 >=0")
     if not (0.0 <= args.rgb_dropout < 1.0 and 0.0 <= args.aux_dropout < 1.0):
         raise ValueError("dropout 概率必须在 [0,1) 内")
     for name in ("degrade_p", "rgb_color_p", "ir_noise_p", "ir_gain_p",
@@ -973,6 +1123,11 @@ def main():
                 else args.flow_supervision_end_weight)
     nce_end = (args.cross_modal_nce_weight if args.cross_modal_nce_end_weight is None
                else args.cross_modal_nce_end_weight)
+    recon_end = (args.embedding_recon_weight if args.embedding_recon_end_weight is None
+                 else args.embedding_recon_end_weight)
+    embedding_alignment_end = (
+        args.embedding_alignment_weight if args.embedding_alignment_end_weight is None
+        else args.embedding_alignment_end_weight)
     cfg.fusion.flow_supervision_weight = float(max(args.flow_supervision_weight, flow_end))
     cfg.fusion.cross_modal_nce_weight = float(max(args.cross_modal_nce_weight, nce_end))
     cfg.fusion.nce_temperature = float(args.nce_temperature)
@@ -1009,10 +1164,25 @@ def main():
     crit = v8DetectionLoss(model)
     effective_batch = args.batch * args.accum
     scaled_wd = args.weight_decay * effective_batch / args.nominal_batch
-    opt = build_optimizer(model, args.lr, args.backbone_lr_mult, wd=scaled_wd)
+    role_mults = None
+    if args.train_stage == "anchored_joint":
+        role_mults = {"anchor": 0.0,
+                      "aux_encoder": args.backbone_lr_mult,
+                      "fusion": args.fusion_lr_mult,
+                      "p2": args.p2_lr_mult,
+                      "detector": args.detector_lr_mult,
+                      "semantic": args.semantic_lr_mult}
+    opt = build_optimizer(model, args.lr, args.backbone_lr_mult, wd=scaled_wd,
+                          role_mults=role_mults)
     log(f"[train] 优化器 AdamW：有效 batch={effective_batch}，"
         f"weight_decay={args.weight_decay:g}×{effective_batch}/{args.nominal_batch}"
         f"={scaled_wd:.3g}，grad_clip={args.grad_clip:g}")
+    if role_mults is not None:
+        group_counts = collections.defaultdict(int)
+        for group in opt.param_groups:
+            group_counts[group.get("role", "unknown")] += sum(p.numel() for p in group["params"])
+        log(f"[train] anchored lr multipliers={role_mults} params="
+            f"{ {k: round(v/1e6,3) for k,v in group_counts.items()} }")
 
     # ---- 断点续训（无人值守必需：半夜崩了不能从头再来）----
     start_ep, best0 = 0, -1.0
@@ -1122,6 +1292,8 @@ def main():
         if args.train_stage == "aux_adapt":
             set_aux_adaptation_mode(model)
             frozen = True
+        elif args.train_stage == "anchored_joint":
+            set_anchored_joint_mode(model, detector_frozen=frozen)
         else:
             set_encoder_frozen(model, frozen)
         lr = lr_at(ep, args.epochs, args.lr, warmup=args.warmup, lrf=args.lrf)
@@ -1138,7 +1310,7 @@ def main():
             if ep == 0:
                 log(f"[train] freeze-bn：冻结 {nb} 个 BN；新建 BN "
                     f"{'也冻结' if args.freeze_new_bn else '仍训练'}")
-        if args.train_stage == "aux_adapt":
+        if args.train_stage in ("aux_adapt", "anchored_joint"):
             set_frozen_bn_eval(model)
         if ep == start_ep:
             trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -1156,10 +1328,16 @@ def main():
                        (flow_end - args.flow_supervision_weight) * progress)
         nce_weight = (args.cross_modal_nce_weight +
                       (nce_end - args.cross_modal_nce_weight) * progress)
+        recon_weight = (args.embedding_recon_weight +
+                        (recon_end - args.embedding_recon_weight) * progress)
+        embedding_alignment_weight = (
+            args.embedding_alignment_weight +
+            (embedding_alignment_end - args.embedding_alignment_weight) * progress)
         aux_w_log = "/".join(f"{v:.3g}" for v in aux_values)
         opt.zero_grad(set_to_none=True)
         agg = {"loss": 0.0, "n": 0, "micro": 0, "group_samples": 0, "skipped": 0,
                "branch_aux": 0.0, "flow_aux": 0.0, "nce_aux": 0.0,
+               "embedding_recon": 0.0, "embedding_alignment": 0.0,
                "grad_steps": 0, "grad_clipped": 0, "grad_norm_sum": 0.0,
                "grad_norm_max": 0.0, "amp_overflow": 0, "norms": [], "stems": set(), "draws": 0}
         health_sum, health_n = {}, 0
@@ -1261,7 +1439,10 @@ def main():
                 loss_vec, loss_items = crit(preds, tgt)
                 loss = accumulation_loss(loss_vec, nominal_samples)
                 if args.architecture == "independent_p2_memory_v3":
-                    loss = loss + model.aux_loss * (rgb.shape[0] / nominal_samples)
+                    embedding_aux = model.embedding_aux_losses
+                    loss = loss + (recon_weight * embedding_aux["reconstruction"] +
+                                   embedding_alignment_weight * embedding_aux["alignment"]) * (
+                                       rgb.shape[0] / nominal_samples)
                     semantic = model.semantic_regularization(
                         tgt,
                         batch["alignment_shift"].to(dev, non_blocking=non_blocking),
@@ -1320,6 +1501,8 @@ def main():
                 agg["branch_aux"] += float(branch_total.detach()) / max(1, rgb.shape[0] * max(1, branch_count))
                 agg["flow_aux"] += float(semantic["flow"].detach())
                 agg["nce_aux"] += float(semantic["nce"].detach())
+                agg["embedding_recon"] += float(embedding_aux["reconstruction"].detach())
+                agg["embedding_alignment"] += float(embedding_aux["alignment"].detach())
             for k in ("box_loss", "cls_loss", "dfl_loss"):
                 agg[k] = agg.get(k, 0.0) + float(loss_items[k])
             agg["n"] += 1
@@ -1367,7 +1550,9 @@ def main():
             msg += (f" semantic_raw=branch:{agg['branch_aux']/n:.3f} "
                     f"flow:{agg['flow_aux']/n:.4f} nce:{agg['nce_aux']/n:.3f}"
                     f" align:{args.alignment_mode} aux_w:{aux_w_log}"
-                    f" flow_w:{flow_weight:.3g} nce_w:{nce_weight:.3g}")
+                    f" flow_w:{flow_weight:.3g} nce_w:{nce_weight:.3g}"
+                    f" embed_raw:{agg['embedding_recon']/n:.3f}/{agg['embedding_alignment']/n:.3f}"
+                    f" embed_w:{recon_weight:.3g}/{embedding_alignment_weight:.3g}")
         if model.spatial_memory:
             if health_n:
                 log(f"[train] fusion epoch-mean={ {k: round(float(v/health_n),4) for k,v in health_sum.items()} }")

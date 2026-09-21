@@ -38,6 +38,8 @@ def main():
         "branch_aux_weight": 0.0,
         "flow_supervision_weight": 0.0,
         "cross_modal_nce_weight": 0.0,
+        "embedding_recon_weight": 0.01,
+        "embedding_alignment_weight": 0.005,
         "nce_temperature": 0.10,
         "p2_match_refine": False,
         "match_floor": 0.0,
@@ -69,13 +71,16 @@ def main():
               "--memory-control","bounded_v2","--no-prior",
               "--no-deformable","--val-batch","1","--val-conf","0.001","--save-every","1"]
     keys = ("architecture","imgsz","epochs","batch","accum","workers","precision","lr","backbone_lr_mult",
+            "fusion_lr_mult","p2_lr_mult","detector_lr_mult","semantic_lr_mult",
             "freeze_epochs","warmup","lrf","grad_clip","calibrate_clip_steps","bn_policy","mosaic","close_aug_frac",
             "scale_min","scale_max","translate","target_crop_p","misalign_px","degrade_p","rgb_color_p",
             "ir_noise_p","ir_gain_p","depth_hole_p","rgb_dropout","aux_dropout","dropout_start_epoch",
             "branch_aux_weight","flow_supervision_weight","cross_modal_nce_weight","nce_temperature",
             "match_floor","branch_aux_weights","branch_aux_end_weights",
             "flow_supervision_end_weight","cross_modal_nce_end_weight","alignment_mode",
-            "depth_reliability","flow_identity_weight","train_stage","val_every","seed")
+            "depth_reliability","flow_identity_weight","embedding_recon_weight",
+            "embedding_recon_end_weight","embedding_alignment_weight",
+            "embedding_alignment_end_weight","train_stage","val_every","seed")
 
     def add_options(cmd, options):
         for key, value in options.items():
