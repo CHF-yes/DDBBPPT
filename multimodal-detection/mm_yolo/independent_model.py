@@ -136,7 +136,6 @@ class IndependentMMYOLO(nn.Module):
         self._struct = cfg.structure()
         self.aux_loss = torch.tensor(0.)
         self._last_register_state = None
-        self.semantic_branch_predictions = {}
         self.semantic_branch_present = None
         self._semantic_common = None
         self._semantic_masks = None
@@ -272,15 +271,10 @@ class IndependentMMYOLO(nn.Module):
             # A separate dense, confidence-gated boundary bypass supports box regression.
             geometry[s] = values[0]*mask[0] + sum(values[m]*confidence[s][m]*rel[m] for m in (1,2))*.25
         self.aux_loss = .01*auxiliary + .005*alignment_loss if self.training else auxiliary.detach()*0
-        self.semantic_branch_predictions = {}
         self.semantic_branch_present = present
         self._semantic_common = aligned_common
         self._semantic_masks = aligned_masks
         self._semantic_flows = flows
-        if self.training and self.semantic_detect is not None:
-            for m, name in enumerate(MODES):
-                branch_features = [self.semantic_adapters[s](aligned_common[s][m]) for s in SCALES]
-                self.semantic_branch_predictions[name] = self.semantic_detect(branch_features, branch_features)
         self._last_register_state = state.detach()
         layers = self.backbone.model
         p5 = fused["p5"]
@@ -295,6 +289,18 @@ class IndependentMMYOLO(nn.Module):
         loc = [x+self.loc_gain[i].sigmoid()*self.localization[i](geometry[s]) for i,(s,x) in enumerate(zip(SCALES,features))]
         return self.model[-1](features,loc)
 
+    def semantic_branch_prediction(self, name):
+        """Run the shared training-only detector on ONE modality's common evidence.
+
+        Three simultaneous auxiliary assigners plus the main detector exceeded
+        23.5 GB at batch=4 / 736x1280 on a 4090, so the caller rotates modalities
+        instead: every branch still receives identical long-run supervision.
+        """
+        if not self.training or self.semantic_detect is None or self._semantic_common is None:
+            return None
+        m = MODES.index(name)
+        feats = [self.semantic_adapters[s](self._semantic_common[s][m]) for s in SCALES]
+        return self.semantic_detect(feats, feats)
     @staticmethod
     def _object_vectors(feature, valid, targets, grid_size=3):
         """Differentiable object-region pooling in normalized canvas coordinates."""

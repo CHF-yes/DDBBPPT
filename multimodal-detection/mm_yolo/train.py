@@ -1113,22 +1113,29 @@ def main():
                     loss = loss + (args.flow_supervision_weight * semantic["flow"] +
                                    args.cross_modal_nce_weight * semantic["nce"]) * (
                                        rgb.shape[0] / nominal_samples)
+                    # 显存修复：每步只跑一个辅助检测支路（原来的三支路同时在图上，
+                    # 在 736x1280 / batch=4 时峰值 22.4G 并在第 2 轮 OOM）。按
+                    # (epoch+batch) 轮换 rgb->ir->dep，单支路权重不再除以 3，因此
+                    # 每步平均辅助梯度量级与原设计一致，只是三条支路轮流受监督。
                     branch_total = loss.new_zeros(())
+                    branch_names = ("rgb", "ir", "dep")
                     branch_count = 0
-                    for mi, name in enumerate(("rgb", "ir", "dep")):
-                        if name not in model.semantic_branch_predictions:
-                            continue
+                    for off in range(len(branch_names)):
+                        name = branch_names[(ep + bi + off) % len(branch_names)]
+                        mi = branch_names.index(name)
                         active = model.semantic_branch_present[:, mi]
                         if not active.any():
                             continue
-                        branch_preds, branch_targets = subset_detection_batch(
-                            model.semantic_branch_predictions[name], tgt, active)
+                        branch_aux = model.semantic_branch_prediction(name)
+                        if branch_aux is None:
+                            continue
+                        branch_preds, branch_targets = subset_detection_batch(branch_aux, tgt, active)
                         branch_vec, _ = crit(branch_preds, branch_targets)
-                        branch_total = branch_total + branch_vec.sum()
-                        branch_count += 1
+                        branch_total = branch_vec.sum()
+                        branch_count = 1
+                        break
                     if branch_count:
-                        loss = loss + args.branch_aux_weight * branch_total / (
-                            nominal_samples * branch_count)
+                        loss = loss + args.branch_aux_weight * branch_total / nominal_samples
                     else:
                         branch_total = loss.new_zeros(())
             if not torch.isfinite(loss.detach()):

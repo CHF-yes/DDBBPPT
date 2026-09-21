@@ -151,7 +151,7 @@ class IndependentV3Tests(unittest.TestCase):
             targets, torch.tensor([[4.,0.],[0.,-4.]]), torch.ones(2))
         self.assertTrue(torch.isfinite(semantic["flow"]) and torch.isfinite(semantic["nce"]))
         active = m.semantic_branch_present[:,1]
-        pred,tgt = subset_detection_batch(m.semantic_branch_predictions["ir"],targets,active)
+        pred,tgt = subset_detection_batch(m.semantic_branch_prediction("ir"),targets,active)
         branch,_ = v8DetectionLoss(m)(pred,tgt)
         total = out["scores"].sum()*0 + branch.sum()/2 + semantic["flow"] + semantic["nce"]
         total.backward()
