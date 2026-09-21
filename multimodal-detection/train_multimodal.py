@@ -43,6 +43,7 @@ def main():
         "match_floor": 0.0,
         "branch_aux_weights": [],
         "val_every": 1,
+        "bn_policy": "adaptive_no_tail",
         "run_full_refit": True,
     }.items():
         cfg.setdefault(key, value)
@@ -65,10 +66,10 @@ def main():
               "--out",str(run),"--modalities","all","--share-tier","a","--depth-channels","4",
               "--depth-resampling","nearest_valid_v2","--metric-branch","--register-bus",
               "--depth-scales","all","--sampler","coverage","--rare-extra-frac","0.10",
-              "--bn-policy","adaptive_no_tail","--memory-control","bounded_v2","--no-prior",
+              "--memory-control","bounded_v2","--no-prior",
               "--no-deformable","--val-batch","1","--val-conf","0.001","--save-every","1"]
     keys = ("architecture","imgsz","epochs","batch","accum","workers","precision","lr","backbone_lr_mult",
-            "freeze_epochs","warmup","lrf","grad_clip","calibrate_clip_steps","mosaic","close_aug_frac",
+            "freeze_epochs","warmup","lrf","grad_clip","calibrate_clip_steps","bn_policy","mosaic","close_aug_frac",
             "scale_min","scale_max","translate","target_crop_p","misalign_px","degrade_p","rgb_color_p",
             "ir_noise_p","ir_gain_p","depth_hole_p","rgb_dropout","aux_dropout","dropout_start_epoch",
             "branch_aux_weight","flow_supervision_weight","cross_modal_nce_weight","nce_temperature",
