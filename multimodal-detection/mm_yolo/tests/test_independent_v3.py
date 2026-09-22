@@ -228,7 +228,6 @@ class IndependentV3Tests(unittest.TestCase):
         new_cfg.fusion.p2_match_refine = True
         new = MMYOLO(new_cfg).train()
         state = dict(old.state_dict())
-        state.pop("metric_gain_logit", None)  # emulate a real V4.4 checkpoint
         migrated, changed = adapt_depth_checkpoint_state(state, new)
         self.assertTrue(changed)
         new.load_state_dict(migrated, strict=True)

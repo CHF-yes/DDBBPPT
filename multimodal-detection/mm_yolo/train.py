@@ -511,7 +511,7 @@ def build_optimizer(model: MMYOLO, lr: float, backbone_mult: float, wd: float = 
         add("anchor", model.backbone.model[:11])
         add("aux_encoder", getattr(model, "aux_encoders", None))
         add("aux_encoder", getattr(model, "metric_encoder", None))
-        if "fusion" in role_ids and hasattr(model, "metric_gain_logit"):
+        if "fusion" in role_ids and getattr(model, "metric_gain_logit", None) is not None:
             role_ids["fusion"].add(id(model.metric_gain_logit))
         add("fusion", getattr(model, "matchers", None))
         add("fusion", getattr(model, "register_bus", None))

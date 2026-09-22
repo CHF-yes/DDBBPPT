@@ -150,9 +150,13 @@ class IndependentMMYOLO(nn.Module):
         # V4.4 used a fixed 0.1 metric residual.  A bounded learnable gain starts
         # at exactly the same value, so V4.4 checkpoints retain their function
         # while valid absolute distance can become more useful during fine-tune.
-        metric_initial = .1 / .5
-        self.metric_gain_logit = nn.Parameter(torch.full(
-            (len(SCALES),), math.log(metric_initial / (1 - metric_initial))))
+        if cfg.fusion.fusion_strategy == "v44_incremental_router_v1":
+            metric_initial = .1 / .5
+            self.metric_gain_logit = nn.Parameter(torch.full(
+                (len(SCALES),), math.log(metric_initial / (1 - metric_initial))))
+        else:
+            # Do not change the state_dict of legacy V4.4 checkpoints.
+            self.metric_gain_logit = None
         dim, md = cfg.fusion.spatial_dim, cfg.fusion.bus_dim
         self.embeddings = nn.ModuleDict({s: nn.ModuleList([EvidenceEmbedding(c, dim) for _ in MODES]) for s,c in self.channels.items()})
         for blocks in self.embeddings.values():
@@ -298,7 +302,8 @@ class IndependentMMYOLO(nn.Module):
                             depth[:,2:3], metric_valid), 1)
         for i, s in enumerate(SCALES):
             values, fraction = masked_pool(metric, metric_valid, raw[s].shape[-2:])
-            gain = .5 * self.metric_gain_logit[i].sigmoid()
+            gain = (.5 * self.metric_gain_logit[i].sigmoid()
+                    if self.metric_gain_logit is not None else raw[s].new_tensor(.1))
             raw[s] = raw[s] + gain*self.metric_encoder[s](values) * (fraction > 0)
         return raw, absolute, metric_valid
 
