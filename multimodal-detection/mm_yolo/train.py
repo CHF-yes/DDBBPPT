@@ -66,6 +66,10 @@ MEMORY_RECIPE = "coverage_spatial_memory_v1"
 
 def recipe_for(args):
     if getattr(args, "architecture", "") == "independent_p2_memory_v3":
+        if getattr(args, "train_stage", "standard") == "aux_independent":
+            return "independent_aux_detectors_v1"
+        if getattr(args, "train_stage", "standard") == "residual_fusion":
+            return "rgb_identity_residual_fusion_v1"
         if getattr(args, "train_stage", "standard") == "anchored_joint":
             return "independent_p2_anchored_joint_v1"
         if getattr(args, "alignment_mode", "legacy_gate_v1") == "identity_residual_v2":
@@ -111,6 +115,19 @@ def reset_fusion_gate_outputs(model):
                 nn.init.normal_(gate[-1].weight, std=.01)
                 nn.init.zeros_(gate[-1].bias)
                 reset += [f"fusion.{scale}.gates.{i}.2.weight", f"fusion.{scale}.gates.{i}.2.bias"]
+    return reset
+
+
+def reset_rgb_identity_residuals(model):
+    """Make the Stage-B hand-off exactly equal to the RGB spatial route."""
+    reset = []
+    with torch.no_grad():
+        for scale, block in model.fusion.items():
+            block.residual_scale.zero_()
+            reset.append(f"fusion.{scale}.residual_scale")
+        model.neck_memory.residual_scale.zero_()
+        model.localization_scale.zero_()
+        reset += ["neck_memory.residual_scale", "localization_scale"]
     return reset
 
 
@@ -217,6 +234,8 @@ def enable_trainable_defaults(model: MMYOLO) -> None:
     semantic = getattr(model, "semantic_detect", None)
     if semantic is not None:
         detectors.append(semantic)
+    for branch in getattr(model, "independent_aux", {}).values():
+        detectors.append(branch.detector)
     for detector in detectors:
         dfl = getattr(detector, "dfl", None)
         if dfl is not None:
@@ -256,6 +275,77 @@ def set_aux_adaptation_mode(model: MMYOLO) -> None:
             for module in list(block.gates[1:]) + list(block.outputs[1:]):
                 for p in module.parameters():
                     p.requires_grad_(True)
+
+
+def set_independent_aux_mode(model: MMYOLO) -> None:
+    """Stage A: train IR/Depth as real standalone detectors.
+
+    The RGB encoder, fused route, shared semantic head and memory are completely
+    frozen.  Direct GT detection losses update an auxiliary encoder and its own
+    full P2--P5 neck/head; the batch loop alternates IR and Depth to fit 24 GB.
+    """
+    for p in model.parameters():
+        p.requires_grad_(False)
+    for module in (getattr(model, "aux_encoders", None),
+                   getattr(model, "metric_encoder", None),
+                   getattr(model, "independent_aux", None)):
+        if module is not None:
+            for p in module.parameters():
+                p.requires_grad_(True)
+    for branch in getattr(model, "independent_aux", {}).values():
+        dfl = getattr(branch.detector, "dfl", None)
+        if dfl is not None:
+            dfl.requires_grad_(False)
+
+
+def set_residual_fusion_mode(model: MMYOLO, downstream_frozen: bool) -> None:
+    """Stage B: open zero-initialized IR/Depth residuals around a fixed RGB path.
+
+    During the initial fusion-only period even the independently trained
+    auxiliary encoders remain fixed.  Afterwards they and the high-resolution
+    downstream detector are released at their role-specific low learning rates.
+    The RGB encoder/query/embedding and RGB residual switch remain immutable.
+    """
+    for p in model.parameters():
+        p.requires_grad_(False)
+
+    def enable(module):
+        if module is not None:
+            for p in module.parameters():
+                p.requires_grad_(True)
+
+    # Learn how much reliable auxiliary evidence to inject.  Slot 0 (RGB) is
+    # deliberately excluded, keeping F_out == F_rgb at the hand-off.
+    if hasattr(model, "fusion"):
+        for block in model.fusion.values():
+            for module in list(block.gates[1:]) + list(block.outputs[1:]):
+                enable(module)
+            block.residual_scale.requires_grad_(True)
+    enable(getattr(model, "register_bus", None))
+    enable(getattr(model, "neck_memory", None))
+    enable(getattr(model, "semantic_adapters", None))
+    enable(getattr(model, "semantic_detect", None))
+
+    if not downstream_frozen:
+        enable(getattr(model, "aux_encoders", None))
+        enable(getattr(model, "metric_encoder", None))
+        enable(getattr(model, "matchers", None))
+        if hasattr(model, "embeddings"):
+            for blocks in model.embeddings.values():
+                for block in blocks[1:]:
+                    enable(block)
+        for name in ("p2_lateral", "p2_neck", "p2_down", "p3_refine", "localization"):
+            enable(getattr(model, name, None))
+        for name in ("neck_gain", "localization_scale"):
+            value = getattr(model, name, None)
+            if value is not None:
+                value.requires_grad_(True)
+        enable(model.backbone.model[11:])
+
+    for detector in (model.model[-1], getattr(model, "semantic_detect", None)):
+        dfl = getattr(detector, "dfl", None)
+        if dfl is not None:
+            dfl.requires_grad_(False)
 
 
 def set_anchored_joint_mode(model: MMYOLO, detector_frozen: bool) -> None:
@@ -383,7 +473,7 @@ def build_optimizer(model: MMYOLO, lr: float, backbone_mult: float, wd: float = 
                     add("fusion", module)
         for name in ("p2_lateral", "p2_neck", "p2_down", "p3_refine", "localization"):
             add("p2", getattr(model, name, None))
-        for name in ("neck_gain", "loc_gain"):
+        for name in ("neck_gain", "loc_gain", "localization_scale"):
             value = getattr(model, name, None)
             if value is not None and "p2" in role_ids:
                 role_ids["p2"].add(id(value))
@@ -395,6 +485,7 @@ def build_optimizer(model: MMYOLO, lr: float, backbone_mult: float, wd: float = 
         add("detector", model.backbone.model[11:])
         add("semantic", getattr(model, "semantic_adapters", None))
         add("semantic", getattr(model, "semantic_detect", None))
+        add("semantic", getattr(model, "independent_aux", None))
 
         # Resolve aliases/overlap by priority: the new P2 head must not inherit
         # the slower pretrained detector rate; the frozen anchor always wins.
@@ -635,16 +726,27 @@ def validate_checkpoint(ck: dict, model: MMYOLO, enabled, canvas, exact: bool = 
 
 
 def adapt_depth_checkpoint_state(state: dict, model: MMYOLO) -> tuple:
-    """仅迁移 Depth 输入适配器的 2ch↔4ch，其他结构差异仍由 strict load 拒绝。"""
+    """Explicit init-only migrations; all unrelated differences remain strict."""
+    out = dict(state)
+    migrated = False
+    target_state = model.state_dict()
+    # V4.3 adds training-only standalone IR/Depth detectors and exact-zero
+    # residual switches.  Old V4.2 checkpoints are the intended initialization
+    # source; initialize only these named additions from the freshly constructed
+    # COCO-derived modules, never silently accept arbitrary missing tensors.
+    for name, target in target_state.items():
+        is_new_switch = name.endswith(".residual_scale") or name == "localization_scale"
+        if name not in out and (name.startswith("independent_aux.") or is_new_switch):
+            out[name] = target.detach().clone()
+            migrated = True
     key = "dep_adapter.weight"
     if key not in state:
-        return state, False
-    old, target = state[key], model.state_dict()[key]
+        return out, migrated
+    old, target = state[key], target_state[key]
     if tuple(old.shape) == tuple(target.shape):
-        return state, False
+        return out, migrated
     if old.ndim != 4 or target.ndim != 4 or old.shape[0] != target.shape[0] or old.shape[2:] != target.shape[2:]:
         raise ValueError(f"{key} 无法迁移：{tuple(old.shape)} -> {tuple(target.shape)}")
-    out = dict(state)
     if old.shape[1] == 2 and target.shape[1] == 4:
         w = target.detach().clone().zero_()
         w[:, 0] = old[:, 0]       # relative -> relative
@@ -795,8 +897,9 @@ def main():
                          "旧 optfix_v3 权重精确续训须显式设为 10")
     ap.add_argument("--freeze-epochs", type=int, default=5, help="前 N 轮冻结编码器")
     ap.add_argument("--train-stage", default="standard",
-                    choices=["standard", "aux_adapt", "anchored_joint"],
-                    help="aux_adapt 仅适配辅助证据；anchored_joint 固定 RGB 语义锚点并分组微调")
+                    choices=["standard", "aux_adapt", "anchored_joint",
+                             "aux_independent", "residual_fusion"],
+                    help="aux_independent 独立预训 IR/Depth 检测器；residual_fusion 从严格 RGB 恒等映射融合")
     ap.add_argument("--fusion-tier", default="L2", choices=["L0", "L1", "L2", "L3"])
     ap.add_argument("--share-tier", default="c", choices=["a", "b", "c"])
     ap.add_argument("--register-bus", dest="register_bus", action="store_true", default=True,
@@ -927,8 +1030,9 @@ def main():
         raise ValueError("clip calibration requires a positive initial safety threshold")
     if args.architecture in ("spatial_memory_v1", "independent_p2_memory_v3") and args.sampler != "coverage":
         raise ValueError("new recipe requires --sampler coverage")
-    if args.train_stage in ("aux_adapt", "anchored_joint") and args.architecture != "independent_p2_memory_v3":
-        raise ValueError("aux_adapt/anchored_joint 仅支持 independent_p2_memory_v3")
+    if args.train_stage in ("aux_adapt", "anchored_joint", "aux_independent",
+                            "residual_fusion") and args.architecture != "independent_p2_memory_v3":
+        raise ValueError("multimodal staged policies 仅支持 independent_p2_memory_v3")
     if args.alignment_mode == "identity_residual_v2" and args.match_floor != 0:
         raise ValueError("identity_residual_v2 不使用 match-floor；请保持 0")
     if args.batch < 1 or args.accum < 1 or args.epochs < 1 or args.save_every < 1:
@@ -1165,7 +1269,7 @@ def main():
     effective_batch = args.batch * args.accum
     scaled_wd = args.weight_decay * effective_batch / args.nominal_batch
     role_mults = None
-    if args.train_stage == "anchored_joint":
+    if args.train_stage in ("anchored_joint", "residual_fusion"):
         role_mults = {"anchor": 0.0,
                       "aux_encoder": args.backbone_lr_mult,
                       "fusion": args.fusion_lr_mult,
@@ -1199,6 +1303,9 @@ def main():
         if args.reset_fusion_gates:
             reset_keys = reset_fusion_gate_outputs(model)
             log(f"[train] v2 迁移：仅重置 {len(reset_keys)} 个门控末层参数张量；其余权重严格迁移")
+        if args.train_stage == "residual_fusion":
+            reset_keys = reset_rgb_identity_residuals(model)
+            log(f"[train] Stage B RGB 恒等起点：重置 {reset_keys}")
         if args.resume:
             start_ep = int(ck["epoch"])
             if start_ep > args.epochs:
@@ -1207,7 +1314,7 @@ def main():
             log(f"[train] 严格续训：{source} epoch={start_ep} best={best0:.4f}")
         else:
             log(f"[train] 仅初始化模型：{source}；optimizer/EMA/RNG 从新实验开始"
-                + (" | Depth adapter 已从 B1 2ch 迁移到 B2 4ch" if migrated else ""))
+                + (" | 已显式初始化 V4.3 新增训练模块/输入适配" if migrated else ""))
 
     ema = ModelEMA(model)
     ema.enabled = True
@@ -1269,15 +1376,52 @@ def main():
                                                 "loader": g.get_state()},
                                         "args": vars(args), "clip_state": clip_state})
 
+    def _evaluate_for_stage(eval_model):
+        """Use standalone IR/Depth AP to select Stage A; fused AP elsewhere."""
+        from eval import evaluate_model
+        if args.train_stage != "aux_independent":
+            return evaluate_model(eval_model, Path(args.root), va_eval,
+                                  imgsz=imgsz, device=dev, modalities=args.modalities,
+                                  conf=args.val_conf, slices=False,
+                                  batch_size=args.val_batch)
+        branches = {}
+        try:
+            for branch in ("ir", "dep"):
+                eval_model.auxiliary_eval_branch = branch
+                branches[branch] = evaluate_model(
+                    eval_model, Path(args.root), va_eval, imgsz=imgsz,
+                    device=dev, modalities="all", conf=args.val_conf,
+                    slices=False, batch_size=args.val_batch)
+        finally:
+            eval_model.auxiliary_eval_branch = None
+        keys = range(int(eval_model.nc))
+        combined = {
+            "map50_95": sum(v["map50_95"] for v in branches.values()) / 2,
+            "map50": sum(v["map50"] for v in branches.values()) / 2,
+            "per_class_95": {k: sum(v["per_class_95"][k] for v in branches.values()) / 2
+                             for k in keys},
+            "per_class_50": {k: sum(v["per_class_50"][k] for v in branches.values()) / 2
+                             for k in keys},
+            "n_valid_classes": min(v["n_valid_classes"] for v in branches.values()),
+            "missing_classes": sorted(set().union(
+                *(v["missing_classes"] for v in branches.values()))),
+            "n_images": len(va_eval), "canvas": list(canvas),
+            "modalities": "independent_ir_depth",
+            "selection": "mean_ir_depth_map50_95",
+            "branches": branches,
+        }
+        return combined
+
     best = best0
     if args.eval_initial and not args.resume:
-        from eval import evaluate_model
         log("[train] 开始 ep0 迁移起点验证（未做任何梯度更新）")
-        initial = evaluate_model(ema.ema, Path(args.root), va_eval,
-                                 imgsz=imgsz, device=dev, modalities=args.modalities,
-                                 conf=args.val_conf, slices=False, batch_size=args.val_batch)
+        initial = _evaluate_for_stage(ema.ema)
         best = float(initial["map50_95"])
         _save(out_dir / "weights" / "best.pt", 0, best)
+        (out_dir / "val_best.json").write_text(json.dumps(
+            initial, ensure_ascii=False, indent=2,
+            default=lambda x: x.tolist() if hasattr(x, "tolist") else str(x)),
+            encoding="utf-8")
         log(f"[train] ep 0/{args.epochs} initial val mAP50-95={best:.4f} "
             f"mAP50={initial['map50']:.4f}（已保存 best.pt）")
         if dev.type == "cuda":
@@ -1289,7 +1433,12 @@ def main():
     for ep in range(start_ep, args.epochs):
         t_ep = time.time()
         frozen = ep < args.freeze_epochs
-        if args.train_stage == "aux_adapt":
+        if args.train_stage == "aux_independent":
+            set_independent_aux_mode(model)
+            frozen = True
+        elif args.train_stage == "residual_fusion":
+            set_residual_fusion_mode(model, downstream_frozen=frozen)
+        elif args.train_stage == "aux_adapt":
             set_aux_adaptation_mode(model)
             frozen = True
         elif args.train_stage == "anchored_joint":
@@ -1310,7 +1459,8 @@ def main():
             if ep == 0:
                 log(f"[train] freeze-bn：冻结 {nb} 个 BN；新建 BN "
                     f"{'也冻结' if args.freeze_new_bn else '仍训练'}")
-        if args.train_stage in ("aux_adapt", "anchored_joint"):
+        if args.train_stage in ("aux_adapt", "anchored_joint", "aux_independent",
+                                "residual_fusion"):
             set_frozen_bn_eval(model)
         if ep == start_ep:
             trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -1434,11 +1584,31 @@ def main():
                      else batch["prior"].to(dev, non_blocking=non_blocking))
             tgt = make_targets(batch, canvas, dev)
             with torch.autocast("cuda", enabled=bool(args.amp) and dev.type == "cuda", dtype=amp_dtype):
-                preds = model(rgb, ir, dep, quality=qual, prior=prior, keep=keep)
-                # 本版 ultralytics 的 v8DetectionLoss 返回 (loss*bs 的三分量向量, 分量字典)
-                loss_vec, loss_items = crit(preds, tgt)
-                loss = accumulation_loss(loss_vec, nominal_samples)
-                if args.architecture == "independent_p2_memory_v3":
+                zero = rgb.new_zeros((), dtype=torch.float32)
+                embedding_aux = {"reconstruction": zero, "alignment": zero}
+                semantic = {"flow": zero, "nce": zero}
+                branch_total, branch_count = zero, 0
+                if args.train_stage == "aux_independent":
+                    # Alternate two full standalone detectors.  No RGB feature,
+                    # fusion tensor or main detector participates in this loss.
+                    names = ("ir", "dep")
+                    name = names[(ep + bi) % len(names)]
+                    branch_aux, active = model.independent_branch_prediction(
+                        name, ir=ir, depth=dep, keep=keep)
+                    if not active.any():
+                        raise RuntimeError(f"Stage A batch has no valid {name} samples")
+                    branch_preds, branch_targets = subset_detection_batch(
+                        branch_aux, tgt, active)
+                    loss_vec, loss_items = crit(branch_preds, branch_targets)
+                    branch_total, branch_count = loss_vec.sum(), 1
+                    loss = aux_w[name] * accumulation_loss(loss_vec, nominal_samples)
+                else:
+                    preds = model(rgb, ir, dep, quality=qual, prior=prior, keep=keep)
+                    # 本版 ultralytics 的 v8DetectionLoss 返回 (loss*bs 的三分量向量, 分量字典)
+                    loss_vec, loss_items = crit(preds, tgt)
+                    loss = accumulation_loss(loss_vec, nominal_samples)
+                if (args.architecture == "independent_p2_memory_v3" and
+                        args.train_stage != "aux_independent"):
                     embedding_aux = model.embedding_aux_losses
                     loss = loss + (recon_weight * embedding_aux["reconstruction"] +
                                    embedding_alignment_weight * embedding_aux["alignment"]) * (
@@ -1455,9 +1625,7 @@ def main():
                     # 在 736x1280 / batch=4 时峰值 22.4G 并在第 2 轮 OOM）。按
                     # (epoch+batch) 轮换 rgb->ir->dep，单支路权重不再除以 3，因此
                     # 每步平均辅助梯度量级与原设计一致，只是三条支路轮流受监督。
-                    branch_total = loss.new_zeros(())
                     branch_names = ("rgb", "ir", "dep")
-                    branch_count = 0
                     for off in range(len(branch_names)):
                         name = branch_names[(ep + bi + off) % len(branch_names)]
                         if aux_w[name] <= 0:
@@ -1484,7 +1652,8 @@ def main():
                     f"样本={stems}；立即停止，不保存污染 checkpoint")
                 raise FloatingPointError(f"non-finite loss at ep={ep+1} batch={bi}")
             scaler.scale(loss).backward()
-            if model.spatial_memory and args.memory_control == "bounded_v2":
+            if (model.spatial_memory and args.memory_control == "bounded_v2" and
+                    args.train_stage != "aux_independent"):
                 health_n += 1
                 for scale, block in model.fusion.items():
                     measurements = dict(block.last_health)
@@ -1562,10 +1731,7 @@ def main():
             log(f"[train] fusion last-batch [match_conf, injection_gate]={fusion_stats}")
         if args.val_every and ((ep + 1) % args.val_every == 0 or ep == args.epochs - 1):
             try:
-                from eval import evaluate_model                # 延迟导入避免循环
-                res = evaluate_model(ema.ema, Path(args.root), va_eval,
-                                     imgsz=imgsz, device=dev, modalities=args.modalities,
-                                     conf=args.val_conf, slices=False, batch_size=args.val_batch)
+                res = _evaluate_for_stage(ema.ema)
                 (out_dir / "val_latest.json").write_text(json.dumps(res, ensure_ascii=False, indent=2,
                     default=lambda x: x.tolist() if hasattr(x, "tolist") else str(x)), encoding="utf-8")
                 msg += f" | val mAP50-95={res['map50_95']:.4f} mAP50={res['map50']:.4f}"

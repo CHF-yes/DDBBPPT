@@ -119,6 +119,12 @@ class ComplementaryFusion(nn.Module):
         self.gates = nn.ModuleList([nn.Sequential(nn.Conv2d(dim*3+6, dim, 1), nn.SiLU(), nn.Conv2d(dim, 2, 1)) for _ in range(3)])
         self.outputs = nn.ModuleList([nn.Conv2d(dim*2, channels, 1, bias=False) for _ in range(3)])
         self.gain = nn.Parameter(torch.full((3,), math.log(.05/.95)))
+        # A separate zero-centred switch gives Stage B an *exact* RGB identity
+        # at initialization while retaining a healthy derivative at zero.  The
+        # old sigmoid gain cannot do both: a very negative logit is almost zero
+        # but also has an almost-zero gradient.  RGB remains the immutable
+        # anchor (slot 0); only IR/Depth switches are released by the trainer.
+        self.residual_scale = nn.Parameter(torch.zeros(3))
         self.last_stats, self.last_health = {}, {}
 
     def forward(self, raw, common, private, valid, match, reliable, memory, quality=None):
@@ -145,11 +151,14 @@ class ComplementaryFusion(nn.Module):
                 # Keep a random branch from overwhelming the pretrained spatial signal.
                 bound = state.detach().float().square().mean(1, keepdim=True).sqrt().clamp_min(.1)
                 residual = residual / torch.sqrt(1 + residual.float().square().mean(1, keepdim=True)/bound.square()).to(residual.dtype)
-                update = update + self.gain[m].sigmoid() * residual
+                coefficient = (self.residual_scale[m] * 0 if m == 0 else
+                               .25 * self.residual_scale[m].tanh())
+                update = update + coefficient * residual
                 stats[str(m)] = torch.stack((match[m].detach().mean(), ((gc+gu)/2).detach().mean()))
             state = state + update / self.rounds
         self.last_stats = stats
         self.last_health = {"context_rms": context.detach().square().mean().sqrt()}
         for m in range(3):
             self.last_health[f"{m}_reliable"] = reliable[m].detach().float().mean()
+            self.last_health[f"{m}_residual_scale"] = (.25 * self.residual_scale[m].detach().tanh())
         return state

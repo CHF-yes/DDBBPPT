@@ -132,7 +132,7 @@ def main():
                 cmd += ["--init-checkpoint",str(Path(a.init_checkpoint).resolve())]
             else:
                 source = run/"stage_a"/"weights"/"best.pt"
-                if not source.is_file():
+                if not a.dry_run and not source.is_file():
                     raise FileNotFoundError(f"Stage B 缺少 Stage A best.pt: {source}")
                 cmd += ["--init-checkpoint",str(source)]
             if a.dry_run:

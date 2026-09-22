@@ -192,6 +192,9 @@ class NeckMemoryRead(nn.Module):
         self.attention = nn.MultiheadAttention(dim, heads, batch_first=True)
         self.out = nn.Conv2d(dim, channels, 1, bias=False)
         self.gain = nn.Parameter(torch.tensor(math.log(.02/.98)))
+        # Exact-zero identity switch for the Stage-B hand-off.  As with the
+        # spatial residuals, tanh has a non-vanishing derivative at zero.
+        self.residual_scale = nn.Parameter(torch.zeros(()))
 
     def forward(self, x, memory, present):
         b, _, h, w = x.shape
@@ -199,4 +202,5 @@ class NeckMemoryRead(nn.Module):
         valid = torch.cat((present.bool(), present.any(1, keepdim=True)), 1).repeat_interleave(memory.shape[2], 1)
         read = safe_read(self.attention, self.norm(self.query(x).flatten(2).transpose(1, 2)),
                          self.norm(tokens), valid)
-        return x + self.gain.sigmoid() * self.out(read.transpose(1, 2).reshape(b, -1, h, w))
+        return x + .10 * self.residual_scale.tanh() * self.out(
+            read.transpose(1, 2).reshape(b, -1, h, w))

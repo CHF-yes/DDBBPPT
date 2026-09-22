@@ -672,7 +672,25 @@ def load_mm_checkpoint(path, strict: bool = True, device=None, **overrides) -> t
     struct.update(overrides)
     cfg = MMConfig.from_structure(struct)
     model = MMYOLO(cfg)
-    missing, unexpected = model.load_state_dict(ck["model_state"], strict=False)
+    state = dict(ck["model_state"])
+    target_state = model.state_dict()
+    # V4.3 adds training-only standalone heads plus zero-centred residual
+    # switches.  They do not exist in older checkpoints.  Generic evaluation of
+    # a V4.2 checkpoint must preserve its old ~5% spatial and ~2% memory
+    # residuals, whereas the new Stage-B trainer explicitly resets these values
+    # to zero before optimization.
+    for name, target in target_state.items():
+        if name in state:
+            continue
+        if name.startswith("independent_aux."):
+            state[name] = target.detach().clone()
+        elif name.startswith("fusion.") and name.endswith(".residual_scale"):
+            state[name] = target.detach().clone().fill_(math.atanh(.20))
+        elif name == "neck_memory.residual_scale":
+            state[name] = target.detach().clone().fill_(math.atanh(.20))
+        elif name == "localization_scale":
+            state[name] = target.detach().clone().fill_(math.atanh(1/3))
+    missing, unexpected = model.load_state_dict(state, strict=False)
     if strict and (missing or unexpected):
         raise RuntimeError(f"结构不匹配：missing={len(missing)} unexpected={len(unexpected)}\n"
                            f"  missing[:8]={missing[:8]}\n  unexpected[:8]={unexpected[:8]}")

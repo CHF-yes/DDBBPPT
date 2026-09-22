@@ -68,6 +68,49 @@ class SpatialDetect(Detect):
         return y if self.export else (y, preds)
 
 
+class IndependentBranchDetector(nn.Module):
+    """Training-only full P2--P5 detector for one auxiliary modality.
+
+    A shallow projection into the fused head can report a loss without proving
+    that the auxiliary encoder can actually detect objects.  Each auxiliary
+    branch therefore receives its own COCO-initialized neck and detector.  Only
+    one branch is executed per optimizer step, so the additional parameters do
+    not duplicate high-resolution activations on a 24 GB GPU.  These modules are
+    omitted from the deployment path; they are supervision, not detector voting.
+    """
+    def __init__(self, source_layers, channels, neck_channels, detector):
+        super().__init__()
+        p2_ch = neck_channels[0]
+        self.p4_top_down = copy.deepcopy(source_layers[13])
+        self.p3_top_down = copy.deepcopy(source_layers[16])
+        self.p3_down = copy.deepcopy(source_layers[17])
+        self.p4_bottom_up = copy.deepcopy(source_layers[19])
+        self.p4_down = copy.deepcopy(source_layers[20])
+        self.p5_bottom_up = copy.deepcopy(source_layers[22])
+        self.p2_lateral = Conv(channels["p2"], p2_ch, 1)
+        self.p2_neck = C3k2(neck_channels[1] + p2_ch, p2_ch, n=2)
+        self.p2_down = Conv(p2_ch, neck_channels[1], 3, 2)
+        self.p3_refine = C3k2(neck_channels[1] * 2, neck_channels[1], n=2)
+        self.neck_gain = nn.Parameter(torch.tensor(.05))
+        self.detector = copy.deepcopy(detector)
+
+    def forward(self, evidence):
+        p5_raw = evidence["p5"]
+        p4_td = self.p4_top_down(torch.cat((
+            F.interpolate(p5_raw, scale_factor=2, mode="nearest"), evidence["p4"]), 1))
+        p3_td = self.p3_top_down(torch.cat((
+            F.interpolate(p4_td, scale_factor=2, mode="nearest"), evidence["p3"]), 1))
+        p2 = self.p2_neck(torch.cat((
+            F.interpolate(p3_td, scale_factor=2, mode="nearest"),
+            self.p2_lateral(evidence["p2"])), 1))
+        p3 = p3_td + self.neck_gain.tanh() * self.p3_refine(
+            torch.cat((self.p2_down(p2), p3_td), 1))
+        p4 = self.p4_bottom_up(torch.cat((self.p3_down(p3), p4_td), 1))
+        p5 = self.p5_bottom_up(torch.cat((self.p4_down(p4), p5_raw), 1))
+        features = [p2, p3, p4, p5]
+        return self.detector(features, features)
+
+
 class IndependentMMYOLO(nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -144,9 +187,20 @@ class IndependentMMYOLO(nn.Module):
                 s: Conv(dim, c, 1) for s, c in zip(SCALES, self.neck_channels)
             })
             self.semantic_detect = copy.deepcopy(det)
+        # Stage A uses two genuinely independent training-only detectors.  They
+        # consume each encoder's raw pyramid, not fused/common features.
+        self.independent_aux = nn.ModuleDict()
+        if (cfg.fusion.branch_aux_weight > 0 or
+                any(float(v) > 0 for v in cfg.fusion.branch_aux_weights)):
+            self.independent_aux = nn.ModuleDict({
+                m: IndependentBranchDetector(self.backbone.model, self.channels,
+                                             self.neck_channels, det)
+                for m in ("ir", "dep")
+            })
         self.neck_memory = NeckMemoryRead(p2_ch, md, cfg.fusion.heads)
         self.localization = nn.ModuleList([Conv(self.channels[s], c, 1) for s,c in zip(SCALES,self.neck_channels)])
         self.loc_gain = nn.Parameter(torch.full((4,), math.log(.05/.95)))
+        self.localization_scale = nn.Parameter(torch.zeros(4))
         self.modality_off = set()
         self.spatial_memory = True
         self.share_tier = "a"
@@ -159,6 +213,7 @@ class IndependentMMYOLO(nn.Module):
         self._semantic_masks = None
         self._semantic_flows = None
         self.last_semantic_losses = {}
+        self.auxiliary_eval_branch = None
         self.embedding_aux_losses = {"reconstruction": torch.tensor(0.),
                                      "alignment": torch.tensor(0.)}
         self.train()
@@ -203,7 +258,41 @@ class IndependentMMYOLO(nn.Module):
                 result[SCALES[INDICES.index(i)]] = y.new_zeros(b,*y.shape[1:]).index_copy(0,active,y)
         return result
 
+    def _add_depth_metric(self, raw, depth, present):
+        """Inject valid metric distance without interpolating invalid pixels."""
+        metric_valid = depth[:,2:3] * depth[:,3:4] * present[:,None,None,None]
+        absolute = depth[:,1:2] * metric_valid
+        metric = torch.cat((absolute,
+                            torch.log1p(20*absolute.float())/math.log(21),
+                            depth[:,2:3], metric_valid), 1)
+        for s in SCALES:
+            values, fraction = masked_pool(metric, metric_valid, raw[s].shape[-2:])
+            raw[s] = raw[s] + .1*self.metric_encoder[s](values) * (fraction > 0)
+        return raw, absolute, metric_valid
+
+    def independent_branch_prediction(self, name, ir=None, depth=None, keep=None):
+        """Predict from one auxiliary sensor with no RGB/fusion information."""
+        if name not in self.independent_aux:
+            raise ValueError(f"independent auxiliary detector is unavailable: {name}")
+        source = ir if name == "ir" else depth
+        if source is None:
+            raise ValueError(f"{name} input is required")
+        b = source.shape[0]
+        present = torch.as_tensor(
+            (keep or {}).get(name, torch.ones(b, device=source.device)),
+            device=source.device).reshape(b).bool()
+        if name == "dep":
+            present &= depth[:,2].flatten(1).any(1)
+            raw = self._encode(depth[:,:1], "dep", present)
+            raw, _, _ = self._add_depth_metric(raw, depth, present)
+        else:
+            raw = self._encode(ir, "ir", present)
+        return self.independent_aux[name](raw), present
+
     def forward(self, rgb, ir=None, depth=None, quality=None, prior=None, keep=None):
+        if self.auxiliary_eval_branch is not None:
+            return self.independent_branch_prediction(
+                self.auxiliary_eval_branch, ir=ir, depth=depth, keep=keep)[0]
         b, _, h, w = rgb.shape
         if h % 32 or w % 32:
             raise ValueError("v3 rectangular canvas height/width must both be multiples of 32")
@@ -218,12 +307,7 @@ class IndependentMMYOLO(nn.Module):
         depth = rgb.new_zeros(b,4,h,w) if depth is None else depth
         raw = [self._encode(rgb,"rgb",present[:,0]), self._encode(ir,"ir",present[:,1]),
                self._encode(depth[:,:1],"dep",present[:,2])]
-        metric_valid = depth[:,2:3] * depth[:,3:4] * present[:,2,None,None,None]
-        absolute = depth[:,1:2] * metric_valid
-        metric = torch.cat((absolute,torch.log1p(20*absolute.float())/math.log(21), depth[:,2:3],metric_valid),1)
-        for s in SCALES:
-            values, fraction = masked_pool(metric,metric_valid,raw[2][s].shape[-2:])
-            raw[2][s] = raw[2][s] + .1*self.metric_encoder[s](values) * (fraction>0)
+        raw[2], absolute, metric_valid = self._add_depth_metric(raw[2], depth, present[:,2])
         masks, commons, privates, reliabilities = {}, {}, {}, {}
         auxiliary = rgb.new_zeros((), dtype=torch.float32)
         # Depth validity and reliability are different concepts.  The hard mask
@@ -347,7 +431,8 @@ class IndependentMMYOLO(nn.Module):
         p4 = layers[19](torch.cat((layers[17](p3),p4_td),1))
         p5 = layers[22](torch.cat((layers[20](p4),fused["p5"]),1))
         features = [p2,p3,p4,p5]
-        loc = [x+self.loc_gain[i].sigmoid()*self.localization[i](geometry[s]) for i,(s,x) in enumerate(zip(SCALES,features))]
+        loc = [x + .15*self.localization_scale[i].tanh()*self.localization[i](geometry[s])
+               for i,(s,x) in enumerate(zip(SCALES,features))]
         return self.model[-1](features,loc)
 
     def semantic_branch_prediction(self, name):

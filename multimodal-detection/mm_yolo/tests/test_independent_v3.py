@@ -13,7 +13,8 @@ from config import default_config
 from model import MMYOLO, save_mm_checkpoint, load_mm_checkpoint
 from train import (build_optimizer, set_encoder_frozen, apply_bn_policy, make_targets,
                    subset_detection_batch, set_aux_adaptation_mode,
-                   set_anchored_joint_mode, enable_trainable_defaults)
+                   set_anchored_joint_mode, set_independent_aux_mode,
+                   set_residual_fusion_mode, enable_trainable_defaults)
 from data import MMDataset, AugCfg, collate, scheduled_aug
 from independent_fusion import (warp, resize_flow, identity_residual_align,
                                 LocalCorrespondence)
@@ -65,6 +66,11 @@ class IndependentV3Tests(unittest.TestCase):
 
     def test_real_loss_gradients_checkpoint_bn_and_p2(self):
         m = MMYOLO(config(checkpoint=True)).train()
+        with torch.no_grad():
+            for block in m.fusion.values():
+                block.residual_scale[1:].fill_(.2)
+            m.neck_memory.residual_scale.fill_(.2)
+            m.localization_scale.fill_(.2)
         rgb,ir,dep = self.inputs()
         before = int(m.aux_encoders["dep"][0].bn.num_batches_tracked)
         out = m(rgb,ir,dep)
@@ -193,6 +199,9 @@ class IndependentV3Tests(unittest.TestCase):
         c.fusion.alignment_mode = "identity_residual_v2"
         c.fusion.depth_reliability = "valid_support_v2"
         m = MMYOLO(c).train()
+        with torch.no_grad():
+            for block in m.fusion.values():
+                block.residual_scale[1:].fill_(.2)
         set_aux_adaptation_mode(m)
         rgb,ir,dep = self.inputs()
         out = m(rgb,ir,dep)
@@ -228,6 +237,48 @@ class IndependentV3Tests(unittest.TestCase):
         self.assertEqual(roles["anchor"], 0.)
         self.assertEqual(roles["fusion"], 1.)
         self.assertEqual(roles["detector"], .16)
+
+    def test_stage_a_uses_standalone_auxiliary_detectors(self):
+        c = config()
+        c.fusion.branch_aux_weights = (0., 1., 1.)
+        m = MMYOLO(c).train()
+        set_independent_aux_mode(m)
+        rgb, ir, dep = self.inputs()
+        pred, active = m.independent_branch_prediction("ir", ir=ir, depth=dep)
+        batch = {"boxes": [torch.tensor([[0., .5, .5, .2, .2]])] * 2}
+        targets = make_targets(batch, (64, 96), torch.device("cpu"))
+        sub_pred, sub_targets = subset_detection_batch(pred, targets, active)
+        loss, _ = v8DetectionLoss(m)(sub_pred, sub_targets)
+        loss.sum().backward()
+        self.assertFalse(any(p.grad is not None for p in m.backbone.parameters()))
+        self.assertTrue(any(p.grad is not None and p.grad.abs().sum() > 0
+                            for p in m.aux_encoders["ir"].parameters()))
+        self.assertTrue(any(p.grad is not None and p.grad.abs().sum() > 0
+                            for p in m.independent_aux["ir"].parameters()))
+        self.assertFalse(any(p.grad is not None
+                             for p in m.independent_aux["dep"].parameters()))
+
+    def test_stage_b_starts_as_exact_rgb_identity(self):
+        c = config()
+        c.fusion.branch_aux_weights = (0., .05, .035)
+        m = MMYOLO(c).eval()
+        rgb, ir, dep = self.inputs()
+        with torch.no_grad():
+            a = m(rgb, ir, dep)[0]
+            b = m(rgb, ir.flip(-1), dep.flip(-1))[0]
+        self.assertTrue(torch.equal(a, b))
+        m.train()
+        set_residual_fusion_mode(m, downstream_frozen=True)
+        self.assertFalse(any(p.requires_grad for p in m.aux_encoders.parameters()))
+        self.assertTrue(all(torch.equal(block.residual_scale.detach(),
+                                        torch.zeros_like(block.residual_scale))
+                            for block in m.fusion.values()))
+        self.assertTrue(all(block.residual_scale.requires_grad
+                            for block in m.fusion.values()))
+        self.assertFalse(any(p.requires_grad for p in m.backbone.model[11:].parameters()))
+        set_residual_fusion_mode(m, downstream_frozen=False)
+        self.assertTrue(any(p.requires_grad for p in m.aux_encoders.parameters()))
+        self.assertTrue(any(p.requires_grad for p in m.backbone.model[13].parameters()))
 
 
 if __name__ == "__main__":
