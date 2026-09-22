@@ -16,8 +16,9 @@ from ultralytics import YOLO
 from ultralytics.nn.modules import Conv, C3k2, Detect
 from ultralytics.cfg import DEFAULT_CFG
 from independent_fusion import (EvidenceEmbedding, LocalCorrespondence,
-                                ComplementaryFusion, identity_residual_align,
-                                warp, resize_flow)
+                                ComplementaryFusion, SpatialEvidenceRouter,
+                                CoarseAffineAligner, affine_flow,
+                                identity_residual_align, warp, resize_flow)
 from memory_fusion import CrossScaleMemory, NeckMemoryRead, masked_pool
 
 SCALES = ("p2", "p3", "p4", "p5")
@@ -154,6 +155,16 @@ class IndependentMMYOLO(nn.Module):
         matcher_scales = SCALES if cfg.fusion.p2_match_refine else ("p3", "p4", "p5")
         self.matchers = nn.ModuleDict({s: nn.ModuleList([LocalCorrespondence() for _ in range(2)]) for s in matcher_scales})
         self.fusion = nn.ModuleDict({s: ComplementaryFusion(c, dim, md) for s,c in self.channels.items()})
+        if cfg.fusion.fusion_strategy not in ("legacy_residual_v2", "evidence_router_v3"):
+            raise ValueError(f"unknown fusion strategy: {cfg.fusion.fusion_strategy}")
+        self.evidence_router = nn.ModuleDict()
+        if cfg.fusion.fusion_strategy == "evidence_router_v3":
+            self.evidence_router = nn.ModuleDict({
+                s: SpatialEvidenceRouter(c, dim, md, context_kernel=5 if s in ("p2", "p3") else 3)
+                for s, c in self.channels.items()
+            })
+        self.ir_coarse_aligner = (CoarseAffineAligner(dim)
+                                  if cfg.fusion.ir_coarse_align else None)
         self.register_bus = CrossScaleMemory(self.channels, dim=md, heads=cfg.fusion.heads,
                                              tokens_per_modality=cfg.fusion.memory_tokens_per_modality)
         old = self.backbone.model[-1]
@@ -199,6 +210,15 @@ class IndependentMMYOLO(nn.Module):
             })
         self.neck_memory = NeckMemoryRead(p2_ch, md, cfg.fusion.heads)
         self.localization = nn.ModuleList([Conv(self.channels[s], c, 1) for s,c in zip(SCALES,self.neck_channels)])
+        self.occlusion_context = nn.ModuleList()
+        if cfg.fusion.fusion_strategy == "evidence_router_v3":
+            for c in self.neck_channels[:2]:
+                block = nn.Sequential(
+                    nn.Conv2d(c, c, 7, padding=3, groups=c, bias=False),
+                    nn.GroupNorm(max(1, min(16, c // 8)), c), nn.SiLU(),
+                    nn.Conv2d(c, c, 1, bias=False))
+                nn.init.zeros_(block[-1].weight)
+                self.occlusion_context.append(block)
         self.loc_gain = nn.Parameter(torch.full((4,), math.log(.05/.95)))
         self.localization_scale = nn.Parameter(torch.zeros(4))
         self.modality_off = set()
@@ -213,6 +233,8 @@ class IndependentMMYOLO(nn.Module):
         self._semantic_masks = None
         self._semantic_flows = None
         self.last_semantic_losses = {}
+        self._ir_affine_prediction = None
+        self._ir_affine_confidence = None
         self.auxiliary_eval_branch = None
         self.embedding_aux_losses = {"reconstruction": torch.tensor(0.),
                                      "alignment": torch.tensor(0.)}
@@ -237,7 +259,9 @@ class IndependentMMYOLO(nn.Module):
         pretrained = n(self.backbone) - n(self.model[-1].cv2[0]) - n(self.model[-1].cv3[0]) + n(self.aux_encoders)
         return {"total": n(self), "pretrained": pretrained, "new": n(self)-pretrained,
                 "rgb_encoder": n(self.backbone.model[:11]), "ir_encoder": n(self.aux_encoders["ir"]),
-                "depth_encoder": n(self.aux_encoders["dep"]), "fusion": n(self.fusion)+n(self.embeddings),
+                "depth_encoder": n(self.aux_encoders["dep"]),
+                "fusion": n(self.fusion)+n(self.embeddings)+n(self.evidence_router) +
+                          (n(self.ir_coarse_aligner) if self.ir_coarse_aligner is not None else 0),
                 "register_bus": n(self.register_bus)}
 
     def _encode(self, x, modality, present):
@@ -331,6 +355,24 @@ class IndependentMMYOLO(nn.Module):
                 commons[s].append(c)
                 privates[s].append(u)
                 auxiliary = auxiliary + loss / 12
+        ir_affine_flow, ir_affine_conf = {}, None
+        if self.ir_coarse_aligner is not None:
+            raw_affine, ir_affine_conf = self.ir_coarse_aligner(
+                commons["p4"][0], commons["p4"][1], masks["p4"][0], masks["p4"][1])
+            max_angle = math.radians(float(self.cfg.fusion.ir_affine_max_degrees))
+            canvas_h, canvas_w = getattr(self, "infer_canvas", (h, w))
+            physical = torch.stack((
+                raw_affine[:, 0] * max_angle,
+                raw_affine[:, 1] * float(self.cfg.fusion.ir_affine_max_shift) / float(canvas_w),
+                raw_affine[:, 2] * float(self.cfg.fusion.ir_affine_max_shift) / float(canvas_h),
+                raw_affine[:, 3] * float(self.cfg.fusion.ir_affine_max_scale)), 1)
+            for s in SCALES:
+                ir_affine_flow[s] = affine_flow(physical, raw[0][s].shape[-2:])
+            self._ir_affine_prediction = raw_affine
+            self._ir_affine_confidence = ir_affine_conf
+        else:
+            self._ir_affine_prediction = None
+            self._ir_affine_confidence = None
         aligned, flows, confidence = {}, {}, {}
         previous = [None,None]
         for s in reversed(SCALES):
@@ -342,8 +384,23 @@ class IndependentMMYOLO(nn.Module):
                 # not because the pixels are geometrically unmatched.  Keep IR
                 # on the nominal identity grid; Depth retains residual matching
                 # because its invalid boundaries can shift local support.
-                if (m == 1 and
-                        self.cfg.fusion.alignment_mode == "identity_residual_v2"):
+                if (m == 1 and self.ir_coarse_aligner is not None):
+                    coarse = ir_affine_flow[s]
+                    coarse_conf = ir_affine_conf[:, :, None, None] * masks[s][m].float()
+                    # Only P2/P3 need local correction after the image-level
+                    # affine.  At coarse scales, a learned local warp is more
+                    # likely to confuse cross-modal appearance with geometry.
+                    if s in ("p2", "p3"):
+                        scene = (None if not quality or "scene_id" not in quality else
+                                 F.interpolate(quality["scene_id"].float(), shape, mode="nearest"))
+                        flow, conf = self.matchers[s][m-1](
+                            commons[s][0], commons[s][m], masks[s][0], masks[s][m],
+                            coarse, scene)
+                        conf = torch.maximum(conf, .25 * coarse_conf)
+                    else:
+                        flow, conf = coarse, coarse_conf
+                elif (m == 1 and
+                      self.cfg.fusion.alignment_mode == "identity_residual_v2"):
                     flow = raw[0][s].new_zeros(raw[0][s].shape[0], 2, *shape,
                                                 dtype=torch.float32)
                     conf = masks[s][m].float()
@@ -410,9 +467,12 @@ class IndependentMMYOLO(nn.Module):
                 similarity = (F.normalize(c[0].detach().float(),dim=1)*F.normalize(c[m].float(),dim=1)).sum(1,keepdim=True)
                 alignment_loss = alignment_loss + ((1-similarity)*weight).sum()/weight.sum().clamp_min(1)/8
             aligned_common[s], aligned_masks[s] = c, mask
-            fused[s] = self.fusion[s](values,c,u,mask,confidence[s],rel,state,qual)
-            self.fusion[s].last_health["ir_flow_rms"] = flows[s][0].detach().float().square().mean().sqrt()
-            self.fusion[s].last_health["dep_flow_rms"] = flows[s][1].detach().float().square().mean().sqrt()
+            fusion_block = (self.evidence_router[s]
+                            if self.cfg.fusion.fusion_strategy == "evidence_router_v3"
+                            else self.fusion[s])
+            fused[s] = fusion_block(values,c,u,mask,confidence[s],rel,state,qual)
+            fusion_block.last_health["ir_flow_rms"] = flows[s][0].detach().float().square().mean().sqrt()
+            fusion_block.last_health["dep_flow_rms"] = flows[s][1].detach().float().square().mean().sqrt()
             # values are already identity/residual aligned in V4.2, so match must
             # not suppress the high-resolution localization path a second time.
             if self.cfg.fusion.alignment_mode == "identity_residual_v2":
@@ -441,6 +501,9 @@ class IndependentMMYOLO(nn.Module):
         p4 = layers[19](torch.cat((layers[17](p3),p4_td),1))
         p5 = layers[22](torch.cat((layers[20](p4),fused["p5"]),1))
         features = [p2,p3,p4,p5]
+        if len(self.occlusion_context):
+            features[0] = features[0] + self.occlusion_context[0](features[0])
+            features[1] = features[1] + self.occlusion_context[1](features[1])
         loc = [x + .15*self.localization_scale[i].tanh()*self.localization[i](geometry[s])
                for i,(s,x) in enumerate(zip(SCALES,features))]
         return self.model[-1](features,loc)
@@ -479,10 +542,11 @@ class IndependentMMYOLO(nn.Module):
         vector = (values * weights).sum((2, 3)) / weights.sum((2, 3)).clamp_min(1e-4)
         return F.normalize(vector, dim=1), weights.mean((1, 2, 3)) >= min_observed
 
-    def semantic_regularization(self, targets, alignment_shift, alignment_supervised):
+    def semantic_regularization(self, targets, alignment_shift, alignment_supervised,
+                                ir_affine_target=None, ir_affine_supervised=None):
         """Return unweighted flow/NCE losses for the current forward pass."""
         zero = next(self.parameters()).new_zeros((), dtype=torch.float32)
-        result = {"flow": zero, "nce": zero}
+        result = {"flow": zero, "nce": zero, "ir_affine": zero}
         if not self.training or self._semantic_common is None:
             self.last_semantic_losses = {k: v.detach() for k, v in result.items()}
             return result
@@ -539,6 +603,22 @@ class IndependentMMYOLO(nn.Module):
                     terms.append((F.cross_entropy(logits, labels) +
                                   F.cross_entropy(logits.t(), labels)) * .5)
             result["nce"] = torch.stack(terms).mean() if terms else zero
+
+        if self.ir_coarse_aligner is not None and self._ir_affine_prediction is not None:
+            target = (torch.zeros_like(self._ir_affine_prediction) if ir_affine_target is None
+                      else ir_affine_target.float())
+            supervised = (target.new_zeros(target.shape[0]) if ir_affine_supervised is None
+                          else ir_affine_supervised.float().reshape(-1))
+            sample_weight = (supervised + (1 - supervised) *
+                             float(self.cfg.fusion.ir_affine_identity_weight))
+            error = F.smooth_l1_loss(
+                self._ir_affine_prediction.float(), target, reduction="none", beta=.10).mean(1)
+            affine_loss = (error * sample_weight).sum() / sample_weight.sum().clamp_min(1)
+            if supervised.any():
+                conf = self._ir_affine_confidence.float().reshape(-1).clamp_min(1e-5)
+                affine_loss = affine_loss + .02 * (
+                    -conf.log() * supervised).sum() / supervised.sum().clamp_min(1)
+            result["ir_affine"] = affine_loss
 
         self.last_semantic_losses = {k: v.detach() for k, v in result.items()}
         return result

@@ -32,6 +32,71 @@ def warp(x, flow):
     return out.to(x.dtype)
 
 
+def affine_flow(params, size):
+    """Convert a small canvas-normalized affine transform to feature flow.
+
+    ``params`` is ``[angle_radians, shift_x/W, shift_y/H, scale_delta]``.
+    The returned field follows :func:`warp`: every output point stores the
+    source-sampling displacement in feature pixels.  Rotation is around the
+    feature-map centre and follows OpenCV's image-coordinate convention.
+    """
+    b = params.shape[0]
+    h, w = int(size[0]), int(size[1])
+    angle, tx, ty, ds = params.float().unbind(1)
+    scale = (1.0 + ds).clamp(.90, 1.10)
+    ca, sa = angle.cos() * scale, angle.sin() * scale
+    yy, xx = torch.meshgrid(
+        torch.arange(h, device=params.device, dtype=torch.float32),
+        torch.arange(w, device=params.device, dtype=torch.float32), indexing="ij")
+    x = xx[None] - (w - 1) / 2.0
+    y = yy[None] - (h - 1) / 2.0
+    sx = ca[:, None, None] * x + sa[:, None, None] * y + tx[:, None, None] * w
+    sy = -sa[:, None, None] * x + ca[:, None, None] * y + ty[:, None, None] * h
+    return torch.stack((sx - x, sy - y), 1).reshape(b, 2, h, w)
+
+
+class CoarseAffineAligner(nn.Module):
+    """Predict a bounded per-image RGB/IR affine correction.
+
+    The final layer is exactly zero initialized, so adding this module to a
+    V4.4 checkpoint cannot move IR before it receives training signal.  Spatial
+    pooling retains enough layout to estimate rotation/translation; a plain
+    global vector cannot do that.
+    """
+    def __init__(self, dim):
+        super().__init__()
+        hidden = 32
+        self.features = nn.Sequential(
+            nn.Conv2d(dim * 4, hidden, 1, bias=False), nn.GroupNorm(8, hidden), nn.SiLU(),
+            nn.Conv2d(hidden, hidden, 3, padding=1, groups=hidden, bias=False),
+            nn.Conv2d(hidden, hidden, 1, bias=False), nn.GroupNorm(8, hidden), nn.SiLU())
+        self.head = nn.Sequential(nn.Linear(hidden * 4 * 8, 96), nn.SiLU(), nn.Linear(96, 5))
+        nn.init.zeros_(self.head[-1].weight)
+        nn.init.zeros_(self.head[-1].bias)
+        self.last_stats = {}
+
+    def forward(self, rgb, ir, rgb_valid, ir_valid):
+        mask = rgb_valid.float() * ir_valid.float()
+        r = F.normalize(rgb.float(), dim=1) * mask
+        i = F.normalize(ir.float(), dim=1) * mask
+        x = torch.cat((r, i, r - i, r * i), 1)
+        x = F.adaptive_avg_pool2d(self.features(x), (4, 8)).flatten(1)
+        out = self.head(x)
+        raw = out[:, :4].tanh()
+        confidence = out[:, 4:5].sigmoid()
+        accepted = raw * confidence
+        self.last_stats = {
+            "confidence": confidence.detach().mean(),
+            # The affine field is built from the full geometric prediction.
+            # Confidence is applied exactly once by identity_residual_align;
+            # logging the accepted motion remains useful for health checks.
+            "angle_norm": accepted[:, 0].detach().abs().mean(),
+            "shift_norm": accepted[:, 1:3].detach().square().sum(1).sqrt().mean(),
+            "scale_norm": accepted[:, 3].detach().abs().mean(),
+        }
+        return raw, confidence
+
+
 def identity_residual_align(x, flow, confidence, warped_valid=None):
     """Blend from the nominal sensor grid towards a residual warp.
 
@@ -161,4 +226,68 @@ class ComplementaryFusion(nn.Module):
         for m in range(3):
             self.last_health[f"{m}_reliable"] = reliable[m].detach().float().mean()
             self.last_health[f"{m}_residual_scale"] = (.25 * self.residual_scale[m].detach().tanh())
+        return state
+
+
+class SpatialEvidenceRouter(nn.Module):
+    """Route independently useful IR/Depth evidence into one RGB-anchored head.
+
+    This is deliberately not detector voting.  Auxiliary modalities produce
+    spatial evidence at every pyramid level, while one router and one YOLO head
+    remain responsible for the final prediction.  The two output projections
+    and the context projection start at zero, making the initial function an
+    exact RGB identity without imposing the old global 0.25 residual ceiling.
+    """
+    def __init__(self, channels, dim=64, memory_dim=128, context_kernel=3):
+        super().__init__()
+        hidden = max(32, min(96, channels // 2))
+        self.query = nn.Sequential(
+            nn.Conv2d(channels, dim, 1, bias=False), nn.GroupNorm(8, dim), nn.SiLU())
+        self.memory = nn.Linear(memory_dim, dim, bias=False)
+        self.gates = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(dim * 3 + 6, hidden, 1, bias=False), nn.GroupNorm(8, hidden), nn.SiLU(),
+                nn.Conv2d(hidden, channels, 1)) for _ in range(2)])
+        self.outputs = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(dim * 2, hidden, 1, bias=False), nn.GroupNorm(8, hidden), nn.SiLU(),
+                nn.Conv2d(hidden, channels, 1, bias=False)) for _ in range(2)])
+        for output in self.outputs:
+            nn.init.zeros_(output[-1].weight)
+        k = int(context_kernel)
+        self.context = nn.Sequential(
+            nn.Conv2d(channels, channels, k, padding=k // 2, groups=channels, bias=False),
+            nn.GroupNorm(max(1, min(16, channels // 8)), channels), nn.SiLU(),
+            nn.Conv2d(channels, channels, 1, bias=False))
+        nn.init.zeros_(self.context[-1].weight)
+        self.last_stats, self.last_health = {}, {}
+
+    def forward(self, raw, common, private, valid, match, reliable, memory,
+                quality=None, anchor=None):
+        state = raw[0] * valid[0] if anchor is None else anchor
+        mem = self.memory(F.layer_norm(
+            memory[:, 3].mean(1).float(), (memory.shape[-1],)))[:, :, None, None]
+        q = self.query(state) + .25 * mem.to(state.dtype)
+        updates, stats = [], {}
+        for slot, m in enumerate((1, 2)):
+            qual = (q.new_zeros(q.shape[0], 3, *q.shape[-2:])
+                    if quality is None or quality[m] is None else quality[m])
+            descriptor = torch.cat((q, common[m], private[m], valid[m],
+                                    match[m], reliable[m], qual), 1)
+            gate = self.gates[slot](descriptor).float().sigmoid().to(state.dtype)
+            evidence = self.outputs[slot](torch.cat((common[m], private[m]), 1).to(state.dtype))
+            update = evidence * gate * reliable[m].to(state.dtype) * valid[m].to(state.dtype)
+            updates.append(update)
+            stats[str(m)] = torch.stack((match[m].detach().mean(), gate.detach().mean()))
+        context = self.context(state)
+        state = state + context + sum(updates)
+        base_rms = raw[0].detach().float().square().mean().sqrt().clamp_min(1e-6)
+        self.last_stats = stats
+        self.last_health = {
+            "context_ratio": context.detach().float().square().mean().sqrt() / base_rms,
+            "ir_route_ratio": updates[0].detach().float().square().mean().sqrt() / base_rms,
+            "dep_route_ratio": updates[1].detach().float().square().mean().sqrt() / base_rms,
+            "1_reliable": reliable[1].detach().float().mean(),
+            "2_reliable": reliable[2].detach().float().mean(),
+        }
         return state

@@ -14,10 +14,13 @@ from model import MMYOLO, save_mm_checkpoint, load_mm_checkpoint
 from train import (build_optimizer, set_encoder_frozen, apply_bn_policy, make_targets,
                    subset_detection_batch, set_aux_adaptation_mode,
                    set_anchored_joint_mode, set_independent_aux_mode,
-                   set_residual_fusion_mode, enable_trainable_defaults)
-from data import MMDataset, AugCfg, collate, scheduled_aug
+                   set_residual_fusion_mode, enable_trainable_defaults,
+                   adapt_depth_checkpoint_state, reset_rgb_identity_residuals)
+from data import (MMDataset, AugCfg, collate, scheduled_aug, centered_affine_M,
+                  _target_occlusion)
 from independent_fusion import (warp, resize_flow, identity_residual_align,
-                                LocalCorrespondence)
+                                LocalCorrespondence, affine_flow,
+                                SpatialEvidenceRouter)
 from independent_model import depth_reliability_map
 from ultralytics.utils.loss import v8DetectionLoss
 
@@ -143,6 +146,113 @@ class IndependentV3Tests(unittest.TestCase):
         one = torch.ones_like(zero)
         self.assertTrue(torch.equal(identity_residual_align(x,flow,zero),x))
         self.assertTrue(torch.allclose(identity_residual_align(x,flow,one),warp(x,flow)))
+
+    def test_affine_flow_matches_opencv_source_to_destination_geometry(self):
+        h, w = 40, 64
+        source = np.zeros((h, w), np.float32)
+        source[11:20, 17:31] = 1
+        cases = ((0., 5., -3., 0.), (4., 0., 0., 0.), (0., 0., 0., .03))
+        for angle, dx, dy, ds in cases:
+            M = centered_affine_M((h, w), angle, 1 + ds, dx, dy)
+            distorted = cv2.warpAffine(source, M, (w, h), flags=cv2.INTER_LINEAR,
+                                       borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+            params = torch.tensor([[np.deg2rad(angle), dx / w, dy / h, ds]])
+            restored = warp(torch.from_numpy(distorted)[None, None],
+                            affine_flow(params, (h, w)))[0, 0].numpy()
+            # Rotation/scale interpolation differs slightly between OpenCV and
+            # grid_sample.  The interior still has to recover the same object.
+            self.assertLess(float(np.mean(np.abs(restored[6:-6, 6:-6] -
+                                                 source[6:-6, 6:-6]))), .035)
+
+    def test_spatial_router_is_rgb_identity_then_aux_outputs_receive_gradients(self):
+        torch.manual_seed(8)
+        router = SpatialEvidenceRouter(32, dim=16, memory_dim=24).train()
+        raw = [torch.randn(2, 32, 8, 12) for _ in range(3)]
+        common = [torch.randn(2, 16, 8, 12) for _ in range(3)]
+        private = [torch.randn(2, 16, 8, 12) for _ in range(3)]
+        valid = [torch.ones(2, 1, 8, 12) for _ in range(3)]
+        match = [torch.ones(2, 1, 8, 12) for _ in range(3)]
+        reliable = [torch.ones(2, 1, 8, 12) for _ in range(3)]
+        memory = torch.randn(2, 4, 3, 24)
+        a = router(raw, common, private, valid, match, reliable, memory)
+        changed = [raw[0], raw[1] * 7, raw[2] - 9]
+        b = router(changed, [common[0], common[1] * 5, common[2] - 4],
+                   [private[0], private[1] - 6, private[2] * 3],
+                   valid, match, reliable, memory)
+        self.assertTrue(torch.equal(a, raw[0]))
+        self.assertTrue(torch.equal(a, b))
+        a.square().mean().backward()
+        for output in router.outputs:
+            self.assertIsNotNone(output[-1].weight.grad)
+            self.assertGreater(float(output[-1].weight.grad.abs().sum()), 0.)
+
+    def test_target_occlusion_is_reproducible_and_keeps_labels_external(self):
+        rgb = np.full((64, 96, 3), 120, np.uint8)
+        ir = np.full_like(rgb, 80)
+        boxes = np.array([[2, .5, .5, .5, .5]], np.float32)
+        original = boxes.copy()
+        import random
+        a = _target_occlusion(rgb, ir, boxes, random.Random(17))
+        b = _target_occlusion(rgb, ir, boxes, random.Random(17))
+        self.assertTrue(np.array_equal(a[0], b[0]) and np.array_equal(a[1], b[1]))
+        self.assertTrue(np.array_equal(boxes, original))
+        self.assertTrue(np.any(a[0] != rgb) ^ np.any(a[1] != ir))
+
+    def test_v44_to_v45_migration_is_explicit_and_strict(self):
+        old_cfg = config()
+        old = MMYOLO(old_cfg)
+        new_cfg = config()
+        new_cfg.fusion.fusion_strategy = "evidence_router_v3"
+        new_cfg.fusion.ir_coarse_align = True
+        new = MMYOLO(new_cfg)
+        migrated, changed = adapt_depth_checkpoint_state(old.state_dict(), new)
+        self.assertTrue(changed)
+        new.load_state_dict(migrated, strict=True)
+        broken = dict(migrated)
+        broken.pop("backbone.model.0.conv.weight")
+        broken, _ = adapt_depth_checkpoint_state(broken, new)
+        with self.assertRaises(RuntimeError):
+            new.load_state_dict(broken, strict=True)
+
+    def test_v45_full_detection_backward_is_finite_and_aux_sensitive(self):
+        c = config(checkpoint=True)
+        c.fusion.fusion_strategy = "evidence_router_v3"
+        c.fusion.ir_coarse_align = True
+        c.fusion.alignment_mode = "identity_residual_v2"
+        c.fusion.depth_reliability = "valid_support_v2"
+        c.fusion.p2_match_refine = True
+        c.fusion.cross_modal_nce_weight = .004
+        m = MMYOLO(c).train()
+        m.infer_canvas = (64, 96)
+        reset_rgb_identity_residuals(m)
+        set_residual_fusion_mode(m, downstream_frozen=False)
+        rgb, ir, dep = self.inputs()
+        with torch.no_grad():
+            base = m(rgb, ir, dep)["scores"].clone()
+            changed = m(rgb, ir * .1 + .8, dep.roll(5, -1))["scores"]
+        self.assertTrue(torch.equal(base, changed))
+        out = m(rgb, ir, dep)
+        batch = {"boxes":[torch.tensor([[0.,.5,.5,.2,.2]]),
+                          torch.tensor([[2.,.4,.4,.3,.2]])]}
+        targets = make_targets(batch, (64, 96), torch.device("cpu"))
+        det, _ = v8DetectionLoss(m)(out, targets)
+        semantic = m.semantic_regularization(
+            targets, torch.zeros(2, 2), torch.zeros(2),
+            torch.tensor([[.4, -.3, .2, .1], [-.2, .1, -.1, 0.]]),
+            torch.ones(2))
+        total = det.sum() / 2 + .004 * semantic["nce"] + .08 * semantic["ir_affine"]
+        total.backward()
+        self.assertTrue(torch.isfinite(total))
+        self.assertTrue(all(torch.isfinite(p.grad).all()
+                            for p in m.parameters() if p.grad is not None))
+        for block in m.evidence_router.values():
+            self.assertTrue(all(output[-1].weight.grad is not None and
+                                output[-1].weight.grad.abs().sum() > 0
+                                for output in block.outputs))
+        self.assertGreater(float(m.ir_coarse_aligner.head[-1].weight.grad.abs().sum()), 0.)
+        self.assertTrue(all(block[-1].weight.grad is not None and
+                            block[-1].weight.grad.abs().sum() > 0
+                            for block in m.occlusion_context))
 
     def test_v42_depth_edges_remain_reliable(self):
         valid = torch.ones(2,1,64,96)

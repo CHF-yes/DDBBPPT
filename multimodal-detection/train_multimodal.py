@@ -73,7 +73,9 @@ def main():
     keys = ("architecture","imgsz","epochs","batch","accum","workers","precision","lr","backbone_lr_mult",
             "fusion_lr_mult","p2_lr_mult","detector_lr_mult","semantic_lr_mult",
             "freeze_epochs","warmup","lrf","grad_clip","calibrate_clip_steps","bn_policy","mosaic","close_aug_frac",
-            "scale_min","scale_max","translate","target_crop_p","misalign_px","degrade_p","rgb_color_p",
+            "scale_min","scale_max","translate","rotate_deg","target_crop_p","target_occlusion_p",
+            "ir_affine_p","ir_affine_deg","ir_affine_shift","ir_affine_scale",
+            "misalign_px","degrade_p","rgb_color_p",
             "ir_noise_p","ir_gain_p","depth_hole_p","rgb_dropout","aux_dropout","dropout_start_epoch",
             "branch_aux_weight","flow_supervision_weight","cross_modal_nce_weight","nce_temperature",
             "match_floor","branch_aux_weights","branch_aux_end_weights",
@@ -82,6 +84,7 @@ def main():
             "embedding_recon_end_weight","embedding_alignment_weight",
             "embedding_alignment_end_weight","train_stage","aux_branch_mode",
             "independent_preserve_weight","independent_preserve_end_weight",
+            "fusion_strategy","ir_affine_loss_weight","ir_affine_loss_end_weight",
             "val_every","seed")
 
     def add_options(cmd, options):
@@ -119,6 +122,8 @@ def main():
             cmd = add_options(common + ["--name",phase_name], options)
             if phase.get("p2_match_refine", False):
                 cmd += ["--p2-match-refine"]
+            if phase.get("ir_coarse_align", False):
+                cmd += ["--ir-coarse-align"]
             if phase.get("eval_initial", True):
                 cmd += ["--eval-initial"]
             if a.smoke:
@@ -162,7 +167,7 @@ def main():
     for stage in stages:
         if state.get(stage+"_complete"):
             continue
-        options = {k:cfg[k] for k in keys}
+        options = {k:cfg[k] for k in keys if k in cfg}
         extra = []
         if stage == "dev":
             if a.smoke:
@@ -183,6 +188,10 @@ def main():
         cmd = add_options(cmd, options)
         if cfg.get("p2_match_refine", False):
             cmd += ["--p2-match-refine"]
+        if cfg.get("ir_coarse_align", False):
+            cmd += ["--ir-coarse-align"]
+        if cfg.get("eval_initial", False) and stage == "dev":
+            cmd += ["--eval-initial"]
         last = run/stage/"weights/last.pt"
         if a.resume and last.exists():
             extra += ["--resume"]

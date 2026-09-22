@@ -223,6 +223,7 @@ class AugCfg:
     hflip_p: float = 0.5
     scale_range: Tuple[float, float] = (0.75, 1.4)      # 随机缩放（短边填充 letterbox）
     translate: float = 0.1                              # 相对平移
+    rotate_deg: float = 0.0                             # 三模态同步小角度旋转
     misalign_px: float = 5.0                            # depth 轻微错位；不用大幅幻影教坏对齐
     degrade_p: float = 0.3                              # RGB 连续谱退化（低照/噪声/模糊）
     rgb_color_p: float = 0.0                            # RGB 轻量颜色/对比度扰动（默认关闭）
@@ -230,6 +231,11 @@ class AugCfg:
     ir_gain_p: float = 0.0                              # IR 正增益/偏置，保持热强度次序
     depth_hole_p: float = 0.0                           # Depth 小块失效（同步更新 valid）
     target_crop_p: float = 0.0                          # 三模态同步、目标感知裁剪
+    target_occlusion_p: float = 0.0                     # 目标内非对称栏杆/块遮挡；标签保持完整框
+    ir_affine_p: float = 0.0                            # IR-only 已知小仿射，用于粗对齐监督
+    ir_affine_deg: float = 0.0                          # IR 旋转上限（度）
+    ir_affine_shift: float = 0.0                        # IR 平移上限（画布像素）
+    ir_affine_scale: float = 0.0                        # IR 比例变化上限（fraction）
     legacy_lowlight: bool = False                       # 仅用于 B1 旧实验的严格续训
     # modality dropout：**只在多模态训练时生效**（enabled 少于 2 路时自动跳过）
     rgb_drop_p: float = 0.05                            # 小概率整路丢 RGB
@@ -253,11 +259,14 @@ def scheduled_aug(base: AugCfg, epoch: int) -> AugCfg:
     mix = lambda a, b: a + (b - a) * t
     return replace(base, mosaic_p=0.0 if epoch >= start else base.mosaic_p,
                    scale_range=(mix(base.scale_range[0], .95), mix(base.scale_range[1], 1.05)),
-                   translate=mix(base.translate, .02), target_crop_p=base.target_crop_p * (1-t),
+                   translate=mix(base.translate, .02), rotate_deg=base.rotate_deg * (1-t),
+                   target_crop_p=base.target_crop_p * (1-t),
                    misalign_px=base.misalign_px * (1-t),
                    degrade_p=base.degrade_p * (1-.8*t), rgb_color_p=base.rgb_color_p * (1-.5*t),
                    ir_noise_p=base.ir_noise_p * (1-.8*t), ir_gain_p=base.ir_gain_p * (1-.5*t),
                    depth_hole_p=base.depth_hole_p * (1-t),
+                   target_occlusion_p=base.target_occlusion_p * (1-t),
+                   ir_affine_p=base.ir_affine_p * (1-t),
                    rgb_drop_p=base.rgb_drop_p * (1-t), aux_drop_p=base.aux_drop_p * (1-t))
 
 
@@ -421,6 +430,16 @@ def shift_M(dx_px: float, dy_px: float) -> np.ndarray:
     return np.array([[1, 0, float(dx_px)], [0, 1, float(dy_px)]], dtype=np.float32)
 
 
+def centered_affine_M(canvas: Tuple[int, int], angle_deg: float, scale: float,
+                      dx_px: float, dy_px: float) -> np.ndarray:
+    """Source-to-destination affine around the canvas centre (OpenCV convention)."""
+    H, W = int(canvas[0]), int(canvas[1])
+    M = cv2.getRotationMatrix2D(((W - 1) / 2.0, (H - 1) / 2.0),
+                               float(angle_deg), float(scale)).astype(np.float32)
+    M[:, 2] += np.asarray([dx_px, dy_px], np.float32)
+    return M
+
+
 def _warp(img: np.ndarray, M: np.ndarray, canvas: Tuple[int, int], nearest: bool = False) -> np.ndarray:
     flags = cv2.INTER_NEAREST if nearest else cv2.INTER_LINEAR
     return cv2.warpAffine(img, M, (canvas[1], canvas[0]), flags=flags,
@@ -509,6 +528,61 @@ def _drop_depth_blocks(dep: np.ndarray, valid: np.ndarray, rng: random.Random
         out[y0:y1, x0:x1] = 0
         vm[y0:y1, x0:x1] = False
     return out, vm
+
+
+def _target_occlusion(rgb: np.ndarray, ir: np.ndarray, boxes: np.ndarray,
+                      rng: random.Random) -> Tuple[np.ndarray, np.ndarray]:
+    """Occlude one sensor inside one target without changing the full-box label.
+
+    Thin bars approximate fences/railings; an occasional compact patch covers a
+    contiguous visible part.  Only RGB *or* IR is modified, ensuring another
+    appearance sensor remains available to teach complementary routing.
+    """
+    b = np.asarray(boxes if boxes is not None else [], np.float32).reshape(-1, 5)
+    if not len(b):
+        return rgb, ir
+    H, W = rgb.shape[:2]
+    row = b[rng.randrange(len(b))]
+    cx, cy, bw, bh = row[1] * W, row[2] * H, row[3] * W, row[4] * H
+    if bw < 8 or bh < 8:
+        return rgb, ir
+    x0, x1 = int(max(0, cx - bw / 2)), int(min(W - 1, cx + bw / 2))
+    y0, y1 = int(max(0, cy - bh / 2)), int(min(H - 1, cy + bh / 2))
+    if x1 <= x0 or y1 <= y0:
+        return rgb, ir
+    use_rgb = rng.random() < .55
+    out = rgb.copy() if use_rgb else ir.copy()
+    roi = out[y0:y1 + 1, x0:x1 + 1]
+    median = (np.median(roi.reshape(-1, roi.shape[-1]), axis=0)
+              if roi.ndim == 3 else np.asarray(float(np.median(roi))))
+    # A median-colour occluder becomes a no-op on exactly the low-texture
+    # objects this augmentation is meant to protect.  Keep it plausible but
+    # enforce visible contrast in either bright or dark regions.
+    offset = 48.0 if float(np.mean(median)) < 128.0 else -48.0
+    fill = np.clip(median.astype(np.float32) + offset, 0, 255).astype(out.dtype)
+    if rng.random() < .75:
+        vertical = rng.random() < .65
+        count = rng.randint(2, 5)
+        thickness = max(2, int(min(bw, bh) * rng.uniform(.025, .07)))
+        slope = rng.uniform(-.18, .18)
+        for j in range(count):
+            frac = (j + rng.uniform(.35, .65)) / count
+            if vertical:
+                x = int(x0 + frac * max(1, x1 - x0))
+                delta = int(slope * (y1 - y0))
+                p0, p1 = (x - delta // 2, y0), (x + delta // 2, y1)
+            else:
+                y = int(y0 + frac * max(1, y1 - y0))
+                delta = int(slope * (x1 - x0))
+                p0, p1 = (x0, y - delta // 2), (x1, y + delta // 2)
+            cv2.line(out, p0, p1, fill.tolist() if hasattr(fill, "tolist") else float(fill), thickness)
+    else:
+        rw = max(3, int(bw * rng.uniform(.15, .35)))
+        rh = max(3, int(bh * rng.uniform(.15, .35)))
+        px = rng.randint(x0, max(x0, x1 - rw))
+        py = rng.randint(y0, max(y0, y1 - rh))
+        out[py:min(y1 + 1, py + rh), px:min(x1 + 1, px + rw)] = fill
+    return (out, ir) if use_rgb else (rgb, out)
 
 
 # ---------------------------------------------------------------- 组感知划分
@@ -792,7 +866,10 @@ class MMDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Optional[dict]:
         self._load_epoch_file()
-        index, draw, epoch = idx if isinstance(idx, tuple) else (idx, 0, self.epoch)
+        if isinstance(idx, tuple):
+            index, draw, epoch = idx[:3]
+        else:
+            index, draw, epoch = idx, 0, self.epoch
         self.epoch = epoch
         aug = scheduled_aug(self.aug, epoch) if self.train else self.aug
         rng = self._rng(index, draw)
@@ -813,7 +890,7 @@ class MMDataset(Dataset):
             self.aug = replace(self.aug, mosaic_p=0, rgb_drop_p=0, aux_drop_p=0)
             for j,(source,(_,_,hh,ww)) in enumerate(zip(sources,rects)):
                 self.canvas = (hh,ww)
-                children.append(self._single_item((source,draw*5+j+1,epoch)))
+                children.append(self._single_item((source,draw*5+j+1,epoch,False)))
         finally:
             self.canvas, self.aug = original_canvas, original_aug
         if any(x is None for x in children):
@@ -848,6 +925,8 @@ class MMDataset(Dataset):
         # no single global displacement target for flow supervision.
         out["alignment_shift"] = torch.zeros(2, dtype=torch.float32)
         out["alignment_supervised"] = torch.tensor(0.0, dtype=torch.float32)
+        out["ir_affine_target"] = torch.zeros(4, dtype=torch.float32)
+        out["ir_affine_supervised"] = torch.tensor(0.0, dtype=torch.float32)
         out["keep"] = {m: float(any(c["keep"][m] for c in children)) for m in ("rgb","ir","dep")}
         # Whole-modality dropout applies to the completed Mosaic, never ambiguous individual tiles.
         aug = scheduled_aug(self.aug,epoch)
@@ -869,8 +948,12 @@ class MMDataset(Dataset):
     def _single_item(self, idx: int) -> Optional[dict]:
         self._load_epoch_file()                # worker 侧惰性同步 epoch（见 __init__ 注释）
         draw = 0
+        allow_special = True
         if isinstance(idx, tuple):
-            idx, draw, self.epoch = idx
+            if len(idx) == 4:
+                idx, draw, self.epoch, allow_special = idx
+            else:
+                idx, draw, self.epoch = idx
         s = self.samples[idx]
         rng = self._rng(idx, draw)
         aug = scheduled_aug(self.aug, self.epoch) if self.train else self.aug
@@ -922,6 +1005,9 @@ class MMDataset(Dataset):
                           rng.random() < aug.target_crop_p)
         M = (target_crop_M(H, W, self.canvas, s["boxes"], rng, flip) if do_target_crop
              else letterbox_M(H, W, self.canvas, scale, dx, dy, flip))
+        if self.train and aug.rotate_deg > 0:
+            angle = rng.uniform(-aug.rotate_deg, aug.rotate_deg)
+            M = (centered_affine_M(self.canvas, angle, 1.0, 0.0, 0.0) @ _mat3(M))[:2]
         jx = jy = 0.0
         if self.train and aug.misalign_px > 0:
             jx = rng.uniform(-1, 1) * aug.misalign_px
@@ -934,6 +1020,29 @@ class MMDataset(Dataset):
         if not want_rgb:
             rgb_w.fill(0)
         ir_w = _warp(ir, M, self.canvas)
+        ir_spatial = _warp(np.ones((H, W), np.uint8), M, self.canvas, nearest=True).astype(np.float32)
+        ir_affine_target = np.zeros(4, np.float32)
+        ir_affine_supervised = 0.0
+        if (self.train and allow_special and want_ir and aug.ir_affine_p > 0 and
+                rng.random() < aug.ir_affine_p):
+            angle = rng.uniform(-aug.ir_affine_deg, aug.ir_affine_deg)
+            sx = rng.uniform(-aug.ir_affine_shift, aug.ir_affine_shift)
+            sy = rng.uniform(-aug.ir_affine_shift, aug.ir_affine_shift)
+            ds = rng.uniform(-aug.ir_affine_scale, aug.ir_affine_scale)
+            A = centered_affine_M(self.canvas, angle, 1.0 + ds, sx, sy)
+            ir_w = _warp(ir_w, A, self.canvas)
+            ir_spatial = _warp(ir_spatial, A, self.canvas, nearest=True).astype(np.float32)
+            # ``warp`` predicts output-reference -> distorted-input sampling.
+            # OpenCV rendered the distorted image with source->destination A,
+            # so an RGB reference coordinate must sample the distorted input at
+            # A(x): the supervised parameters have the same sign as A.
+            ir_affine_target[:] = (
+                angle / max(1e-6, aug.ir_affine_deg),
+                sx / max(1e-6, aug.ir_affine_shift),
+                sy / max(1e-6, aug.ir_affine_shift),
+                ds / max(1e-6, aug.ir_affine_scale),
+            )
+            ir_affine_supervised = 1.0
         # ⚠️ 审计修复：depth/掩码只用 Md **warp 一次**。旧版先 _warp(dep, M) 再 _warp(dep_w, Mj@M)，
         #    等于把 M 应用了两遍 → 有效像素只剩正确的 2.46%、7/30 张整幅变空。
         if aug.depth_resampling not in ("legacy_bilinear_v1", "nearest_valid_v2"):
@@ -965,6 +1074,9 @@ class MMDataset(Dataset):
         out_boxes = canvas_boxes_from_norm(s.get("boxes"), M, (H, W), self.canvas,
                                            min_size=aug.box_min_size,
                                            require_center=aug.box_require_center)
+        if (self.train and allow_special and aug.target_occlusion_p > 0 and
+                len(out_boxes) and rng.random() < aug.target_occlusion_p):
+            rgb_w, ir_w = _target_occlusion(rgb_w, ir_w, out_boxes, rng)
 
         # ---- 显式先验与质量描述子：**在 1/4 降采样图上算**（它们本来就是低分辨率量），
         #      比在全画布上做多次 blur/Sobel 快十几倍 ----
@@ -1003,7 +1115,8 @@ class MMDataset(Dataset):
         rel_depth = relative_depth(dep_w, valid_w)
         abs_depth = absolute_metric_depth(dep_w, valid_w, metric_available)
         spatial = _warp(np.ones((H,W),np.uint8), M, self.canvas, nearest=True).astype(np.float32)
-        quality["availability"] = np.stack((spatial*keep["rgb"], spatial*keep["ir"],valid_w*keep["dep"])).astype(np.float32)
+        quality["availability"] = np.stack((spatial*keep["rgb"], ir_spatial*keep["ir"],
+                                             valid_w*keep["dep"])).astype(np.float32)
         quality["scene_id"] = np.ones((1,*self.canvas),np.float32)
         return {
             "rgb": torch.from_numpy(rgb_w.transpose(2, 0, 1).copy()).float() / 255.0,
@@ -1019,6 +1132,8 @@ class MMDataset(Dataset):
             "alignment_shift": torch.tensor([jx, jy], dtype=torch.float32),
             "alignment_supervised": torch.tensor(
                 float(self.train and aug.misalign_px > 0), dtype=torch.float32),
+            "ir_affine_target": torch.from_numpy(ir_affine_target),
+            "ir_affine_supervised": torch.tensor(ir_affine_supervised, dtype=torch.float32),
             "orig_hw": torch.tensor([H, W], dtype=torch.float32),
             "stem": s["stem"],
             "keep": keep,
@@ -1120,6 +1235,8 @@ def collate(batch: List[Optional[dict]]) -> Optional[dict]:
         "M": torch.stack([b["M"] for b in batch]),
         "alignment_shift": torch.stack([b.get("alignment_shift", torch.zeros(2)) for b in batch]),
         "alignment_supervised": torch.stack([b.get("alignment_supervised", torch.tensor(0.0)) for b in batch]),
+        "ir_affine_target": torch.stack([b.get("ir_affine_target", torch.zeros(4)) for b in batch]),
+        "ir_affine_supervised": torch.stack([b.get("ir_affine_supervised", torch.tensor(0.0)) for b in batch]),
         "orig_hw": torch.stack([b["orig_hw"] for b in batch]),
         "stems": [b["stem"] for b in batch],
         "keep": {k: torch.tensor([b["keep"][k] for b in batch]) for k in ("rgb", "ir", "dep")},
