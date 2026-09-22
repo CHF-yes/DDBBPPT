@@ -67,9 +67,11 @@ MEMORY_RECIPE = "coverage_spatial_memory_v1"
 def recipe_for(args):
     if getattr(args, "architecture", "") == "independent_p2_memory_v3":
         if getattr(args, "train_stage", "standard") == "aux_independent":
-            return "independent_aux_detectors_v1"
+            return ("independent_aux_detectors_v2_both" if
+                    getattr(args, "aux_branch_mode", "alternate") == "both" else
+                    "independent_aux_detectors_v1")
         if getattr(args, "train_stage", "standard") == "residual_fusion":
-            return "rgb_identity_residual_fusion_v1"
+            return "rgb_identity_residual_fusion_v2_aligned_ir"
         if getattr(args, "train_stage", "standard") == "anchored_joint":
             return "independent_p2_anchored_joint_v1"
         if getattr(args, "alignment_mode", "legacy_gate_v1") == "identity_residual_v2":
@@ -282,7 +284,8 @@ def set_independent_aux_mode(model: MMYOLO) -> None:
 
     The RGB encoder, fused route, shared semantic head and memory are completely
     frozen.  Direct GT detection losses update an auxiliary encoder and its own
-    full P2--P5 neck/head; the batch loop alternates IR and Depth to fit 24 GB.
+    full P2--P5 neck/head; the batch loop may backpropagate IR and Depth
+    sequentially so both receive a complete epoch without exceeding 24 GB.
     """
     for p in model.parameters():
         p.requires_grad_(False)
@@ -697,7 +700,9 @@ def validate_checkpoint(ck: dict, model: MMYOLO, enabled, canvas, exact: bool = 
                  "branch_aux_end_weights", "flow_supervision_end_weight",
                  "cross_modal_nce_end_weight", "alignment_mode", "depth_reliability",
                  "flow_identity_weight", "embedding_recon_weight", "embedding_recon_end_weight",
-                 "embedding_alignment_weight", "embedding_alignment_end_weight", "train_stage")
+                 "embedding_alignment_weight", "embedding_alignment_end_weight", "train_stage",
+                 "aux_branch_mode", "independent_preserve_weight",
+                 "independent_preserve_end_weight")
         legacy = {"depth_channels": 2, "depth_view": "both", "depth_init": "relative",
                   "misalign_px": 15.0, "degrade_p": 0.3, "rgb_color_p": 0.0,
                   "ir_noise_p": 0.0, "ir_gain_p": 0.0,
@@ -717,7 +722,9 @@ def validate_checkpoint(ck: dict, model: MMYOLO, enabled, canvas, exact: bool = 
                       alignment_mode="legacy_gate_v1", depth_reliability="legacy_edge_v1",
                       flow_identity_weight=0., embedding_recon_weight=.01,
                       embedding_recon_end_weight=None, embedding_alignment_weight=.005,
-                      embedding_alignment_end_weight=None, fusion_lr_mult=1., p2_lr_mult=1.,
+                      embedding_alignment_end_weight=None, aux_branch_mode="alternate",
+                      independent_preserve_weight=0., independent_preserve_end_weight=None,
+                      fusion_lr_mult=1., p2_lr_mult=1.,
                       detector_lr_mult=1., semantic_lr_mult=1., train_stage="standard")
         changed = [k for k in keys
                    if old.get(k, legacy.get(k)) != getattr(args, k, legacy.get(k))]
@@ -900,6 +907,9 @@ def main():
                     choices=["standard", "aux_adapt", "anchored_joint",
                              "aux_independent", "residual_fusion"],
                     help="aux_independent 独立预训 IR/Depth 检测器；residual_fusion 从严格 RGB 恒等映射融合")
+    ap.add_argument("--aux-branch-mode", default="alternate",
+                    choices=["alternate", "both"],
+                    help="Stage A 辅助分支调度；both 在同一批顺序反传 IR/Depth，完整覆盖每轮")
     ap.add_argument("--fusion-tier", default="L2", choices=["L0", "L1", "L2", "L3"])
     ap.add_argument("--share-tier", default="c", choices=["a", "b", "c"])
     ap.add_argument("--register-bus", dest="register_bus", action="store_true", default=True,
@@ -995,6 +1005,9 @@ def main():
     ap.add_argument("--embedding-alignment-weight", type=float, default=.005,
                     help="common 余弦对齐起始权重；旧固定值为 .005")
     ap.add_argument("--embedding-alignment-end-weight", type=float, default=None)
+    ap.add_argument("--independent-preserve-weight", type=float, default=0.0,
+                    help="Stage B 用冻结的独立检测头约束辅助编码器，防止遗忘独立识别能力")
+    ap.add_argument("--independent-preserve-end-weight", type=float, default=None)
     args = ap.parse_args()
     if args.branch_aux_weights is not None:
         args.branch_aux_weights = tuple(float(v) for v in args.branch_aux_weights)
@@ -1023,6 +1036,8 @@ def main():
             or min(args.embedding_recon_weight, args.embedding_alignment_weight) < 0
             or (args.embedding_recon_end_weight is not None and args.embedding_recon_end_weight < 0)
             or (args.embedding_alignment_end_weight is not None and args.embedding_alignment_end_weight < 0)
+            or args.independent_preserve_weight < 0
+            or (args.independent_preserve_end_weight is not None and args.independent_preserve_end_weight < 0)
             or not 0 <= args.flow_identity_weight <= 1
             or args.nce_temperature <= 0):
         raise ValueError("semantic loss weights must be nonnegative and temperature positive")
@@ -1232,6 +1247,9 @@ def main():
     embedding_alignment_end = (
         args.embedding_alignment_weight if args.embedding_alignment_end_weight is None
         else args.embedding_alignment_end_weight)
+    independent_preserve_end = (
+        args.independent_preserve_weight if args.independent_preserve_end_weight is None
+        else args.independent_preserve_end_weight)
     cfg.fusion.flow_supervision_weight = float(max(args.flow_supervision_weight, flow_end))
     cfg.fusion.cross_modal_nce_weight = float(max(args.cross_modal_nce_weight, nce_end))
     cfg.fusion.nce_temperature = float(args.nce_temperature)
@@ -1483,10 +1501,14 @@ def main():
         embedding_alignment_weight = (
             args.embedding_alignment_weight +
             (embedding_alignment_end - args.embedding_alignment_weight) * progress)
+        independent_preserve_weight = (
+            args.independent_preserve_weight +
+            (independent_preserve_end - args.independent_preserve_weight) * progress)
         aux_w_log = "/".join(f"{v:.3g}" for v in aux_values)
         opt.zero_grad(set_to_none=True)
         agg = {"loss": 0.0, "n": 0, "micro": 0, "group_samples": 0, "skipped": 0,
                "branch_aux": 0.0, "flow_aux": 0.0, "nce_aux": 0.0,
+               "independent_preserve": 0.0,
                "embedding_recon": 0.0, "embedding_alignment": 0.0,
                "grad_steps": 0, "grad_clipped": 0, "grad_norm_sum": 0.0,
                "grad_norm_max": 0.0, "amp_overflow": 0, "norms": [], "stems": set(), "draws": 0}
@@ -1588,20 +1610,43 @@ def main():
                 embedding_aux = {"reconstruction": zero, "alignment": zero}
                 semantic = {"flow": zero, "nce": zero}
                 branch_total, branch_count = zero, 0
+                branch_backward = False
                 if args.train_stage == "aux_independent":
-                    # Alternate two full standalone detectors.  No RGB feature,
-                    # fusion tensor or main detector participates in this loss.
+                    # Each auxiliary detector is independent of RGB/fusion.  In
+                    # ``both`` mode the two graphs are backpropagated one at a
+                    # time, so every epoch covers both sensors without retaining
+                    # two high-resolution detector graphs at once.
                     names = ("ir", "dep")
-                    name = names[(ep + bi) % len(names)]
-                    branch_aux, active = model.independent_branch_prediction(
-                        name, ir=ir, depth=dep, keep=keep)
-                    if not active.any():
-                        raise RuntimeError(f"Stage A batch has no valid {name} samples")
-                    branch_preds, branch_targets = subset_detection_batch(
-                        branch_aux, tgt, active)
-                    loss_vec, loss_items = crit(branch_preds, branch_targets)
-                    branch_total, branch_count = loss_vec.sum(), 1
-                    loss = aux_w[name] * accumulation_loss(loss_vec, nominal_samples)
+                    if args.aux_branch_mode != "both":
+                        names = (names[(ep + bi) % len(names)],)
+                    item_sum = {}
+                    loss_scalar = zero
+                    for name in names:
+                        branch_aux, active = model.independent_branch_prediction(
+                            name, ir=ir, depth=dep, keep=keep)
+                        if not active.any():
+                            raise RuntimeError(f"Stage A batch has no valid {name} samples")
+                        branch_preds, branch_targets = subset_detection_batch(
+                            branch_aux, tgt, active)
+                        loss_vec, branch_items = crit(branch_preds, branch_targets)
+                        branch_loss = aux_w[name] * accumulation_loss(loss_vec, nominal_samples)
+                        if not torch.isfinite(branch_loss.detach()):
+                            raise FloatingPointError(f"non-finite {name} auxiliary loss at ep={ep+1} batch={bi}")
+                        # Backpropagate and release this branch before building
+                        # the next graph.  The branches have disjoint parameters,
+                        # so one optimizer step still updates both consistently.
+                        scaler.scale(branch_loss).backward()
+                        branch_backward = True
+                        loss_scalar = loss_scalar + branch_loss.detach()
+                        branch_total = branch_total + loss_vec.sum().detach()
+                        branch_count += 1
+                        for key, value in branch_items.items():
+                            value = value.detach()
+                            item_sum[key] = item_sum.get(key, value.new_zeros(())) + value
+                        del branch_aux, branch_preds, branch_targets, loss_vec, branch_loss
+                    loss_items = {key: value / max(1, branch_count)
+                                  for key, value in item_sum.items()}
+                    loss = loss_scalar
                 else:
                     preds = model(rgb, ir, dep, quality=qual, prior=prior, keep=keep)
                     # 本版 ultralytics 的 v8DetectionLoss 返回 (loss*bs 的三分量向量, 分量字典)
@@ -1651,7 +1696,33 @@ def main():
                 log(f"[train][FATAL] ep={ep+1} batch={bi} loss 非有限，"
                     f"样本={stems}；立即停止，不保存污染 checkpoint")
                 raise FloatingPointError(f"non-finite loss at ep={ep+1} batch={bi}")
-            scaler.scale(loss).backward()
+            if not branch_backward:
+                scaler.scale(loss).backward()
+            # Stage A's standalone heads become frozen teachers in Stage B.
+            # Alternating one teacher after the fused backward preserves the
+            # independent recognition capacity of each auxiliary encoder while
+            # keeping peak memory below running both detector graphs together.
+            # Deployment still has one learned fusion head: this is supervision,
+            # never prediction voting.
+            if (args.train_stage == "residual_fusion" and not frozen and
+                    independent_preserve_weight > 0):
+                preserve_name = ("ir", "dep")[(ep + bi) % 2]
+                preserve_aux, preserve_active = model.independent_branch_prediction(
+                    preserve_name, ir=ir, depth=dep, keep=keep)
+                if preserve_active.any():
+                    preserve_preds, preserve_targets = subset_detection_batch(
+                        preserve_aux, tgt, preserve_active)
+                    preserve_vec, _ = crit(preserve_preds, preserve_targets)
+                    preserve_loss = (independent_preserve_weight *
+                                     accumulation_loss(preserve_vec, nominal_samples))
+                    if not torch.isfinite(preserve_loss.detach()):
+                        raise FloatingPointError(
+                            f"non-finite {preserve_name} preservation loss at ep={ep+1} batch={bi}")
+                    scaler.scale(preserve_loss).backward()
+                    agg["independent_preserve"] += (
+                        float(preserve_vec.detach().sum()) /
+                        max(1, int(preserve_active.sum())))
+                    del preserve_aux, preserve_preds, preserve_targets, preserve_vec, preserve_loss
             if (model.spatial_memory and args.memory_control == "bounded_v2" and
                     args.train_stage != "aux_independent"):
                 health_n += 1
@@ -1715,11 +1786,14 @@ def main():
                 args.branch_aux_weight or args.branch_aux_weights
                 or args.branch_aux_end_weights or args.flow_supervision_weight
                 or args.cross_modal_nce_weight or args.flow_supervision_end_weight
-                or args.cross_modal_nce_end_weight):
+                or args.cross_modal_nce_end_weight or args.independent_preserve_weight
+                or args.independent_preserve_end_weight):
             msg += (f" semantic_raw=branch:{agg['branch_aux']/n:.3f} "
-                    f"flow:{agg['flow_aux']/n:.4f} nce:{agg['nce_aux']/n:.3f}"
+                    f"flow:{agg['flow_aux']/n:.4f} nce:{agg['nce_aux']/n:.3f} "
+                    f"preserve:{agg['independent_preserve']/n:.3f}"
                     f" align:{args.alignment_mode} aux_w:{aux_w_log}"
                     f" flow_w:{flow_weight:.3g} nce_w:{nce_weight:.3g}"
+                    f" preserve_w:{independent_preserve_weight:.3g}"
                     f" embed_raw:{agg['embedding_recon']/n:.3f}/{agg['embedding_alignment']/n:.3f}"
                     f" embed_w:{recon_weight:.3g}/{embedding_alignment_weight:.3g}")
         if model.spatial_memory:

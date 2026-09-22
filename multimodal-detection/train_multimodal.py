@@ -80,7 +80,9 @@ def main():
             "flow_supervision_end_weight","cross_modal_nce_end_weight","alignment_mode",
             "depth_reliability","flow_identity_weight","embedding_recon_weight",
             "embedding_recon_end_weight","embedding_alignment_weight",
-            "embedding_alignment_end_weight","train_stage","val_every","seed")
+            "embedding_alignment_end_weight","train_stage","aux_branch_mode",
+            "independent_preserve_weight","independent_preserve_end_weight",
+            "val_every","seed")
 
     def add_options(cmd, options):
         for key, value in options.items():

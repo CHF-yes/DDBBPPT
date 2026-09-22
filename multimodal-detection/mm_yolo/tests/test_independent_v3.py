@@ -258,6 +258,37 @@ class IndependentV3Tests(unittest.TestCase):
         self.assertFalse(any(p.grad is not None
                              for p in m.independent_aux["dep"].parameters()))
 
+    def test_stage_a_both_branches_receive_gradients_sequentially(self):
+        c = config()
+        c.fusion.branch_aux_weights = (0., 1., 1.)
+        m = MMYOLO(c).train()
+        set_independent_aux_mode(m)
+        _, ir, dep = self.inputs()
+        batch = {"boxes": [torch.tensor([[0., .5, .5, .2, .2]])] * 2}
+        targets = make_targets(batch, (64, 96), torch.device("cpu"))
+        criterion = v8DetectionLoss(m)
+        for name in ("ir", "dep"):
+            pred, active = m.independent_branch_prediction(
+                name, ir=ir, depth=dep)
+            sub_pred, sub_targets = subset_detection_batch(pred, targets, active)
+            loss, _ = criterion(sub_pred, sub_targets)
+            loss.sum().backward()
+        self.assertTrue(any(p.grad is not None and p.grad.abs().sum() > 0
+                            for p in m.aux_encoders["ir"].parameters()))
+        self.assertTrue(any(p.grad is not None and p.grad.abs().sum() > 0
+                            for p in m.aux_encoders["dep"].parameters()))
+
+    def test_identity_mode_keeps_registered_ir_on_nominal_grid(self):
+        c = config()
+        c.fusion.branch_aux_weights = (0., .05, .05)
+        c.fusion.alignment_mode = "identity_residual_v2"
+        c.fusion.p2_match_refine = True
+        m = MMYOLO(c).train()
+        rgb, ir, dep = self.inputs()
+        m(rgb, ir, dep)
+        for scale in ("p2", "p3", "p4", "p5"):
+            self.assertEqual(float(m._semantic_flows[scale][0].abs().max()), 0.)
+
     def test_stage_b_starts_as_exact_rgb_identity(self):
         c = config()
         c.fusion.branch_aux_weights = (0., .05, .035)

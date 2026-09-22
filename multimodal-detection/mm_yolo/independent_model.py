@@ -73,9 +73,9 @@ class IndependentBranchDetector(nn.Module):
 
     A shallow projection into the fused head can report a loss without proving
     that the auxiliary encoder can actually detect objects.  Each auxiliary
-    branch therefore receives its own COCO-initialized neck and detector.  Only
-    one branch is executed per optimizer step, so the additional parameters do
-    not duplicate high-resolution activations on a 24 GB GPU.  These modules are
+    branch therefore receives its own COCO-initialized neck and detector.  The
+    two branches are executed and backpropagated sequentially, so the additional
+    parameters do not duplicate high-resolution activations on a 24 GB GPU.  These modules are
     omitted from the deployment path; they are supervision, not detector voting.
     """
     def __init__(self, source_layers, channels, neck_channels, detector):
@@ -337,7 +337,17 @@ class IndependentMMYOLO(nn.Module):
             shape = raw[0][s].shape[-2:]
             flows[s], confidence[s] = [], [masks[s][0]]
             for m in range(1,3):
-                if s == "p2" and not self.cfg.fusion.p2_match_refine:
+                # RGB/IR are captured on the same image grid.  Their learned
+                # descriptor similarity is low because IR is not RGB texture,
+                # not because the pixels are geometrically unmatched.  Keep IR
+                # on the nominal identity grid; Depth retains residual matching
+                # because its invalid boundaries can shift local support.
+                if (m == 1 and
+                        self.cfg.fusion.alignment_mode == "identity_residual_v2"):
+                    flow = raw[0][s].new_zeros(raw[0][s].shape[0], 2, *shape,
+                                                dtype=torch.float32)
+                    conf = masks[s][m].float()
+                elif s == "p2" and not self.cfg.fusion.p2_match_refine:
                     flow = resize_flow(previous[m-1],shape)
                     conf = F.interpolate(confidence["p3"][m],shape,mode="bilinear",align_corners=False)
                 else:
