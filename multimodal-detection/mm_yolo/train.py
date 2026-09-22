@@ -68,6 +68,8 @@ def recipe_for(args):
     if getattr(args, "architecture", "") == "independent_p2_memory_v3":
         if getattr(args, "fusion_strategy", "legacy_residual_v2") == "evidence_router_v3":
             return "spatial_evidence_router_v3_affine_occlusion"
+        if getattr(args, "fusion_strategy", "legacy_residual_v2") == "v44_incremental_router_v1":
+            return "v44_incremental_router_v1_preserve_legacy_route"
         if getattr(args, "train_stage", "standard") == "aux_independent":
             return ("independent_aux_detectors_v2_both" if
                     getattr(args, "aux_branch_mode", "alternate") == "both" else
@@ -146,6 +148,26 @@ def reset_rgb_identity_residuals(model):
         for i, block in enumerate(getattr(model, "occlusion_context", ())):
             block[-1].weight.zero_()
             reset.append(f"occlusion_context.{i}.3.weight")
+    return reset
+
+
+def reset_incremental_router_additions(model):
+    """Reset only new V4.4-incremental modules; preserve the V4.4 route."""
+    reset = []
+    with torch.no_grad():
+        for scale, block in getattr(model, "evidence_router", {}).items():
+            for slot, output in enumerate(block.outputs):
+                output[-1].weight.zero_()
+                reset.append(f"evidence_router.{scale}.outputs.{slot}.3.weight")
+            block.context[-1].weight.zero_()
+            reset.append(f"evidence_router.{scale}.context.3.weight")
+        for i, block in enumerate(getattr(model, "occlusion_context", ())):
+            block[-1].weight.zero_()
+            reset.append(f"occlusion_context.{i}.3.weight")
+        gain = getattr(model, "metric_gain_logit", None)
+        if gain is not None:
+            gain.fill_(math.log(.1 / (.5 - .1)))
+            reset.append("metric_gain_logit")
     return reset
 
 
@@ -333,20 +355,33 @@ def set_residual_fusion_mode(model: MMYOLO, downstream_frozen: bool) -> None:
             for p in module.parameters():
                 p.requires_grad_(True)
 
-    # Learn how much reliable auxiliary evidence to inject.  Slot 0 (RGB) is
-    # deliberately excluded, keeping F_out == F_rgb at the hand-off.
-    if hasattr(model, "fusion"):
+    incremental = getattr(model.cfg.fusion, "fusion_strategy", "") == "v44_incremental_router_v1"
+    # In the incremental recipe the learned V4.4 route is frozen during the
+    # warm-up; only new corrections and auxiliary evidence adapt first.
+    if hasattr(model, "fusion") and (not incremental or not downstream_frozen):
         for block in model.fusion.values():
             for module in list(block.gates[1:]) + list(block.outputs[1:]):
                 enable(module)
             block.residual_scale.requires_grad_(True)
-    enable(getattr(model, "register_bus", None))
-    enable(getattr(model, "neck_memory", None))
+    if not incremental or not downstream_frozen:
+        enable(getattr(model, "register_bus", None))
+        enable(getattr(model, "neck_memory", None))
     enable(getattr(model, "evidence_router", None))
     enable(getattr(model, "ir_coarse_aligner", None))
     enable(getattr(model, "occlusion_context", None))
     enable(getattr(model, "semantic_adapters", None))
     enable(getattr(model, "semantic_detect", None))
+    if incremental:
+        enable(getattr(model, "aux_encoders", None))
+        enable(getattr(model, "metric_encoder", None))
+        value = getattr(model, "metric_gain_logit", None)
+        if value is not None:
+            value.requires_grad_(True)
+        enable(getattr(model, "matchers", None))
+        if hasattr(model, "embeddings"):
+            for blocks in model.embeddings.values():
+                for block in blocks[1:]:
+                    enable(block)
 
     if not downstream_frozen:
         enable(getattr(model, "aux_encoders", None))
@@ -476,6 +511,8 @@ def build_optimizer(model: MMYOLO, lr: float, backbone_mult: float, wd: float = 
         add("anchor", model.backbone.model[:11])
         add("aux_encoder", getattr(model, "aux_encoders", None))
         add("aux_encoder", getattr(model, "metric_encoder", None))
+        if "fusion" in role_ids and hasattr(model, "metric_gain_logit"):
+            role_ids["fusion"].add(id(model.metric_gain_logit))
         add("fusion", getattr(model, "matchers", None))
         add("fusion", getattr(model, "register_bus", None))
         add("fusion", getattr(model, "neck_memory", None))
@@ -676,11 +713,10 @@ def validate_checkpoint(ck: dict, model: MMYOLO, enabled, canvas, exact: bool = 
             old_f["memory_control"] = "bounded_v2"
         old_f, new_f = saved_structure.get("fusion", {}), current_structure.get("fusion", {})
         if (old_f.get("fusion_strategy") == "legacy_residual_v2" and
-                new_f.get("fusion_strategy") == "evidence_router_v3" and
-                not old_f.get("ir_coarse_align") and new_f.get("ir_coarse_align")):
-            # One explicit V4.4 -> V4.5 warm-start path.  The migration routine
-            # below initializes every newly named tensor from the freshly built
-            # identity modules; arbitrary structural changes remain forbidden.
+                new_f.get("fusion_strategy") in ("evidence_router_v3",
+                                                  "v44_incremental_router_v1")):
+            # Explicit V4.4 warm-start paths.  The incremental path keeps the
+            # old fusion weights and only initializes newly named tensors below.
             for key in ("fusion_strategy", "ir_coarse_align",
                         "ir_affine_max_degrees", "ir_affine_max_shift",
                         "ir_affine_max_scale", "ir_affine_identity_weight"):
@@ -793,7 +829,8 @@ def adapt_depth_checkpoint_state(state: dict, model: MMYOLO) -> tuple:
         is_new_switch = name.endswith(".residual_scale") or name == "localization_scale"
         is_v45 = (name.startswith("evidence_router.") or
                   name.startswith("ir_coarse_aligner.") or
-                  name.startswith("occlusion_context."))
+                  name.startswith("occlusion_context.") or
+                  name == "metric_gain_logit")
         if name not in out and (name.startswith("independent_aux.") or is_new_switch or
                                 (legacy_fusion and is_v45)):
             out[name] = target.detach().clone()
@@ -1070,7 +1107,8 @@ def main():
                     help="Stage B 用冻结的独立检测头约束辅助编码器，防止遗忘独立识别能力")
     ap.add_argument("--independent-preserve-end-weight", type=float, default=None)
     ap.add_argument("--fusion-strategy", default="legacy_residual_v2",
-                    choices=["legacy_residual_v2", "evidence_router_v3"])
+                    choices=["legacy_residual_v2", "evidence_router_v3",
+                             "v44_incremental_router_v1"])
     ap.add_argument("--ir-coarse-align", action="store_true",
                     help="启用样本级 IR 小仿射 + P2/P3 局部残差对齐")
     ap.add_argument("--ir-affine-loss-weight", type=float, default=0.0)
@@ -1138,6 +1176,8 @@ def main():
         raise ValueError("几何增强范围无效或 rare-sample-max < 1")
     if args.fusion_strategy == "evidence_router_v3" and not args.ir_coarse_align:
         raise ValueError("evidence_router_v3 必须启用 --ir-coarse-align")
+    if args.fusion_strategy == "v44_incremental_router_v1" and args.ir_coarse_align:
+        raise ValueError("v44_incremental_router_v1 默认保留 IR 恒等对齐，不启用样本级仿射")
     if args.ir_coarse_align and args.fusion_strategy != "evidence_router_v3":
         raise ValueError("--ir-coarse-align 只适用于 evidence_router_v3")
     if args.late_bus and args.register_bus:
@@ -1407,9 +1447,15 @@ def main():
         if args.reset_fusion_gates:
             reset_keys = reset_fusion_gate_outputs(model)
             log(f"[train] v2 迁移：仅重置 {len(reset_keys)} 个门控末层参数张量；其余权重严格迁移")
-        if args.train_stage == "residual_fusion":
-            reset_keys = reset_rgb_identity_residuals(model)
-            log(f"[train] Stage B RGB 恒等起点：重置 {reset_keys}")
+        # A reset is an init-only operation.  Exact --resume must restore the
+        # learned fusion/optimizer state byte-for-byte and never erase residuals.
+        if args.train_stage == "residual_fusion" and not args.resume:
+            if args.fusion_strategy == "v44_incremental_router_v1":
+                reset_keys = reset_incremental_router_additions(model)
+                log(f"[train] V4.4 增量起点：仅重置新增模块 {reset_keys}")
+            else:
+                reset_keys = reset_rgb_identity_residuals(model)
+                log(f"[train] Stage B RGB 恒等起点：重置 {reset_keys}")
         if args.resume:
             start_ep = int(ck["epoch"])
             if start_ep > args.epochs:

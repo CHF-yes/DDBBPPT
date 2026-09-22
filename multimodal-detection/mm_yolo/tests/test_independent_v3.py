@@ -15,7 +15,8 @@ from train import (build_optimizer, set_encoder_frozen, apply_bn_policy, make_ta
                    subset_detection_batch, set_aux_adaptation_mode,
                    set_anchored_joint_mode, set_independent_aux_mode,
                    set_residual_fusion_mode, enable_trainable_defaults,
-                   adapt_depth_checkpoint_state, reset_rgb_identity_residuals)
+                   adapt_depth_checkpoint_state, reset_rgb_identity_residuals,
+                   reset_incremental_router_additions)
 from data import (MMDataset, AugCfg, collate, scheduled_aug, centered_affine_M,
                   _target_occlusion)
 from independent_fusion import (warp, resize_flow, identity_residual_align,
@@ -213,6 +214,34 @@ class IndependentV3Tests(unittest.TestCase):
         broken, _ = adapt_depth_checkpoint_state(broken, new)
         with self.assertRaises(RuntimeError):
             new.load_state_dict(broken, strict=True)
+
+    def test_v44_incremental_router_preserves_loaded_v44_function(self):
+        old_cfg = config()
+        old_cfg.fusion.alignment_mode = "identity_residual_v2"
+        old_cfg.fusion.depth_reliability = "valid_support_v2"
+        old_cfg.fusion.p2_match_refine = True
+        old = MMYOLO(old_cfg).train()
+        new_cfg = config()
+        new_cfg.fusion.fusion_strategy = "v44_incremental_router_v1"
+        new_cfg.fusion.alignment_mode = "identity_residual_v2"
+        new_cfg.fusion.depth_reliability = "valid_support_v2"
+        new_cfg.fusion.p2_match_refine = True
+        new = MMYOLO(new_cfg).train()
+        state = dict(old.state_dict())
+        state.pop("metric_gain_logit", None)  # emulate a real V4.4 checkpoint
+        migrated, changed = adapt_depth_checkpoint_state(state, new)
+        self.assertTrue(changed)
+        new.load_state_dict(migrated, strict=True)
+        reset_incremental_router_additions(new)
+        old.infer_canvas = new.infer_canvas = (64, 96)
+        rgb, ir, dep = self.inputs()
+        with torch.no_grad():
+            a = old(rgb, ir, dep)
+            b = new(rgb, ir, dep)
+        self.assertTrue(torch.equal(a["boxes"], b["boxes"]))
+        self.assertTrue(torch.equal(a["scores"], b["scores"]))
+        self.assertTrue(torch.equal(new._semantic_flows["p3"][0],
+                                    torch.zeros_like(new._semantic_flows["p3"][0])))
 
     def test_v45_full_detection_backward_is_finite_and_aux_sensitive(self):
         c = config(checkpoint=True)

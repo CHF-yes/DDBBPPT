@@ -123,11 +123,10 @@ class FusionCfg:
     match_floor: float = 0.0
     # 按模态的共享辅助检测支路权重 (rgb, ir, dep)；空表示三个都用 branch_aux_weight。
     branch_aux_weights: Tuple[float, ...] = ()
-    # V4.5 keeps the audited V4.4 modules in the state dict for warm-start
-    # compatibility, but routes deployment features through a spatial evidence
-    # router.  Unlike the legacy scalar residual switch, evidence_router_v3 has
-    # per-position/per-channel gates and an exact RGB identity initialization.
-    fusion_strategy: str = "legacy_residual_v2"  # legacy_residual_v2 / evidence_router_v3
+    # V4.5 replaces the deployment route with a spatial evidence router.
+    # v44_incremental_router_v1 instead keeps the learned V4.4 fusion as the
+    # exact base function and adds only zero-initialized spatial corrections.
+    fusion_strategy: str = "legacy_residual_v2"  # legacy_residual_v2 / evidence_router_v3 / v44_incremental_router_v1
     ir_coarse_align: bool = False
     ir_affine_max_degrees: float = 5.0
     ir_affine_max_shift: float = 10.0       # canvas pixels

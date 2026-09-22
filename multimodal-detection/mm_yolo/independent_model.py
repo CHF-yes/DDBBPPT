@@ -147,6 +147,12 @@ class IndependentMMYOLO(nn.Module):
             encoder[0].conv = conv
         self.metric_encoder = nn.ModuleDict({s: nn.Sequential(nn.Conv2d(4, 64, 1), nn.SiLU(),
                                                               nn.Conv2d(64, c, 1, bias=False)) for s, c in self.channels.items()})
+        # V4.4 used a fixed 0.1 metric residual.  A bounded learnable gain starts
+        # at exactly the same value, so V4.4 checkpoints retain their function
+        # while valid absolute distance can become more useful during fine-tune.
+        metric_initial = .1 / .5
+        self.metric_gain_logit = nn.Parameter(torch.full(
+            (len(SCALES),), math.log(metric_initial / (1 - metric_initial))))
         dim, md = cfg.fusion.spatial_dim, cfg.fusion.bus_dim
         self.embeddings = nn.ModuleDict({s: nn.ModuleList([EvidenceEmbedding(c, dim) for _ in MODES]) for s,c in self.channels.items()})
         for blocks in self.embeddings.values():
@@ -155,10 +161,11 @@ class IndependentMMYOLO(nn.Module):
         matcher_scales = SCALES if cfg.fusion.p2_match_refine else ("p3", "p4", "p5")
         self.matchers = nn.ModuleDict({s: nn.ModuleList([LocalCorrespondence() for _ in range(2)]) for s in matcher_scales})
         self.fusion = nn.ModuleDict({s: ComplementaryFusion(c, dim, md) for s,c in self.channels.items()})
-        if cfg.fusion.fusion_strategy not in ("legacy_residual_v2", "evidence_router_v3"):
+        if cfg.fusion.fusion_strategy not in (
+                "legacy_residual_v2", "evidence_router_v3", "v44_incremental_router_v1"):
             raise ValueError(f"unknown fusion strategy: {cfg.fusion.fusion_strategy}")
         self.evidence_router = nn.ModuleDict()
-        if cfg.fusion.fusion_strategy == "evidence_router_v3":
+        if cfg.fusion.fusion_strategy in ("evidence_router_v3", "v44_incremental_router_v1"):
             self.evidence_router = nn.ModuleDict({
                 s: SpatialEvidenceRouter(c, dim, md, context_kernel=5 if s in ("p2", "p3") else 3)
                 for s, c in self.channels.items()
@@ -211,7 +218,7 @@ class IndependentMMYOLO(nn.Module):
         self.neck_memory = NeckMemoryRead(p2_ch, md, cfg.fusion.heads)
         self.localization = nn.ModuleList([Conv(self.channels[s], c, 1) for s,c in zip(SCALES,self.neck_channels)])
         self.occlusion_context = nn.ModuleList()
-        if cfg.fusion.fusion_strategy == "evidence_router_v3":
+        if cfg.fusion.fusion_strategy in ("evidence_router_v3", "v44_incremental_router_v1"):
             for c in self.neck_channels[:2]:
                 block = nn.Sequential(
                     nn.Conv2d(c, c, 7, padding=3, groups=c, bias=False),
@@ -289,9 +296,10 @@ class IndependentMMYOLO(nn.Module):
         metric = torch.cat((absolute,
                             torch.log1p(20*absolute.float())/math.log(21),
                             depth[:,2:3], metric_valid), 1)
-        for s in SCALES:
+        for i, s in enumerate(SCALES):
             values, fraction = masked_pool(metric, metric_valid, raw[s].shape[-2:])
-            raw[s] = raw[s] + .1*self.metric_encoder[s](values) * (fraction > 0)
+            gain = .5 * self.metric_gain_logit[i].sigmoid()
+            raw[s] = raw[s] + gain*self.metric_encoder[s](values) * (fraction > 0)
         return raw, absolute, metric_valid
 
     def independent_branch_prediction(self, name, ir=None, depth=None, keep=None):
@@ -467,10 +475,20 @@ class IndependentMMYOLO(nn.Module):
                 similarity = (F.normalize(c[0].detach().float(),dim=1)*F.normalize(c[m].float(),dim=1)).sum(1,keepdim=True)
                 alignment_loss = alignment_loss + ((1-similarity)*weight).sum()/weight.sum().clamp_min(1)/8
             aligned_common[s], aligned_masks[s] = c, mask
-            fusion_block = (self.evidence_router[s]
-                            if self.cfg.fusion.fusion_strategy == "evidence_router_v3"
-                            else self.fusion[s])
-            fused[s] = fusion_block(values,c,u,mask,confidence[s],rel,state,qual)
+            if self.cfg.fusion.fusion_strategy == "evidence_router_v3":
+                fusion_block = self.evidence_router[s]
+                fused[s] = fusion_block(values,c,u,mask,confidence[s],rel,state,qual)
+            elif self.cfg.fusion.fusion_strategy == "v44_incremental_router_v1":
+                # Preserve the complete learned V4.4 route.  The new router is
+                # evaluated around that base and its zero-initialized output and
+                # context projections make the migration function-preserving.
+                base = self.fusion[s](values,c,u,mask,confidence[s],rel,state,qual)
+                fusion_block = self.evidence_router[s]
+                fused[s] = fusion_block(
+                    values,c,u,mask,confidence[s],rel,state,qual,anchor=base)
+            else:
+                fusion_block = self.fusion[s]
+                fused[s] = fusion_block(values,c,u,mask,confidence[s],rel,state,qual)
             fusion_block.last_health["ir_flow_rms"] = flows[s][0].detach().float().square().mean().sqrt()
             fusion_block.last_health["dep_flow_rms"] = flows[s][1].detach().float().square().mean().sqrt()
             # values are already identity/residual aligned in V4.2, so match must
