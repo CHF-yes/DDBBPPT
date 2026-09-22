@@ -339,6 +339,67 @@ def _run_dev(cfg: MC.ModelConfig, args, run_root: Path, stage: Path, trainer_typ
     return best
 
 
+def _run_localization(cfg: MC.ModelConfig, args, run_root: Path, stage: Path,
+                      trainer_type, validator_type, source: Path, state: dict) -> Path:
+    """Run a separately selectable high-resolution FP32 localization phase.
+
+    This phase intentionally keeps the validation split out of training.  It is
+    therefore a real model-selection result, unlike the optional all-data refit.
+    """
+    phase_dir = run_root / "phase2_localization"
+    last, best = phase_dir / "weights" / "last.pt", phase_dir / "weights" / "best.pt"
+    if args.resume and last.is_file() and not state.get("localization_complete"):
+        LOGGER.info(f"Phase 2 定位精修断点续训：{last}")
+        YOLO(str(last)).train(resume=True, trainer=trainer_type)
+    elif not state.get("localization_complete"):
+        h = cfg.hyper
+        kw = _common_overrides(cfg, args, stage / args.dev_yaml, run_root, "phase2_localization")
+        kw.update({
+            "epochs": args.localization_epochs,
+            # FP32 activations cost more memory; keep effective nbs semantics but
+            # halve only the physical batch on the server.
+            "batch": max(1, args.batch // 2) if not h.localization_amp else args.batch,
+            "optimizer": "AdamW",
+            "lr0": args.localization_lr,
+            "lrf": 0.20,
+            "warmup_epochs": 1.0,
+            "patience": 0,
+            "val": True,
+            "amp": h.localization_amp,
+            "mosaic": 0.0,
+            "mixup": 0.0,
+            "cutmix": 0.0,
+            "copy_paste": 0.0,
+            "close_mosaic": 0,
+            "scale": 0.08,
+            "translate": 0.015,
+            "hsv_h": min(h.aug.hsv_h, 0.008),
+            "hsv_s": min(h.aug.hsv_s, 0.20),
+            "hsv_v": min(h.aug.hsv_v, 0.16),
+        })
+        LOGGER.info(
+            f"Phase 2 定位精修：仍使用固定 train/val，imgsz={args.imgsz}, "
+            f"physical_batch={kw['batch']}, amp={kw['amp']}, epochs={args.localization_epochs}")
+        YOLO(str(source)).train(trainer=trainer_type, **kw)
+    if not best.is_file():
+        raise FileNotFoundError(f"Phase 2 完成但不存在 best.pt：{best}")
+
+    if not state.get("localization_complete"):
+        metrics = YOLO(str(best)).val(
+            validator=validator_type,
+            data=str((stage / args.dev_yaml).resolve()), split="val",
+            imgsz=args.imgsz, batch=max(1, args.batch // 2), workers=args.workers,
+            device=args.device, conf=0.001, iou=0.7, max_det=100,
+            plots=False, verbose=True)
+        report = _metrics_payload(metrics, best, args.split_file, args.imgsz)
+        _json_dump(phase_dir / "formal_eval.json", report)
+        state.update({"localization_complete": True,
+                      "localization_best": str(best.resolve()),
+                      "localization_metrics": report})
+        _json_dump(run_root / "state.json", state)
+    return best
+
+
 def _run_full(cfg: MC.ModelConfig, args, run_root: Path, stage: Path, trainer_type,
               source: Path, state: dict) -> Path:
     phase_dir = run_root / "phase2_full"
@@ -351,12 +412,14 @@ def _run_full(cfg: MC.ModelConfig, args, run_root: Path, stage: Path, trainer_ty
         kw = _common_overrides(cfg, args, stage / "dataset_full.yaml", run_root, "phase2_full")
         kw.update({
             "epochs": args.full_finetune_epochs,
+            "batch": max(1, args.batch // 2) if not h.full_finetune_amp else args.batch,
             "optimizer": "AdamW",
             "lr0": args.full_finetune_lr,
             "lrf": 0.20,
             "warmup_epochs": 1.0,
             "patience": 0,
             "val": False,
+            "amp": h.full_finetune_amp,
             "mosaic": 0.0,
             "mixup": 0.0,
             "cutmix": 0.0,
@@ -369,7 +432,7 @@ def _run_full(cfg: MC.ModelConfig, args, run_root: Path, stage: Path, trainer_ty
             "hsv_v": min(h.aug.hsv_v, 0.20),
         })
         LOGGER.info(
-            f"Phase 2 开始：从 Phase 1 best 新建 AdamW/EMA，用全量数据低 LR 精修 "
+            f"全量提交精修开始：从已选 best 新建 AdamW/EMA，用全量数据低 LR 精修 "
             f"{args.full_finetune_epochs} 轮；此阶段验证集已进入训练，指标不作泛化成绩。")
         YOLO(str(source)).train(trainer=trainer_type, **kw)
     if not last.is_file():
@@ -400,6 +463,9 @@ def parse_args() -> argparse.Namespace:
                         help="<=0 表示关闭；默认使用注册表（正式配置为关闭但记录范数）")
     parser.add_argument("--rare-target-images", type=int, default=None)
     parser.add_argument("--rare-max-repeat", type=int, default=None)
+    parser.add_argument("--localization-epochs", type=int, default=None,
+                        help="固定train/val上的独立FP32定位精修轮数；0=跳过")
+    parser.add_argument("--localization-lr", type=float, default=None)
     parser.add_argument("--full-finetune-epochs", type=int, default=None)
     parser.add_argument("--full-finetune-lr", type=float, default=None)
     parser.add_argument("--no-full-finetune", action="store_true")
@@ -431,6 +497,11 @@ def main() -> None:
                                else h.rare_target_images)
     args.rare_max_repeat = (args.rare_max_repeat if args.rare_max_repeat is not None
                             else h.rare_max_repeat)
+    args.localization_epochs = (args.localization_epochs
+                                 if args.localization_epochs is not None
+                                 else h.localization_epochs)
+    args.localization_lr = (args.localization_lr if args.localization_lr is not None
+                             else h.localization_lr)
     args.full_finetune_epochs = (args.full_finetune_epochs
                                  if args.full_finetune_epochs is not None
                                  else h.full_finetune_epochs)
@@ -440,9 +511,12 @@ def main() -> None:
     clip = None if clip is None or clip <= 0 else float(clip)
     if args.batch < 1 or args.epochs < 1 or args.imgsz < 320:
         raise SystemExit("batch/epochs 必须为正，imgsz 必须 >= 320")
+    if args.localization_epochs < 0 or (args.localization_epochs and args.localization_lr <= 0):
+        raise SystemExit("localization-epochs 必须 >=0，启用时 localization-lr 必须 >0")
     args.dev_yaml = "dataset_dev.yaml"
     if args.smoke:
         args.epochs = 1
+        args.localization_epochs = min(args.localization_epochs, 1)
         args.workers = 0
         args.no_full_finetune = True
         args.dev_yaml = "dataset_smoke.yaml"
@@ -451,7 +525,7 @@ def main() -> None:
     stage = run_root / "dataset"
     state_path = run_root / "state.json"
     if not args.resume and any((run_root / p / "weights" / "last.pt").exists()
-                               for p in ("phase1_dev", "phase2_full")):
+                               for p in ("phase1_dev", "phase2_localization", "phase2_full")):
         raise FileExistsError(f"运行目录已有 checkpoint；请换 --name 或显式 --resume：{run_root}")
     run_root.mkdir(parents=True, exist_ok=True)
     _add_file_log(run_root / "train.log")
@@ -485,14 +559,18 @@ def main() -> None:
                     else MC.resolve_pretrained_weights(h.pretrained_weights))
     if not args.weights.is_file():
         raise FileNotFoundError(f"预训练权重不存在：{args.weights}")
-    TR.configure_rgb_trainer(clip)
+    TR.configure_rgb_trainer(clip, rect_train=h.rect_train)
     validator_type, trainer_type = TR.get_rgb_trainer_types()
     state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.is_file() else {
-        "phase1_complete": False, "phase2_complete": False}
+        "phase1_complete": False, "localization_complete": False,
+        "phase2_complete": False}
 
     _keep_awake(True)
     try:
         best = _run_dev(cfg, args, run_root, stage, trainer_type, validator_type, state)
+        if args.localization_epochs > 0:
+            best = _run_localization(
+                cfg, args, run_root, stage, trainer_type, validator_type, best, state)
         if args.no_full_finetune or args.full_finetune_epochs <= 0:
             final = best
             state.update({"final_checkpoint": str(final.resolve()), "phase2_skipped": True})

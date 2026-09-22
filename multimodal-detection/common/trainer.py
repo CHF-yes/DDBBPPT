@@ -13,9 +13,11 @@ import models_config as MC
 
 try:  # 保持纯配置工具在未装训练依赖时仍可 import；真正训练时会在下方给出明确错误。
     import torch
+    from ultralytics.data import build_yolo_dataset
     from ultralytics.models.yolo.detect.train import DetectionTrainer
     from ultralytics.models.yolo.detect.val import DetectionValidator
     from ultralytics.utils import LOGGER, nms
+    from ultralytics.utils.torch_utils import unwrap_model
 except ImportError:  # pragma: no cover - 仅用于轻量配置环境
     torch = None
     DetectionTrainer = object
@@ -97,12 +99,14 @@ def train_config_prints(cfg: MC.ModelConfig) -> str:
 
 
 def configure_rgb_trainer(grad_clip_norm: Optional[float], localization_scale: float = 0.12,
-                          localization_translate: float = 0.03) -> None:
+                          localization_translate: float = 0.03,
+                          rect_train: bool = False) -> None:
     """Configure custom RGB trainer in an environment-safe way (also survives Ultralytics DDP spawn)."""
     value = 0.0 if grad_clip_norm is None else float(grad_clip_norm)
     os.environ["EFYOLO_GRAD_CLIP_NORM"] = str(value)
     os.environ["EFYOLO_LOCALIZATION_SCALE"] = str(float(localization_scale))
     os.environ["EFYOLO_LOCALIZATION_TRANSLATE"] = str(float(localization_translate))
+    os.environ["EFYOLO_RECT_TRAIN"] = "1" if rect_train else "0"
 
 
 def _report_gradient_health(trainer) -> None:
@@ -153,6 +157,9 @@ class HighQualityDetectionTrainer(DetectionTrainer):
     """Official detector trainer with audited NMS, gradient policy and late localization phase."""
 
     def __init__(self, *args, **kwargs):
+        # Set before BaseTrainer builds datasets; the environment also survives
+        # Ultralytics' optional DDP subprocess launch.
+        self._rect_train = os.environ.get("EFYOLO_RECT_TRAIN", "0") == "1"
         super().__init__(*args, **kwargs)
         raw = float(os.environ.get("EFYOLO_GRAD_CLIP_NORM", "0"))
         self._grad_clip_norm = raw if raw > 0 and math.isfinite(raw) else None
@@ -163,8 +170,22 @@ class HighQualityDetectionTrainer(DetectionTrainer):
         self._grad_nonfinite = 0
         LOGGER.info(
             f"[rgb-hq] audited trainer active; gradient clip="
-            f"{'off (monitor only)' if self._grad_clip_norm is None else self._grad_clip_norm}"
+            f"{'off (monitor only)' if self._grad_clip_norm is None else self._grad_clip_norm}; "
+            f"rect_train={self._rect_train}"
         )
+
+    def build_dataset(self, img_path: str, mode: str = "train", batch: int | None = None):
+        """Use true rectangular batches for the all-16:9 RGB data when requested.
+
+        Ultralytics' detection trainer hard-codes rectangular batches to validation.
+        Here all images have exactly the same aspect ratio, so training remains
+        shuffleable while an ``imgsz=1280`` request produces a 736x1280 batch
+        instead of a 1280x1280 canvas with 44% padding.
+        """
+        stride = max(int(unwrap_model(self.model).stride.max()), 32)
+        rect = mode == "val" or (mode == "train" and self._rect_train)
+        return build_yolo_dataset(
+            self.args, img_path, batch, self.data, mode=mode, rect=rect, stride=stride)
 
     def get_validator(self):
         return CompleteDetectionValidator(

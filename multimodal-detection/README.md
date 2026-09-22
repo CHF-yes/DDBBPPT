@@ -31,6 +31,7 @@ multimodal-detection/
 
 ```bash
 python train_rgb.py \
+  --config rgb_hq_11m_rect \
   --data-root /data/train_extracted \
   --labels /data/new_labels_2000 \
   --split-file configs/split_s42.json \
@@ -38,10 +39,13 @@ python train_rgb.py \
   --device 0 --batch 16 --workers 12
 ```
 
-默认模型为 YOLO11m，输入画布为 **960×960 正方形**。原图按长宽比缩放后
-letterbox 补边，并非拉伸成正方形。训练先使用固定 1600/400 划分选择 `best.pt`，
-随后用全部 2000 张图低学习率精修 18 轮。中断后在完全相同的命令末尾加
-`--resume`，以恢复 optimizer、GradScaler 和 EMA。
+`rgb_hq_11m_rect` 仍是标准 YOLO11m，但利用本数据全部为 16:9 的事实，以
+`imgsz=1280 + rect train` 形成约 **736×1280** 的批画布；相同像素预算不再把
+44% 算力浪费在正方形黑边上。先使用固定 1600/400 划分训练，再在同一划分上
+单独进行 FP32 弱增强定位精修并重新选择 `best.pt`；最后的全量 2000 图精修被
+明确视为提交阶段，不作为泛化成绩。旧 `rgb_hq_11m` 配方仍保留用于复现
+960×960 基线。中断后在完全相同的命令末尾加 `--resume`，以恢复 optimizer、
+GradScaler 和 EMA。
 
 生成 RGB 提交包：
 

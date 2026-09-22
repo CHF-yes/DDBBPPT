@@ -93,10 +93,15 @@ class HyperParams:
     cls: float = 0.5
     dfl: float = 1.5
     grad_clip_norm: Optional[float] = None
+    rect_train: bool = False
     rare_target_images: int = 80
     rare_max_repeat: int = 6
+    localization_epochs: int = 0
+    localization_lr: float = 1e-4
+    localization_amp: bool = False
     full_finetune_epochs: int = 18
     full_finetune_lr: float = 1.5e-4
+    full_finetune_amp: bool = True
     aug: AugmentParams = field(default_factory=AugmentParams)
 
 
@@ -123,7 +128,48 @@ RGB_HQ_11M = ModelConfig(
     data_prep="固定group-aware 1600/400划分；训练结束后全量2000图低学习率精修。",
 )
 
-_MODELS = [RGB_HQ_11M]
+
+RGB_HQ_11M_RECT = ModelConfig(
+    key="rgb_hq_11m_rect",
+    name="RGB长画布高定位模型",
+    description="YOLO11m COCO预训练，16:9训练画布和独立FP32定位精修",
+    hyper=HyperParams(
+        pretrained_weights="yolo11m.pt",
+        epochs=140,
+        imgsz=1280,
+        batch=4,
+        optimizer="AdamW",
+        lr0=6e-4,
+        lrf=0.03,
+        warmup_epochs=3.0,
+        patience=0,
+        rect_train=True,
+        rare_target_images=96,
+        rare_max_repeat=8,
+        localization_epochs=24,
+        localization_lr=1e-4,
+        localization_amp=False,
+        full_finetune_epochs=12,
+        full_finetune_lr=5e-5,
+        full_finetune_amp=False,
+        aug=AugmentParams(
+            scale=0.20,
+            translate=0.04,
+            mosaic_p=0.0,
+            close_mosaic_epochs=0,
+            mixup_p=0.0,
+            hsv_s=0.45,
+            hsv_v=0.30,
+        ),
+    ),
+    notes=(
+        "原图全部为16:9；imgsz=1280配合rect train得到约736x1280批画布。"
+        "Phase 2仍只看固定train/val并用FP32选best；全量精修单独标记，不冒充泛化成绩。"
+    ),
+    data_prep="固定group-aware 1600/400划分；稀有类追加后保持每轮完整覆盖。",
+)
+
+_MODELS = [RGB_HQ_11M, RGB_HQ_11M_RECT]
 MODELS: Dict[str, ModelConfig] = {model.key: model for model in _MODELS}
 
 
