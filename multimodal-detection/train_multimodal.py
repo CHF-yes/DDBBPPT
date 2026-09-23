@@ -69,7 +69,8 @@ def main():
               "--depth-resampling","nearest_valid_v2","--metric-branch","--register-bus",
               "--depth-scales","all","--sampler","coverage","--rare-extra-frac","0.10",
               "--memory-control","bounded_v2","--no-prior",
-              "--no-deformable","--val-batch","1","--val-conf","0.001","--save-every","1"]
+              "--no-deformable","--val-batch",str(cfg.get("val_batch", 1)),
+              "--val-conf","0.001","--save-every","1"]
     keys = ("architecture","imgsz","epochs","batch","accum","workers","precision","lr","backbone_lr_mult",
             "fusion_lr_mult","p2_lr_mult","detector_lr_mult","semantic_lr_mult","ir_read_mode",
             "freeze_epochs","warmup","lrf","grad_clip","calibrate_clip_steps","bn_policy","mosaic","close_aug_frac",
