@@ -16,12 +16,13 @@ from train import (build_optimizer, set_encoder_frozen, apply_bn_policy, make_ta
                    set_anchored_joint_mode, set_independent_aux_mode,
                    set_residual_fusion_mode, enable_trainable_defaults,
                    adapt_depth_checkpoint_state, reset_rgb_identity_residuals,
-                   reset_incremental_router_additions)
+                   reset_incremental_router_additions, reset_v48_additions)
 from data import (MMDataset, AugCfg, collate, scheduled_aug, centered_affine_M,
                   _target_occlusion)
 from independent_fusion import (warp, resize_flow, identity_residual_align,
                                 LocalCorrespondence, affine_flow,
-                                SpatialEvidenceRouter, TrustedEvidenceRouter)
+                                SpatialEvidenceRouter, TrustedEvidenceRouter,
+                                EmbeddingComplementPlugin)
 from independent_model import depth_reliability_map
 from ultralytics.utils.loss import v8DetectionLoss
 
@@ -207,6 +208,33 @@ class IndependentV3Tests(unittest.TestCase):
                             output[-1].weight.grad.abs().sum() > 0
                             for output in router.outputs))
 
+    def test_v48_plugin_is_identity_has_gradients_and_masks_depth(self):
+        torch.manual_seed(10)
+        plugin = EmbeddingComplementPlugin(32, dim=16, memory_dim=24).train()
+        common = [torch.randn(2, 16, 8, 12) for _ in range(3)]
+        private = [torch.randn(2, 16, 8, 12) for _ in range(3)]
+        valid = [torch.ones(2, 1, 8, 12) for _ in range(3)]
+        reliable = [torch.ones(2, 1, 8, 12) for _ in range(3)]
+        memory = torch.randn(2, 4, 3, 24)
+        anchor = torch.randn(2, 32, 8, 12)
+        fused, geometry = plugin(common, private, valid, reliable, memory, anchor)
+        self.assertTrue(torch.equal(fused, anchor))
+        self.assertEqual(float(geometry.abs().max()), 0.)
+        # At exact zero, geometry.square() has a zero derivative.  A detector's
+        # regression path supplies a non-zero upstream gradient, modelled here
+        # by a linear geometry term.
+        (fused.square().mean() + geometry.mean()).backward()
+        for output in (plugin.ir_shared, plugin.ir_private, plugin.depth_support):
+            self.assertIsNotNone(output[-1].weight.grad)
+            self.assertGreater(float(output[-1].weight.grad.abs().sum()), 0.)
+        plugin.zero_grad(set_to_none=True)
+        valid[2].zero_()
+        _, a = plugin(common, private, valid, reliable, memory, anchor)
+        common[2].mul_(100)
+        private[2].mul_(-100)
+        _, b = plugin(common, private, valid, reliable, memory, anchor)
+        self.assertTrue(torch.equal(a, b))
+
     def test_target_occlusion_is_reproducible_and_keeps_labels_external(self):
         rgb = np.full((64, 96, 3), 120, np.uint8)
         ir = np.full_like(rgb, 80)
@@ -289,6 +317,46 @@ class IndependentV3Tests(unittest.TestCase):
         self.assertTrue(all(name.startswith(("evidence_router.", "ir_coarse_aligner.",
                                              "matchers.p2.0.", "matchers.p3.0."))
                             for name in trainable))
+
+    def test_v48_preserves_v44_then_releases_downstream(self):
+        old_cfg = config()
+        old_cfg.fusion.alignment_mode = "identity_residual_v2"
+        old_cfg.fusion.depth_reliability = "valid_support_v2"
+        old_cfg.fusion.p2_match_refine = True
+        old = MMYOLO(old_cfg).train()
+        new_cfg = copy.deepcopy(old_cfg)
+        new_cfg.fusion.fusion_strategy = "v48_embedding_complement_v1"
+        new_cfg.fusion.ir_coarse_align = True
+        new_cfg.fusion.branch_aux_weights = (0., .04, 0.)
+        new = MMYOLO(new_cfg).train()
+        migrated, changed = adapt_depth_checkpoint_state(old.state_dict(), new)
+        self.assertTrue(changed)
+        new.load_state_dict(migrated, strict=True)
+        reset_v48_additions(new)
+        old.infer_canvas = new.infer_canvas = (64, 96)
+        rgb, ir, dep = self.inputs()
+        with torch.no_grad():
+            a = old(rgb, ir, dep)
+            b = new(rgb, ir, dep)
+        self.assertTrue(torch.equal(a["boxes"], b["boxes"]))
+        self.assertTrue(torch.equal(a["scores"], b["scores"]))
+        # A learned, non-zero IR rotation must remain isolated from the
+        # protected V4.4 route while the additive plugin is still zero.
+        with torch.no_grad():
+            new.ir_coarse_aligner.head[-1].bias.copy_(
+                torch.tensor((.6, 0., 0., 0., 2.)))
+            c = new(rgb, ir, dep)
+        self.assertTrue(torch.equal(a["boxes"], c["boxes"]))
+        self.assertTrue(torch.equal(a["scores"], c["scores"]))
+        set_residual_fusion_mode(new, downstream_frozen=True)
+        trainable = [name for name, p in new.named_parameters() if p.requires_grad]
+        self.assertTrue(trainable)
+        self.assertTrue(all(name.startswith(("evidence_router.", "ir_coarse_aligner."))
+                            for name in trainable))
+        set_residual_fusion_mode(new, downstream_frozen=False)
+        self.assertTrue(any(p.requires_grad for p in new.aux_encoders["ir"].parameters()))
+        self.assertTrue(any(p.requires_grad for p in new.backbone.model[13].parameters()))
+        self.assertFalse(any(p.requires_grad for p in new.fusion.parameters()))
 
     def test_v45_full_detection_backward_is_finite_and_aux_sensitive(self):
         c = config(checkpoint=True)

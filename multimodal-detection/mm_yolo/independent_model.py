@@ -17,7 +17,7 @@ from ultralytics.nn.modules import Conv, C3k2, Detect
 from ultralytics.cfg import DEFAULT_CFG
 from independent_fusion import (EvidenceEmbedding, LocalCorrespondence,
                                 ComplementaryFusion, SpatialEvidenceRouter,
-                                TrustedEvidenceRouter,
+                                TrustedEvidenceRouter, EmbeddingComplementPlugin,
                                 CoarseAffineAligner, affine_flow,
                                 identity_residual_align, warp, resize_flow)
 from memory_fusion import CrossScaleMemory, NeckMemoryRead, masked_pool
@@ -168,7 +168,7 @@ class IndependentMMYOLO(nn.Module):
         self.fusion = nn.ModuleDict({s: ComplementaryFusion(c, dim, md) for s,c in self.channels.items()})
         if cfg.fusion.fusion_strategy not in (
                 "legacy_residual_v2", "evidence_router_v3", "v44_incremental_router_v1",
-                "v47_trusted_evidence_v1"):
+                "v47_trusted_evidence_v1", "v48_embedding_complement_v1"):
             raise ValueError(f"unknown fusion strategy: {cfg.fusion.fusion_strategy}")
         self.evidence_router = nn.ModuleDict()
         if cfg.fusion.fusion_strategy in ("evidence_router_v3", "v44_incremental_router_v1"):
@@ -179,6 +179,10 @@ class IndependentMMYOLO(nn.Module):
         elif cfg.fusion.fusion_strategy == "v47_trusted_evidence_v1":
             self.evidence_router = nn.ModuleDict({
                 s: TrustedEvidenceRouter(c, dim, md) for s, c in self.channels.items()
+            })
+        elif cfg.fusion.fusion_strategy == "v48_embedding_complement_v1":
+            self.evidence_router = nn.ModuleDict({
+                s: EmbeddingComplementPlugin(c, dim, md) for s, c in self.channels.items()
             })
         self.ir_coarse_aligner = (CoarseAffineAligner(dim)
                                   if cfg.fusion.ir_coarse_align else None)
@@ -391,11 +395,20 @@ class IndependentMMYOLO(nn.Module):
                 ir_affine_conf = ir_affine_prediction_conf
             max_angle = math.radians(float(self.cfg.fusion.ir_affine_max_degrees))
             canvas_h, canvas_w = getattr(self, "infer_canvas", (h, w))
-            physical = torch.stack((
-                raw_affine[:, 0] * max_angle,
-                raw_affine[:, 1] * float(self.cfg.fusion.ir_affine_max_shift) / float(canvas_w),
-                raw_affine[:, 2] * float(self.cfg.fusion.ir_affine_max_shift) / float(canvas_h),
-                raw_affine[:, 3] * float(self.cfg.fusion.ir_affine_max_scale)), 1)
+            if self.cfg.fusion.fusion_strategy == "v48_embedding_complement_v1":
+                # The observed physical defect is irregular IR tilt.  V4.8 does
+                # not invent unseen translation/scale and learns rotation only.
+                physical = torch.stack((
+                    raw_affine[:, 0] * max_angle,
+                    raw_affine[:, 1] * 0,
+                    raw_affine[:, 2] * 0,
+                    raw_affine[:, 3] * 0), 1)
+            else:
+                physical = torch.stack((
+                    raw_affine[:, 0] * max_angle,
+                    raw_affine[:, 1] * float(self.cfg.fusion.ir_affine_max_shift) / float(canvas_w),
+                    raw_affine[:, 2] * float(self.cfg.fusion.ir_affine_max_shift) / float(canvas_h),
+                    raw_affine[:, 3] * float(self.cfg.fusion.ir_affine_max_scale)), 1)
             for s in SCALES:
                 ir_affine_flow[s] = affine_flow(physical, raw[0][s].shape[-2:])
             self._ir_affine_prediction = raw_affine
@@ -420,13 +433,15 @@ class IndependentMMYOLO(nn.Module):
                     # Only P2/P3 need local correction after the image-level
                     # affine.  At coarse scales, a learned local warp is more
                     # likely to confuse cross-modal appearance with geometry.
-                    if s in ("p2", "p3"):
+                    if (s in ("p2", "p3") and
+                            self.cfg.fusion.fusion_strategy != "v48_embedding_complement_v1"):
                         scene = (None if not quality or "scene_id" not in quality else
                                  F.interpolate(quality["scene_id"].float(), shape, mode="nearest"))
                         flow, conf = self.matchers[s][m-1](
                             commons[s][0], commons[s][m], masks[s][0], masks[s][m],
                             coarse, scene)
-                        if self.cfg.fusion.fusion_strategy == "v47_trusted_evidence_v1":
+                        if self.cfg.fusion.fusion_strategy in (
+                                "v47_trusted_evidence_v1", "v48_embedding_complement_v1"):
                             # Local correction is conditional on the image-level
                             # detector accepting that this sample is misaligned.
                             conf = conf * coarse_conf
@@ -463,6 +478,8 @@ class IndependentMMYOLO(nn.Module):
             qual = [None if not quality or m not in quality else F.interpolate(quality[m].float(),own[0].shape[-2:],mode="bilinear",align_corners=False) for m in MODES]
             scene = None if not quality or "scene_id" not in quality else F.interpolate(quality["scene_id"].float(),own[0].shape[-2:],mode="nearest")
             c,u,mask,rel,values = [commons[s][0]], [privates[s][0]], [masks[s][0]], [reliabilities[s][0]], [own[0]]
+            plugin_c, plugin_u = [commons[s][0]], [privates[s][0]]
+            plugin_mask, plugin_rel = [masks[s][0]], [reliabilities[s][0]]
             for m in range(1,3):
                 flow = flows[s][m-1]
                 vm = warp(masks[s][m],flow).clamp(0,1)
@@ -492,16 +509,46 @@ class IndependentMMYOLO(nn.Module):
                         qual[m] = warp(qual[m], flow) * vm
                 else:
                     raise ValueError(f"unknown alignment mode: {self.cfg.fusion.alignment_mode}")
-                c.append(ac)
-                u.append(au)
-                mask.append(am)
-                rel.append(ar)
-                values.append(av)
+                # V4.8 keeps the complete V4.4 route on the nominal IR grid.
+                # The corrected IR is visible only to the zero-initialized
+                # additive plugin, so a wrong angle cannot corrupt the base.
+                if (self.cfg.fusion.fusion_strategy == "v48_embedding_complement_v1"
+                        and m == 1):
+                    plugin_c.append(ac)
+                    plugin_u.append(au)
+                    plugin_mask.append(am)
+                    plugin_rel.append(ar)
+                    base_mask = masks[s][m]
+                    c.append(commons[s][m] * base_mask)
+                    u.append(privates[s][m] * base_mask)
+                    mask.append(base_mask)
+                    rel.append(reliabilities[s][m] * base_mask)
+                    values.append(own[m] * base_mask)
+                else:
+                    c.append(ac)
+                    u.append(au)
+                    mask.append(am)
+                    rel.append(ar)
+                    values.append(av)
+                    plugin_c.append(ac)
+                    plugin_u.append(au)
+                    plugin_mask.append(am)
+                    plugin_rel.append(ar)
                 weight = (rel[m] if self.cfg.fusion.alignment_mode == "identity_residual_v2"
                           else confidence[s][m] * rel[m]).detach()
-                similarity = (F.normalize(c[0].detach().float(),dim=1)*F.normalize(c[m].float(),dim=1)).sum(1,keepdim=True)
+                aligned_for_loss = (plugin_c[m]
+                                    if self.cfg.fusion.fusion_strategy == "v48_embedding_complement_v1"
+                                    else c[m])
+                similarity = (F.normalize(c[0].detach().float(),dim=1)*
+                              F.normalize(aligned_for_loss.float(),dim=1)).sum(1,keepdim=True)
                 alignment_loss = alignment_loss + ((1-similarity)*weight).sum()/weight.sum().clamp_min(1)/8
             aligned_common[s], aligned_masks[s] = c, mask
+            base_match = confidence[s]
+            if self.cfg.fusion.fusion_strategy == "v48_embedding_complement_v1":
+                # The learned V4.4 route treated IR as nominally registered.
+                # Rotation confidence belongs only to the new additive plugin.
+                base_match = list(confidence[s])
+                base_match[1] = masks[s][1].float()
             if self.cfg.fusion.fusion_strategy == "evidence_router_v3":
                 fusion_block = self.evidence_router[s]
                 fused[s] = fusion_block(values,c,u,mask,confidence[s],rel,state,qual)
@@ -517,10 +564,18 @@ class IndependentMMYOLO(nn.Module):
                 # V4.4 remains the immutable detector route.  The plugin has no
                 # unconditional context branch and can write only target-evidence
                 # gated, bounded IR/Depth residuals.
-                base = self.fusion[s](values,c,u,mask,confidence[s],rel,state,qual)
+                base = self.fusion[s](values,c,u,mask,base_match,rel,state,qual)
                 fusion_block = self.evidence_router[s]
                 fused[s] = fusion_block(
                     values,c,u,mask,confidence[s],rel,state,qual,anchor=base)
+            elif self.cfg.fusion.fusion_strategy == "v48_embedding_complement_v1":
+                # V4.4 is the protected detector feature.  Corrected IR common/
+                # private embeddings can add a complement; Depth returns a
+                # localization-only support tensor used below.
+                base = self.fusion[s](values,c,u,mask,base_match,rel,state,qual)
+                fusion_block = self.evidence_router[s]
+                fused[s], depth_support = fusion_block(
+                    plugin_c, plugin_u, plugin_mask, plugin_rel, state, base)
             else:
                 fusion_block = self.fusion[s]
                 fused[s] = fusion_block(values,c,u,mask,confidence[s],rel,state,qual)
@@ -533,6 +588,8 @@ class IndependentMMYOLO(nn.Module):
             else:
                 geometry[s] = values[0]*mask[0] + sum(
                     values[m]*confidence[s][m]*rel[m] for m in (1,2))*.25
+            if self.cfg.fusion.fusion_strategy == "v48_embedding_complement_v1":
+                geometry[s] = geometry[s] + depth_support
         # Keep the two objectives separate.  Stage A benefits from information
         # preservation, while a detection fine-tune must be able to anneal both
         # terms instead of silently retaining the old fixed .01/.005 pressure.

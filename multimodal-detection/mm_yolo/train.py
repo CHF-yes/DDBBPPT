@@ -66,6 +66,8 @@ MEMORY_RECIPE = "coverage_spatial_memory_v1"
 
 def recipe_for(args):
     if getattr(args, "architecture", "") == "independent_p2_memory_v3":
+        if getattr(args, "fusion_strategy", "legacy_residual_v2") == "v48_embedding_complement_v1":
+            return "v48_v44_base_rotation_embedding_complement"
         if getattr(args, "fusion_strategy", "legacy_residual_v2") == "v47_trusted_evidence_v1":
             return "v47_trusted_evidence_frozen_v44"
         if getattr(args, "fusion_strategy", "legacy_residual_v2") == "evidence_router_v3":
@@ -201,6 +203,38 @@ def reset_incremental_router_additions(model):
         if gain is not None:
             gain.fill_(math.log(.1 / (.5 - .1)))
             reset.append("metric_gain_logit")
+    return reset
+
+
+def reset_v48_additions(model):
+    """Reset only V4.8 additions and retain every learned V4.4 tensor."""
+    reset = []
+    with torch.no_grad():
+        for scale, block in getattr(model, "evidence_router", {}).items():
+            for name in ("ir_shared", "ir_private", "depth_support"):
+                module = getattr(block, name, None)
+                if module is not None:
+                    module[-1].weight.zero_()
+                    reset.append(f"evidence_router.{scale}.{name}.{len(module)-1}.weight")
+            mix = getattr(block, "ir_mix", None)
+            if mix is not None:
+                mix[-1].weight.zero_()
+                mix[-1].bias.zero_()
+                reset += [f"evidence_router.{scale}.ir_mix.{len(mix)-1}.weight",
+                          f"evidence_router.{scale}.ir_mix.{len(mix)-1}.bias"]
+            if hasattr(block, "ir_gain_logit"):
+                fraction = .05 / float(block.max_ir_gain)
+                block.ir_gain_logit.fill_(math.log(fraction / (1 - fraction)))
+                reset.append(f"evidence_router.{scale}.ir_gain_logit")
+            if hasattr(block, "depth_gain_logit"):
+                fraction = .03 / float(block.max_depth_gain)
+                block.depth_gain_logit.fill_(math.log(fraction / (1 - fraction)))
+                reset.append(f"evidence_router.{scale}.depth_gain_logit")
+        aligner = getattr(model, "ir_coarse_aligner", None)
+        if aligner is not None:
+            aligner.head[-1].weight.zero_()
+            aligner.head[-1].bias.zero_()
+            reset += ["ir_coarse_aligner.head.2.weight", "ir_coarse_aligner.head.2.bias"]
     return reset
 
 
@@ -390,6 +424,32 @@ def set_residual_fusion_mode(model: MMYOLO, downstream_frozen: bool) -> None:
 
     incremental = getattr(model.cfg.fusion, "fusion_strategy", "") == "v44_incremental_router_v1"
     trusted = getattr(model.cfg.fusion, "fusion_strategy", "") == "v47_trusted_evidence_v1"
+    v48 = getattr(model.cfg.fusion, "fusion_strategy", "") == "v48_embedding_complement_v1"
+    if v48:
+        # Protect the learned V4.4 fusion and RGB backbone.  The short first
+        # phase learns only the exact-zero plugin/alignment.  Afterwards the
+        # auxiliary representations and downstream detector adapt at low LR.
+        enable(getattr(model, "evidence_router", None))
+        enable(getattr(model, "ir_coarse_aligner", None))
+        if not downstream_frozen:
+            enable(getattr(model, "aux_encoders", None))
+            enable(getattr(model, "metric_encoder", None))
+            if hasattr(model, "embeddings"):
+                for blocks in model.embeddings.values():
+                    for block in blocks[1:]:
+                        enable(block)
+            for name in ("p2_lateral", "p2_neck", "p2_down", "p3_refine",
+                         "localization", "neck_memory"):
+                enable(getattr(model, name, None))
+            for name in ("neck_gain", "localization_scale"):
+                value = getattr(model, name, None)
+                if value is not None:
+                    value.requires_grad_(True)
+            enable(model.backbone.model[11:])
+        dfl = getattr(model.model[-1], "dfl", None)
+        if dfl is not None:
+            dfl.requires_grad_(False)
+        return
     if trusted:
         # Strict plugin mode: protect the complete V4.4 function, including BN
         # statistics.  Only target-evidence routing and supervised IR alignment
@@ -749,7 +809,8 @@ def validate_checkpoint(ck: dict, model: MMYOLO, enabled, canvas, exact: bool = 
         current_structure.get("encoder", {}).pop("depth_input_channels", None)
         if getattr(args, "reset_fusion_gates", False):
             old_f, new_f = saved_structure.get("fusion", {}), current_structure.get("fusion", {})
-            if (old_f.get("architecture") != "spatial_memory_v1" or
+            if (not isinstance(old_f, dict) or not isinstance(new_f, dict) or
+                    old_f.get("architecture") != "spatial_memory_v1" or
                     new_f.get("architecture") != "spatial_memory_v1" or
                     old_f.get("memory_control") != "unbounded_v1" or new_f.get("memory_control") != "bounded_v2"):
                 raise ValueError("explicit gate repair only allows unbounded_v1 -> bounded_v2")
@@ -757,10 +818,12 @@ def validate_checkpoint(ck: dict, model: MMYOLO, enabled, canvas, exact: bool = 
                 raise ValueError("repair must retain the source train/validation split")
             old_f["memory_control"] = "bounded_v2"
         old_f, new_f = saved_structure.get("fusion", {}), current_structure.get("fusion", {})
-        if (old_f.get("fusion_strategy") == "legacy_residual_v2" and
+        if (isinstance(old_f, dict) and isinstance(new_f, dict) and
+                old_f.get("fusion_strategy") == "legacy_residual_v2" and
                 new_f.get("fusion_strategy") in ("evidence_router_v3",
                                                   "v44_incremental_router_v1",
-                                                  "v47_trusted_evidence_v1")):
+                                                  "v47_trusted_evidence_v1",
+                                                  "v48_embedding_complement_v1")):
             # Explicit V4.4 warm-start paths.  The incremental path keeps the
             # old fusion weights and only initializes newly named tensors below.
             for key in ("fusion_strategy", "ir_coarse_align",
@@ -1158,7 +1221,8 @@ def main():
     ap.add_argument("--independent-preserve-end-weight", type=float, default=None)
     ap.add_argument("--fusion-strategy", default="legacy_residual_v2",
                     choices=["legacy_residual_v2", "evidence_router_v3",
-                             "v44_incremental_router_v1", "v47_trusted_evidence_v1"])
+                             "v44_incremental_router_v1", "v47_trusted_evidence_v1",
+                             "v48_embedding_complement_v1"])
     ap.add_argument("--ir-coarse-align", action="store_true",
                     help="启用样本级 IR 小仿射 + P2/P3 局部残差对齐")
     ap.add_argument("--ir-affine-loss-weight", type=float, default=0.0)
@@ -1235,9 +1299,17 @@ def main():
         raise ValueError("v44_incremental_router_v1 默认保留 IR 恒等对齐，不启用样本级仿射")
     if args.fusion_strategy == "v47_trusted_evidence_v1" and not args.ir_coarse_align:
         raise ValueError("v47_trusted_evidence_v1 requires supervised IR coarse alignment")
+    if args.fusion_strategy == "v48_embedding_complement_v1" and not args.ir_coarse_align:
+        raise ValueError("V4.8 requires confidence-blended IR rotation correction")
     if args.ir_coarse_align and args.fusion_strategy not in (
-            "evidence_router_v3", "v47_trusted_evidence_v1"):
-        raise ValueError("--ir-coarse-align 只适用于 evidence_router_v3/V4.7")
+            "evidence_router_v3", "v47_trusted_evidence_v1",
+            "v48_embedding_complement_v1"):
+        raise ValueError("--ir-coarse-align 只适用于 evidence_router_v3/V4.7/V4.8")
+    if args.fusion_strategy == "v48_embedding_complement_v1" and (
+            args.ir_affine_p != 0 or args.ir_affine_shift != 0 or
+            args.ir_affine_scale != 0 or args.ir_affine_loss_weight != 0 or
+            (args.ir_affine_loss_end_weight not in (None, 0))):
+        raise ValueError("V4.8 禁止 IR-only 人工仿射/监督；仅从真实配对学习旋转校正")
     if args.late_bus and args.register_bus:
         raise ValueError("持久 register 与旧 --late-bus 不应同时开启；请选择一个做消融")
     if args.modalities == "dep" and args.depth_scales != "all":
@@ -1511,8 +1583,11 @@ def main():
         # A reset is an init-only operation.  Exact --resume must restore the
         # learned fusion/optimizer state byte-for-byte and never erase residuals.
         if args.train_stage == "residual_fusion" and not args.resume:
-            if args.fusion_strategy in ("v44_incremental_router_v1",
-                                         "v47_trusted_evidence_v1"):
+            if args.fusion_strategy == "v48_embedding_complement_v1":
+                reset_keys = reset_v48_additions(model)
+                log(f"[train] V4.8 V4.4 保底起点：仅重置新增插件 {reset_keys}")
+            elif args.fusion_strategy in ("v44_incremental_router_v1",
+                                           "v47_trusted_evidence_v1"):
                 reset_keys = reset_incremental_router_additions(model)
                 log(f"[train] V4.4 增量起点：仅重置新增模块 {reset_keys}")
             else:

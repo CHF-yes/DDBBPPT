@@ -387,3 +387,108 @@ class TrustedEvidenceRouter(nn.Module):
             "2_reliable": reliable[2].detach().float().mean(),
         }
         return state
+
+
+class EmbeddingComplementPlugin(nn.Module):
+    """V4.8 additive RGB/IR complement plus Depth geometry support.
+
+    The protected ``anchor`` is the complete learned V4.4 fused feature.  This
+    module never replaces it.  IR common/private *spatial embeddings* generate
+    two candidate residuals and a single softmax chooses their relative share;
+    there is no V4.7-style product of evidence, gain, gate, match and reliability.
+
+    Depth is intentionally asymmetric.  It sees the RGB/IR semantic embeddings
+    and valid metric support, but its output is returned as a localization-only
+    correction.  It cannot create class logits through an independent route.
+    All final projections are zero initialized, making checkpoint migration an
+    exact V4.4 function while retaining healthy gradients on the first step.
+    """
+    def __init__(self, channels, dim=64, memory_dim=128,
+                 max_ir_gain=.20, max_depth_gain=.10):
+        super().__init__()
+        hidden = max(32, min(96, channels // 2))
+        self.max_ir_gain = float(max_ir_gain)
+        self.max_depth_gain = float(max_depth_gain)
+        self.query = nn.Sequential(
+            nn.Conv2d(channels, dim, 1, bias=False),
+            nn.GroupNorm(8, dim), nn.SiLU())
+        self.memory = nn.Linear(memory_dim, dim, bias=False)
+
+        self.ir_shared = nn.Sequential(
+            nn.Conv2d(dim * 5, hidden, 1, bias=False),
+            nn.GroupNorm(8, hidden), nn.SiLU(),
+            nn.Conv2d(hidden, channels, 1, bias=False))
+        self.ir_private = nn.Sequential(
+            nn.Conv2d(dim * 3, hidden, 1, bias=False),
+            nn.GroupNorm(8, hidden), nn.SiLU(),
+            nn.Conv2d(hidden, channels, 1, bias=False))
+        self.ir_mix = nn.Sequential(
+            nn.Conv2d(dim * 4, hidden, 1, bias=False),
+            nn.GroupNorm(8, hidden), nn.SiLU(),
+            nn.Conv2d(hidden, 2, 1))
+
+        # RGB query + RGB/IR/Depth common + Depth private + valid/reliability.
+        self.depth_support = nn.Sequential(
+            nn.Conv2d(dim * 5 + 2, hidden, 1, bias=False),
+            nn.GroupNorm(8, hidden), nn.SiLU(),
+            nn.Conv2d(hidden, channels, 1, bias=False))
+
+        for output in (self.ir_shared, self.ir_private, self.depth_support):
+            nn.init.zeros_(output[-1].weight)
+        nn.init.zeros_(self.ir_mix[-1].weight)
+        nn.init.zeros_(self.ir_mix[-1].bias)
+
+        ir_fraction = .05 / self.max_ir_gain
+        dep_fraction = .03 / self.max_depth_gain
+        self.ir_gain_logit = nn.Parameter(torch.tensor(
+            math.log(ir_fraction / (1 - ir_fraction))))
+        self.depth_gain_logit = nn.Parameter(torch.tensor(
+            math.log(dep_fraction / (1 - dep_fraction))))
+        self.last_stats, self.last_health = {}, {}
+
+    @staticmethod
+    def _bounded(residual, reference):
+        scale = reference.detach().float().square().mean(
+            1, keepdim=True).sqrt().clamp_min(.1)
+        return residual / torch.sqrt(
+            1 + residual.float().square().mean(1, keepdim=True) /
+            scale.square()).to(residual.dtype)
+
+    def forward(self, common, private, valid, reliable, memory, anchor):
+        mem = self.memory(F.layer_norm(
+            memory[:, 3].mean(1).float(), (memory.shape[-1],)))[:, :, None, None]
+        q = self.query(anchor) + .25 * mem.to(anchor.dtype)
+        rgb_c, ir_c, dep_c = common
+        ir_u, dep_u = private[1], private[2]
+
+        shared = self.ir_shared(torch.cat((
+            q, rgb_c, ir_c, (rgb_c - ir_c).abs(), rgb_c * ir_c), 1))
+        unique = self.ir_private(torch.cat((q, ir_c, ir_u), 1))
+        mix = self.ir_mix(torch.cat((q, rgb_c, ir_c, ir_u), 1)).float().softmax(1)
+        ir_delta = mix[:, :1].to(anchor.dtype) * shared + mix[:, 1:].to(anchor.dtype) * unique
+        ir_delta = self._bounded(ir_delta, anchor) * valid[1].to(anchor.dtype)
+        ir_gain = self.max_ir_gain * self.ir_gain_logit.sigmoid()
+        fused = anchor + ir_gain.to(anchor.dtype) * ir_delta
+
+        depth_descriptor = torch.cat((
+            q, rgb_c, ir_c, dep_c, dep_u,
+            valid[2].to(q.dtype), reliable[2].to(q.dtype)), 1)
+        depth_delta = self.depth_support(depth_descriptor)
+        depth_delta = self._bounded(depth_delta, anchor) * valid[2].to(anchor.dtype)
+        depth_gain = self.max_depth_gain * self.depth_gain_logit.sigmoid()
+        depth_delta = depth_gain.to(anchor.dtype) * depth_delta
+
+        base_rms = anchor.detach().float().square().mean().sqrt().clamp_min(1e-6)
+        self.last_stats = {
+            "ir_shared_mix": mix[:, :1].detach().mean(),
+            "ir_private_mix": mix[:, 1:].detach().mean(),
+        }
+        self.last_health = {
+            "ir_route_ratio": (ir_gain * ir_delta).detach().float().square().mean().sqrt() / base_rms,
+            "dep_geometry_ratio": depth_delta.detach().float().square().mean().sqrt() / base_rms,
+            "ir_gain": ir_gain.detach(),
+            "dep_gain": depth_gain.detach(),
+            "1_reliable": reliable[1].detach().float().mean(),
+            "2_reliable": reliable[2].detach().float().mean(),
+        }
+        return fused, depth_delta

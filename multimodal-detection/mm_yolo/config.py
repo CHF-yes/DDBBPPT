@@ -128,7 +128,9 @@ class FusionCfg:
     # exact base function and adds only zero-initialized spatial corrections.
     # v47_trusted_evidence_v1 removes the unconditional context correction and
     # admits only target-supervised, bounded IR/Depth evidence.
-    fusion_strategy: str = "legacy_residual_v2"  # legacy_residual_v2 / evidence_router_v3 / v44_incremental_router_v1 / v47_trusted_evidence_v1
+    # v48_embedding_complement_v1 protects V4.4, blends rotation-corrected IR
+    # spatial embeddings, and uses Depth only as localization support.
+    fusion_strategy: str = "legacy_residual_v2"  # see train.py choices
     ir_coarse_align: bool = False
     ir_affine_max_degrees: float = 5.0
     ir_affine_max_shift: float = 10.0       # canvas pixels
