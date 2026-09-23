@@ -125,6 +125,8 @@ def main():
                 cmd += ["--p2-match-refine"]
             if phase.get("ir_coarse_align", False):
                 cmd += ["--ir-coarse-align"]
+            if phase.get("preserve_init_fusion", False):
+                cmd += ["--preserve-init-fusion"]
             if phase.get("eval_initial", True):
                 cmd += ["--eval-initial"]
             if a.smoke:
@@ -191,6 +193,8 @@ def main():
             cmd += ["--p2-match-refine"]
         if cfg.get("ir_coarse_align", False):
             cmd += ["--ir-coarse-align"]
+        if cfg.get("preserve_init_fusion", False):
+            cmd += ["--preserve-init-fusion"]
         if cfg.get("eval_initial", False) and stage == "dev":
             cmd += ["--eval-initial"]
         last = run/stage/"weights/last.pt"

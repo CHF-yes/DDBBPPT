@@ -1148,6 +1148,9 @@ def main():
                     choices=["standard", "aux_adapt", "anchored_joint",
                              "aux_independent", "residual_fusion"],
                     help="aux_independent 独立预训 IR/Depth 检测器；residual_fusion 从严格 RGB 恒等映射融合")
+    ap.add_argument("--preserve-init-fusion", action="store_true",
+                    help="仅用于新实验 --init-checkpoint：保留 checkpoint 的融合/记忆/定位状态，"
+                         "不重置为 RGB 恒等起点")
     ap.add_argument("--aux-branch-mode", default="alternate",
                     choices=["alternate", "both"],
                     help="Stage A 辅助分支调度；both 在同一批顺序反传 IR/Depth，完整覆盖每轮")
@@ -1276,6 +1279,9 @@ def main():
         args.branch_aux_end_weights = tuple(float(v) for v in args.branch_aux_end_weights)
     if args.reset_fusion_gates and (args.resume or not args.init_checkpoint):
         raise ValueError("--reset-fusion-gates requires --init-checkpoint in a new run")
+    if args.preserve_init_fusion and (
+            args.resume or not args.init_checkpoint or args.train_stage != "residual_fusion"):
+        raise ValueError("--preserve-init-fusion only supports a new residual_fusion run with --init-checkpoint")
     if args.memory_control != "unbounded_v1" and args.architecture not in ("spatial_memory_v1", "independent_p2_memory_v3"):
         raise ValueError("memory-control applies only to spatial memory")
     if args.bn_policy == "adaptive_no_tail" and args.sampler != "coverage":
@@ -1624,7 +1630,9 @@ def main():
         # A reset is an init-only operation.  Exact --resume must restore the
         # learned fusion/optimizer state byte-for-byte and never erase residuals.
         if args.train_stage == "residual_fusion" and not args.resume:
-            if args.fusion_strategy == "v48_embedding_complement_v1":
+            if args.preserve_init_fusion:
+                log("[train] 热启动保留：继承 checkpoint 的融合/记忆/定位状态，不重置为 RGB 恒等")
+            elif args.fusion_strategy == "v48_embedding_complement_v1":
                 reset_keys = reset_v48_additions(model)
                 log(f"[train] V4.8 V4.4 保底起点：仅重置新增插件 {reset_keys}")
             elif args.fusion_strategy in ("v44_incremental_router_v1",
@@ -1677,7 +1685,8 @@ def main():
     if args.init_checkpoint:
         meta_base["initialization"] = {"checkpoint": str(Path(args.init_checkpoint).resolve()),
                                        "epoch": ck["epoch"], "best_map": ck.get("best_map"),
-                                       "reset_fusion_gates": args.reset_fusion_gates}
+                                       "reset_fusion_gates": args.reset_fusion_gates,
+                                       "preserve_init_fusion": args.preserve_init_fusion}
     elif args.resume and ck.get("meta", {}).get("initialization"):
         meta_base["initialization"] = ck["meta"]["initialization"]
     deployment = _CODE / "v3_deployment.json"

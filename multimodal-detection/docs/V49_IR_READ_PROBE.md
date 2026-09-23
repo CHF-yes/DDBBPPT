@@ -20,7 +20,9 @@ the original IR image.
    split with only `ir_read_mode` changed.
 4. A paired six-epoch server probe starts both arms from the same V4.4
    `best.pt`, using the same seed, batches, augmentation, optimizer recipe, and
-   validation split. The only intended difference is `ir_read_mode`.
+   validation split. `preserve_init_fusion` keeps the V4.4 fusion state intact
+   instead of reinitializing it to RGB identity. The only intended difference
+   between the two arms is `ir_read_mode`.
 
 ## Decision rule
 
