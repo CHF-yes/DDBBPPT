@@ -126,7 +126,9 @@ class FusionCfg:
     # V4.5 replaces the deployment route with a spatial evidence router.
     # v44_incremental_router_v1 instead keeps the learned V4.4 fusion as the
     # exact base function and adds only zero-initialized spatial corrections.
-    fusion_strategy: str = "legacy_residual_v2"  # legacy_residual_v2 / evidence_router_v3 / v44_incremental_router_v1
+    # v47_trusted_evidence_v1 removes the unconditional context correction and
+    # admits only target-supervised, bounded IR/Depth evidence.
+    fusion_strategy: str = "legacy_residual_v2"  # legacy_residual_v2 / evidence_router_v3 / v44_incremental_router_v1 / v47_trusted_evidence_v1
     ir_coarse_align: bool = False
     ir_affine_max_degrees: float = 5.0
     ir_affine_max_shift: float = 10.0       # canvas pixels

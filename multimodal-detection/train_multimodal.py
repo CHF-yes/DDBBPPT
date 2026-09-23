@@ -85,6 +85,7 @@ def main():
             "embedding_alignment_end_weight","train_stage","aux_branch_mode",
             "independent_preserve_weight","independent_preserve_end_weight",
             "fusion_strategy","ir_affine_loss_weight","ir_affine_loss_end_weight",
+            "evidence_supervision_weight","evidence_supervision_end_weight",
             "val_every","seed")
 
     def add_options(cmd, options):

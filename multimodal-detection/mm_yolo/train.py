@@ -66,6 +66,8 @@ MEMORY_RECIPE = "coverage_spatial_memory_v1"
 
 def recipe_for(args):
     if getattr(args, "architecture", "") == "independent_p2_memory_v3":
+        if getattr(args, "fusion_strategy", "legacy_residual_v2") == "v47_trusted_evidence_v1":
+            return "v47_trusted_evidence_frozen_v44"
         if getattr(args, "fusion_strategy", "legacy_residual_v2") == "evidence_router_v3":
             return "spatial_evidence_router_v3_affine_occlusion"
         if getattr(args, "fusion_strategy", "legacy_residual_v2") == "v44_incremental_router_v1":
@@ -97,10 +99,12 @@ def apply_bn_policy(model, policy, frozen=False):
         raise ValueError(policy)
     encoders = model.encoder_modules() if hasattr(model, "encoder_modules") else [model.backbone.model[:11]]
     encoder_bn = {id(m) for enc in encoders for m in enc.modules() if isinstance(m, BN_TYPES)}
+    trusted_plugin = getattr(model.cfg.fusion, "fusion_strategy", "") == "v47_trusted_evidence_v1"
     for name, m in model.named_modules():
         if isinstance(m, BN_TYPES):
             m.momentum = .03
-            m.train(not (frozen and (id(m) in encoder_bn or name.startswith("dep_stem."))))
+            m.train(not (trusted_plugin or
+                          (frozen and (id(m) in encoder_bn or name.startswith("dep_stem.")))))
 
 
 def set_bn_tail_mode(model, extra):
@@ -138,8 +142,20 @@ def reset_rgb_identity_residuals(model):
             for slot, output in enumerate(block.outputs):
                 output[-1].weight.zero_()
                 reset.append(f"evidence_router.{scale}.outputs.{slot}.3.weight")
-            block.context[-1].weight.zero_()
-            reset.append(f"evidence_router.{scale}.context.3.weight")
+            if hasattr(block, "context"):
+                block.context[-1].weight.zero_()
+                reset.append(f"evidence_router.{scale}.context.3.weight")
+            if hasattr(block, "evidence_heads"):
+                for slot, head in enumerate(block.evidence_heads):
+                    head[-1].weight.zero_()
+                    head[-1].bias.fill_(-2.1972246)
+                    reset += [f"evidence_router.{scale}.evidence_heads.{slot}.3.weight",
+                              f"evidence_router.{scale}.evidence_heads.{slot}.3.bias"]
+            if hasattr(block, "route_gain_logit"):
+                initial_fraction = .05 / float(block.max_gain)
+                block.route_gain_logit.fill_(
+                    math.log(initial_fraction / (1 - initial_fraction)))
+                reset.append(f"evidence_router.{scale}.route_gain_logit")
         aligner = getattr(model, "ir_coarse_aligner", None)
         if aligner is not None:
             aligner.head[-1].weight.zero_()
@@ -159,8 +175,25 @@ def reset_incremental_router_additions(model):
             for slot, output in enumerate(block.outputs):
                 output[-1].weight.zero_()
                 reset.append(f"evidence_router.{scale}.outputs.{slot}.3.weight")
-            block.context[-1].weight.zero_()
-            reset.append(f"evidence_router.{scale}.context.3.weight")
+            if hasattr(block, "context"):
+                block.context[-1].weight.zero_()
+                reset.append(f"evidence_router.{scale}.context.3.weight")
+            if hasattr(block, "evidence_heads"):
+                for slot, head in enumerate(block.evidence_heads):
+                    head[-1].weight.zero_()
+                    head[-1].bias.fill_(-2.1972246)
+                    reset += [f"evidence_router.{scale}.evidence_heads.{slot}.3.weight",
+                              f"evidence_router.{scale}.evidence_heads.{slot}.3.bias"]
+            if hasattr(block, "route_gain_logit"):
+                initial_fraction = .05 / float(block.max_gain)
+                block.route_gain_logit.fill_(
+                    math.log(initial_fraction / (1 - initial_fraction)))
+                reset.append(f"evidence_router.{scale}.route_gain_logit")
+        aligner = getattr(model, "ir_coarse_aligner", None)
+        if aligner is not None:
+            aligner.head[-1].weight.zero_()
+            aligner.head[-1].bias.zero_()
+            reset += ["ir_coarse_aligner.head.2.weight", "ir_coarse_aligner.head.2.bias"]
         for i, block in enumerate(getattr(model, "occlusion_context", ())):
             block[-1].weight.zero_()
             reset.append(f"occlusion_context.{i}.3.weight")
@@ -356,6 +389,18 @@ def set_residual_fusion_mode(model: MMYOLO, downstream_frozen: bool) -> None:
                 p.requires_grad_(True)
 
     incremental = getattr(model.cfg.fusion, "fusion_strategy", "") == "v44_incremental_router_v1"
+    trusted = getattr(model.cfg.fusion, "fusion_strategy", "") == "v47_trusted_evidence_v1"
+    if trusted:
+        # Strict plugin mode: protect the complete V4.4 function, including BN
+        # statistics.  Only target-evidence routing and supervised IR alignment
+        # are allowed to learn.
+        enable(getattr(model, "evidence_router", None))
+        enable(getattr(model, "ir_coarse_aligner", None))
+        for scale in ("p2", "p3"):
+            matchers = getattr(model, "matchers", {})
+            if scale in matchers and len(matchers[scale]):
+                enable(matchers[scale][0])
+        return
     # In the incremental recipe the learned V4.4 route is frozen during the
     # warm-up; only new corrections and auxiliary evidence adapt first.
     if hasattr(model, "fusion") and (not incremental or not downstream_frozen):
@@ -714,7 +759,8 @@ def validate_checkpoint(ck: dict, model: MMYOLO, enabled, canvas, exact: bool = 
         old_f, new_f = saved_structure.get("fusion", {}), current_structure.get("fusion", {})
         if (old_f.get("fusion_strategy") == "legacy_residual_v2" and
                 new_f.get("fusion_strategy") in ("evidence_router_v3",
-                                                  "v44_incremental_router_v1")):
+                                                  "v44_incremental_router_v1",
+                                                  "v47_trusted_evidence_v1")):
             # Explicit V4.4 warm-start paths.  The incremental path keeps the
             # old fusion weights and only initializes newly named tensors below.
             for key in ("fusion_strategy", "ir_coarse_align",
@@ -780,7 +826,8 @@ def validate_checkpoint(ck: dict, model: MMYOLO, enabled, canvas, exact: bool = 
                  "embedding_alignment_weight", "embedding_alignment_end_weight", "train_stage",
                  "aux_branch_mode", "independent_preserve_weight",
                  "independent_preserve_end_weight", "fusion_strategy", "ir_coarse_align",
-                 "ir_affine_loss_weight", "ir_affine_loss_end_weight")
+                 "ir_affine_loss_weight", "ir_affine_loss_end_weight",
+                 "evidence_supervision_weight", "evidence_supervision_end_weight")
         legacy = {"depth_channels": 2, "depth_view": "both", "depth_init": "relative",
                   "misalign_px": 15.0, "degrade_p": 0.3, "rgb_color_p": 0.0,
                   "ir_noise_p": 0.0, "ir_gain_p": 0.0,
@@ -807,6 +854,7 @@ def validate_checkpoint(ck: dict, model: MMYOLO, enabled, canvas, exact: bool = 
                       independent_preserve_weight=0., independent_preserve_end_weight=None,
                       fusion_strategy="legacy_residual_v2", ir_coarse_align=False,
                       ir_affine_loss_weight=0., ir_affine_loss_end_weight=None,
+                      evidence_supervision_weight=0., evidence_supervision_end_weight=None,
                       fusion_lr_mult=1., p2_lr_mult=1.,
                       detector_lr_mult=1., semantic_lr_mult=1., train_stage="standard")
         changed = [k for k in keys
@@ -828,7 +876,7 @@ def adapt_depth_checkpoint_state(state: dict, model: MMYOLO) -> tuple:
     for name, target in target_state.items():
         is_new_switch = name.endswith(".residual_scale") or name == "localization_scale"
         is_v45 = (name.startswith("evidence_router.") or
-                  name.startswith("ir_coarse_aligner.") or
+                   name.startswith("ir_coarse_aligner.") or
                   name.startswith("occlusion_context.") or
                   name == "metric_gain_logit")
         if name not in out and (name.startswith("independent_aux.") or is_new_switch or
@@ -1108,11 +1156,14 @@ def main():
     ap.add_argument("--independent-preserve-end-weight", type=float, default=None)
     ap.add_argument("--fusion-strategy", default="legacy_residual_v2",
                     choices=["legacy_residual_v2", "evidence_router_v3",
-                             "v44_incremental_router_v1"])
+                             "v44_incremental_router_v1", "v47_trusted_evidence_v1"])
     ap.add_argument("--ir-coarse-align", action="store_true",
                     help="启用样本级 IR 小仿射 + P2/P3 局部残差对齐")
     ap.add_argument("--ir-affine-loss-weight", type=float, default=0.0)
     ap.add_argument("--ir-affine-loss-end-weight", type=float, default=None)
+    ap.add_argument("--evidence-supervision-weight", type=float, default=0.0,
+                    help="V4.7 complete-box target evidence supervision")
+    ap.add_argument("--evidence-supervision-end-weight", type=float, default=None)
     args = ap.parse_args()
     if args.branch_aux_weights is not None:
         args.branch_aux_weights = tuple(float(v) for v in args.branch_aux_weights)
@@ -1143,8 +1194,10 @@ def main():
             or (args.embedding_alignment_end_weight is not None and args.embedding_alignment_end_weight < 0)
             or args.independent_preserve_weight < 0
             or (args.independent_preserve_end_weight is not None and args.independent_preserve_end_weight < 0)
-            or args.ir_affine_loss_weight < 0
+            or args.ir_affine_loss_weight < 0 or args.evidence_supervision_weight < 0
             or (args.ir_affine_loss_end_weight is not None and args.ir_affine_loss_end_weight < 0)
+            or (args.evidence_supervision_end_weight is not None and
+                args.evidence_supervision_end_weight < 0)
             or not 0 <= args.flow_identity_weight <= 1
             or args.nce_temperature <= 0):
         raise ValueError("semantic loss weights must be nonnegative and temperature positive")
@@ -1178,8 +1231,11 @@ def main():
         raise ValueError("evidence_router_v3 必须启用 --ir-coarse-align")
     if args.fusion_strategy == "v44_incremental_router_v1" and args.ir_coarse_align:
         raise ValueError("v44_incremental_router_v1 默认保留 IR 恒等对齐，不启用样本级仿射")
-    if args.ir_coarse_align and args.fusion_strategy != "evidence_router_v3":
-        raise ValueError("--ir-coarse-align 只适用于 evidence_router_v3")
+    if args.fusion_strategy == "v47_trusted_evidence_v1" and not args.ir_coarse_align:
+        raise ValueError("v47_trusted_evidence_v1 requires supervised IR coarse alignment")
+    if args.ir_coarse_align and args.fusion_strategy not in (
+            "evidence_router_v3", "v47_trusted_evidence_v1"):
+        raise ValueError("--ir-coarse-align 只适用于 evidence_router_v3/V4.7")
     if args.late_bus and args.register_bus:
         raise ValueError("持久 register 与旧 --late-bus 不应同时开启；请选择一个做消融")
     if args.modalities == "dep" and args.depth_scales != "all":
@@ -1376,6 +1432,9 @@ def main():
         else args.independent_preserve_end_weight)
     ir_affine_end = (args.ir_affine_loss_weight if args.ir_affine_loss_end_weight is None
                      else args.ir_affine_loss_end_weight)
+    evidence_end = (args.evidence_supervision_weight
+                    if args.evidence_supervision_end_weight is None
+                    else args.evidence_supervision_end_weight)
     cfg.fusion.flow_supervision_weight = float(max(args.flow_supervision_weight, flow_end))
     cfg.fusion.cross_modal_nce_weight = float(max(args.cross_modal_nce_weight, nce_end))
     cfg.fusion.nce_temperature = float(args.nce_temperature)
@@ -1450,7 +1509,8 @@ def main():
         # A reset is an init-only operation.  Exact --resume must restore the
         # learned fusion/optimizer state byte-for-byte and never erase residuals.
         if args.train_stage == "residual_fusion" and not args.resume:
-            if args.fusion_strategy == "v44_incremental_router_v1":
+            if args.fusion_strategy in ("v44_incremental_router_v1",
+                                         "v47_trusted_evidence_v1"):
                 reset_keys = reset_incremental_router_additions(model)
                 log(f"[train] V4.4 增量起点：仅重置新增模块 {reset_keys}")
             else:
@@ -1638,11 +1698,13 @@ def main():
             (independent_preserve_end - args.independent_preserve_weight) * progress)
         ir_affine_weight = (args.ir_affine_loss_weight +
                             (ir_affine_end - args.ir_affine_loss_weight) * progress)
+        evidence_weight = (args.evidence_supervision_weight +
+                           (evidence_end - args.evidence_supervision_weight) * progress)
         aux_w_log = "/".join(f"{v:.3g}" for v in aux_values)
         opt.zero_grad(set_to_none=True)
         agg = {"loss": 0.0, "n": 0, "micro": 0, "group_samples": 0, "skipped": 0,
                "branch_aux": 0.0, "flow_aux": 0.0, "nce_aux": 0.0,
-               "ir_affine_aux": 0.0,
+               "ir_affine_aux": 0.0, "evidence_aux": 0.0,
                "independent_preserve": 0.0,
                "embedding_recon": 0.0, "embedding_alignment": 0.0,
                "grad_steps": 0, "grad_clipped": 0, "grad_norm_sum": 0.0,
@@ -1743,7 +1805,8 @@ def main():
             with torch.autocast("cuda", enabled=bool(args.amp) and dev.type == "cuda", dtype=amp_dtype):
                 zero = rgb.new_zeros((), dtype=torch.float32)
                 embedding_aux = {"reconstruction": zero, "alignment": zero}
-                semantic = {"flow": zero, "nce": zero, "ir_affine": zero}
+                semantic = {"flow": zero, "nce": zero, "ir_affine": zero,
+                            "evidence": zero}
                 branch_total, branch_count = zero, 0
                 branch_backward = False
                 if args.train_stage == "aux_independent":
@@ -1802,7 +1865,8 @@ def main():
                     )
                     loss = loss + (flow_weight * semantic["flow"] +
                                    nce_weight * semantic["nce"] +
-                                   ir_affine_weight * semantic["ir_affine"]) * (
+                                   ir_affine_weight * semantic["ir_affine"] +
+                                   evidence_weight * semantic["evidence"]) * (
                                        rgb.shape[0] / nominal_samples)
                     # 显存修复：每步只跑一个辅助检测支路（原来的三支路同时在图上，
                     # 在 736x1280 / batch=4 时峰值 22.4G 并在第 2 轮 OOM）。按
@@ -1882,6 +1946,7 @@ def main():
                 agg["flow_aux"] += float(semantic["flow"].detach())
                 agg["nce_aux"] += float(semantic["nce"].detach())
                 agg["ir_affine_aux"] += float(semantic["ir_affine"].detach())
+                agg["evidence_aux"] += float(semantic["evidence"].detach())
                 agg["embedding_recon"] += float(embedding_aux["reconstruction"].detach())
                 agg["embedding_alignment"] += float(embedding_aux["alignment"].detach())
             for k in ("box_loss", "cls_loss", "dfl_loss"):
@@ -1928,13 +1993,15 @@ def main():
                 or args.branch_aux_end_weights or args.flow_supervision_weight
                 or args.cross_modal_nce_weight or args.flow_supervision_end_weight
                 or args.cross_modal_nce_end_weight or args.independent_preserve_weight
+                or args.evidence_supervision_weight or args.evidence_supervision_end_weight
                 or args.independent_preserve_end_weight):
             msg += (f" semantic_raw=branch:{agg['branch_aux']/n:.3f} "
                     f"flow:{agg['flow_aux']/n:.4f} nce:{agg['nce_aux']/n:.3f} "
-                    f"ir_aff:{agg['ir_affine_aux']/n:.4f} "
+                    f"ir_aff:{agg['ir_affine_aux']/n:.4f} evidence:{agg['evidence_aux']/n:.4f} "
                     f"preserve:{agg['independent_preserve']/n:.3f}"
                     f" align:{args.alignment_mode} aux_w:{aux_w_log}"
                     f" flow_w:{flow_weight:.3g} nce_w:{nce_weight:.3g} ir_aff_w:{ir_affine_weight:.3g}"
+                    f" evidence_w:{evidence_weight:.3g}"
                     f" preserve_w:{independent_preserve_weight:.3g}"
                     f" embed_raw:{agg['embedding_recon']/n:.3f}/{agg['embedding_alignment']/n:.3f}"
                     f" embed_w:{recon_weight:.3g}/{embedding_alignment_weight:.3g}")
@@ -1946,7 +2013,7 @@ def main():
             fusion_stats = {s: {m: [round(float(v), 4) for v in pair.cpu()]
                                for m, pair in block.last_stats.items()}
                             for s, block in log_blocks.items()}
-            log(f"[train] fusion last-batch [match_conf, injection_gate]={fusion_stats}")
+            log(f"[train] fusion last-batch router_stats={fusion_stats}")
         if args.val_every and ((ep + 1) % args.val_every == 0 or ep == args.epochs - 1):
             try:
                 res = _evaluate_for_stage(ema.ema)

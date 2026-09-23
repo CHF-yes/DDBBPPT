@@ -291,3 +291,99 @@ class SpatialEvidenceRouter(nn.Module):
             "2_reliable": reliable[2].detach().float().mean(),
         }
         return state
+
+
+class TrustedEvidenceRouter(nn.Module):
+    """V4.7 target-evidence plugin around a frozen V4.4 feature.
+
+    Unlike :class:`SpatialEvidenceRouter`, this block has no unconditional
+    ``context(state)`` branch.  IR/Depth can modify the anchor only where their
+    own training-supervised object evidence, validity and reliability agree.
+    Output projections are zero initialized, so a migrated V4.4 checkpoint is
+    an exact function-preserving starting point.
+    """
+    def __init__(self, channels, dim=64, memory_dim=128, max_gain=.20):
+        super().__init__()
+        hidden = max(32, min(96, channels // 2))
+        self.max_gain = float(max_gain)
+        self.query = nn.Sequential(
+            nn.Conv2d(channels, dim, 1, bias=False), nn.GroupNorm(8, dim), nn.SiLU())
+        self.memory = nn.Linear(memory_dim, dim, bias=False)
+        # Evidence is deliberately auxiliary-only: it is predicted from one
+        # sensor's own common/private representation, not from RGB agreement.
+        self.evidence_heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(dim * 2 + 2, hidden, 1, bias=False),
+                nn.GroupNorm(8, hidden), nn.SiLU(),
+                nn.Conv2d(hidden, 1, 1)) for _ in range(2)])
+        for head in self.evidence_heads:
+            nn.init.zeros_(head[-1].weight)
+            nn.init.constant_(head[-1].bias, -2.1972246)  # p(object)=0.10
+        self.gates = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(dim * 3 + 7, hidden, 1, bias=False),
+                nn.GroupNorm(8, hidden), nn.SiLU(),
+                nn.Conv2d(hidden, channels, 1)) for _ in range(2)])
+        self.outputs = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(dim * 2, hidden, 1, bias=False),
+                nn.GroupNorm(8, hidden), nn.SiLU(),
+                nn.Conv2d(hidden, channels, 1, bias=False)) for _ in range(2)])
+        for output in self.outputs:
+            nn.init.zeros_(output[-1].weight)
+        # Per-modality bounded residual capacity.  The initial nominal limit is
+        # 5%, but exact identity still comes from the zero output projections.
+        initial_fraction = .05 / self.max_gain
+        self.route_gain_logit = nn.Parameter(torch.full(
+            (2,), math.log(initial_fraction / (1 - initial_fraction))))
+        self.last_stats, self.last_health = {}, {}
+        self.last_evidence_logits = []
+
+    def forward(self, raw, common, private, valid, match, reliable, memory,
+                quality=None, anchor=None):
+        state = raw[0] * valid[0] if anchor is None else anchor
+        mem = self.memory(F.layer_norm(
+            memory[:, 3].mean(1).float(), (memory.shape[-1],)))[:, :, None, None]
+        q = self.query(state) + .25 * mem.to(state.dtype)
+        updates, stats, logits_all = [], {}, []
+        base_rms = state.detach().float().square().mean(1, keepdim=True).sqrt().clamp_min(.1)
+        gains = self.max_gain * self.route_gain_logit.sigmoid()
+        for slot, m in enumerate((1, 2)):
+            valid_m = valid[m].to(state.dtype)
+            reliable_m = reliable[m].to(state.dtype)
+            evidence_logits = self.evidence_heads[slot](torch.cat((
+                common[m], private[m], valid_m, reliable_m), 1).to(state.dtype))
+            evidence_prob = evidence_logits.float().sigmoid().to(state.dtype)
+            logits_all.append(evidence_logits)
+            qual = (q.new_zeros(q.shape[0], 3, *q.shape[-2:])
+                    if quality is None or quality[m] is None else quality[m])
+            descriptor = torch.cat((q, common[m], private[m], valid_m,
+                                    match[m], reliable_m, qual, evidence_prob), 1)
+            gate = self.gates[slot](descriptor).float().sigmoid().to(state.dtype)
+            residual = self.outputs[slot](
+                torch.cat((common[m], private[m]), 1).to(state.dtype))
+            # Bound each local residual relative to the stable V4.4 anchor.  The
+            # target evidence map then makes the global update spatially sparse.
+            residual = residual / torch.sqrt(
+                1 + residual.float().square().mean(1, keepdim=True) /
+                base_rms.square()).to(residual.dtype)
+            update = (gains[slot].to(state.dtype) * residual * gate *
+                      evidence_prob * reliable_m * valid_m)
+            updates.append(update)
+            stats[str(m)] = torch.stack((
+                match[m].detach().mean(), gate.detach().mean(),
+                evidence_prob.detach().mean(), gains[slot].detach()))
+        state = state + sum(updates)
+        anchor_rms = anchor.detach().float().square().mean().sqrt().clamp_min(1e-6)
+        self.last_evidence_logits = logits_all
+        self.last_stats = stats
+        self.last_health = {
+            "ir_route_ratio": updates[0].detach().float().square().mean().sqrt() / anchor_rms,
+            "dep_route_ratio": updates[1].detach().float().square().mean().sqrt() / anchor_rms,
+            "ir_evidence": logits_all[0].detach().float().sigmoid().mean(),
+            "dep_evidence": logits_all[1].detach().float().sigmoid().mean(),
+            "ir_gain": gains[0].detach(), "dep_gain": gains[1].detach(),
+            "1_reliable": reliable[1].detach().float().mean(),
+            "2_reliable": reliable[2].detach().float().mean(),
+        }
+        return state

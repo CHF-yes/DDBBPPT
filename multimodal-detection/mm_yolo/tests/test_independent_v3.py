@@ -21,7 +21,7 @@ from data import (MMDataset, AugCfg, collate, scheduled_aug, centered_affine_M,
                   _target_occlusion)
 from independent_fusion import (warp, resize_flow, identity_residual_align,
                                 LocalCorrespondence, affine_flow,
-                                SpatialEvidenceRouter)
+                                SpatialEvidenceRouter, TrustedEvidenceRouter)
 from independent_model import depth_reliability_map
 from ultralytics.utils.loss import v8DetectionLoss
 
@@ -187,6 +187,26 @@ class IndependentV3Tests(unittest.TestCase):
             self.assertIsNotNone(output[-1].weight.grad)
             self.assertGreater(float(output[-1].weight.grad.abs().sum()), 0.)
 
+    def test_trusted_router_is_identity_and_uses_target_evidence(self):
+        torch.manual_seed(9)
+        router = TrustedEvidenceRouter(32, dim=16, memory_dim=24).train()
+        raw = [torch.randn(2, 32, 8, 12) for _ in range(3)]
+        common = [torch.randn(2, 16, 8, 12) for _ in range(3)]
+        private = [torch.randn(2, 16, 8, 12) for _ in range(3)]
+        valid = [torch.ones(2, 1, 8, 12) for _ in range(3)]
+        match = [torch.ones(2, 1, 8, 12) for _ in range(3)]
+        reliable = [torch.ones(2, 1, 8, 12) for _ in range(3)]
+        memory = torch.randn(2, 4, 3, 24)
+        anchor = torch.randn(2, 32, 8, 12)
+        out = router(raw, common, private, valid, match, reliable, memory, anchor=anchor)
+        self.assertTrue(torch.equal(out, anchor))
+        self.assertTrue(all(torch.allclose(x.sigmoid(), torch.full_like(x, .1), atol=1e-5)
+                            for x in router.last_evidence_logits))
+        out.square().mean().backward()
+        self.assertTrue(all(output[-1].weight.grad is not None and
+                            output[-1].weight.grad.abs().sum() > 0
+                            for output in router.outputs))
+
     def test_target_occlusion_is_reproducible_and_keeps_labels_external(self):
         rgb = np.full((64, 96, 3), 120, np.uint8)
         ir = np.full_like(rgb, 80)
@@ -241,6 +261,34 @@ class IndependentV3Tests(unittest.TestCase):
         self.assertTrue(torch.equal(a["scores"], b["scores"]))
         self.assertTrue(torch.equal(new._semantic_flows["p3"][0],
                                     torch.zeros_like(new._semantic_flows["p3"][0])))
+
+    def test_v47_preserves_v44_and_freezes_original_route(self):
+        old_cfg = config()
+        old_cfg.fusion.alignment_mode = "identity_residual_v2"
+        old_cfg.fusion.depth_reliability = "valid_support_v2"
+        old_cfg.fusion.p2_match_refine = True
+        old = MMYOLO(old_cfg).train()
+        new_cfg = copy.deepcopy(old_cfg)
+        new_cfg.fusion.fusion_strategy = "v47_trusted_evidence_v1"
+        new_cfg.fusion.ir_coarse_align = True
+        new = MMYOLO(new_cfg).train()
+        migrated, changed = adapt_depth_checkpoint_state(old.state_dict(), new)
+        self.assertTrue(changed)
+        new.load_state_dict(migrated, strict=True)
+        reset_incremental_router_additions(new)
+        old.infer_canvas = new.infer_canvas = (64, 96)
+        rgb, ir, dep = self.inputs()
+        with torch.no_grad():
+            a = old(rgb, ir, dep)
+            b = new(rgb, ir, dep)
+        self.assertTrue(torch.equal(a["boxes"], b["boxes"]))
+        self.assertTrue(torch.equal(a["scores"], b["scores"]))
+        set_residual_fusion_mode(new, downstream_frozen=False)
+        trainable = [name for name, p in new.named_parameters() if p.requires_grad]
+        self.assertTrue(trainable)
+        self.assertTrue(all(name.startswith(("evidence_router.", "ir_coarse_aligner.",
+                                             "matchers.p2.0.", "matchers.p3.0."))
+                            for name in trainable))
 
     def test_v45_full_detection_backward_is_finite_and_aux_sensitive(self):
         c = config(checkpoint=True)

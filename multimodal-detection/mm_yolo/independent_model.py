@@ -17,6 +17,7 @@ from ultralytics.nn.modules import Conv, C3k2, Detect
 from ultralytics.cfg import DEFAULT_CFG
 from independent_fusion import (EvidenceEmbedding, LocalCorrespondence,
                                 ComplementaryFusion, SpatialEvidenceRouter,
+                                TrustedEvidenceRouter,
                                 CoarseAffineAligner, affine_flow,
                                 identity_residual_align, warp, resize_flow)
 from memory_fusion import CrossScaleMemory, NeckMemoryRead, masked_pool
@@ -166,13 +167,18 @@ class IndependentMMYOLO(nn.Module):
         self.matchers = nn.ModuleDict({s: nn.ModuleList([LocalCorrespondence() for _ in range(2)]) for s in matcher_scales})
         self.fusion = nn.ModuleDict({s: ComplementaryFusion(c, dim, md) for s,c in self.channels.items()})
         if cfg.fusion.fusion_strategy not in (
-                "legacy_residual_v2", "evidence_router_v3", "v44_incremental_router_v1"):
+                "legacy_residual_v2", "evidence_router_v3", "v44_incremental_router_v1",
+                "v47_trusted_evidence_v1"):
             raise ValueError(f"unknown fusion strategy: {cfg.fusion.fusion_strategy}")
         self.evidence_router = nn.ModuleDict()
         if cfg.fusion.fusion_strategy in ("evidence_router_v3", "v44_incremental_router_v1"):
             self.evidence_router = nn.ModuleDict({
                 s: SpatialEvidenceRouter(c, dim, md, context_kernel=5 if s in ("p2", "p3") else 3)
                 for s, c in self.channels.items()
+            })
+        elif cfg.fusion.fusion_strategy == "v47_trusted_evidence_v1":
+            self.evidence_router = nn.ModuleDict({
+                s: TrustedEvidenceRouter(c, dim, md) for s, c in self.channels.items()
             })
         self.ir_coarse_aligner = (CoarseAffineAligner(dim)
                                   if cfg.fusion.ir_coarse_align else None)
@@ -249,6 +255,7 @@ class IndependentMMYOLO(nn.Module):
         self.auxiliary_eval_branch = None
         self.embedding_aux_losses = {"reconstruction": torch.tensor(0.),
                                      "alignment": torch.tensor(0.)}
+        self._evidence_logits = {}
         self.train()
 
     @property
@@ -370,8 +377,16 @@ class IndependentMMYOLO(nn.Module):
                 auxiliary = auxiliary + loss / 12
         ir_affine_flow, ir_affine_conf = {}, None
         if self.ir_coarse_aligner is not None:
-            raw_affine, ir_affine_conf = self.ir_coarse_aligner(
+            raw_affine, ir_affine_prediction_conf = self.ir_coarse_aligner(
                 commons["p4"][0], commons["p4"][1], masks["p4"][0], masks["p4"][1])
+            # V4.7 must be an exact V4.4 function at migration.  The affine
+            # regressor starts at zero motion, so no local IR warp is accepted
+            # until supervised artificial transforms teach non-zero geometry.
+            if self.cfg.fusion.fusion_strategy == "v47_trusted_evidence_v1":
+                motion = torch.tanh(4 * raw_affine.float().abs().mean(1, keepdim=True))
+                ir_affine_conf = ir_affine_prediction_conf * motion.to(ir_affine_prediction_conf.dtype)
+            else:
+                ir_affine_conf = ir_affine_prediction_conf
             max_angle = math.radians(float(self.cfg.fusion.ir_affine_max_degrees))
             canvas_h, canvas_w = getattr(self, "infer_canvas", (h, w))
             physical = torch.stack((
@@ -382,7 +397,7 @@ class IndependentMMYOLO(nn.Module):
             for s in SCALES:
                 ir_affine_flow[s] = affine_flow(physical, raw[0][s].shape[-2:])
             self._ir_affine_prediction = raw_affine
-            self._ir_affine_confidence = ir_affine_conf
+            self._ir_affine_confidence = ir_affine_prediction_conf
         else:
             self._ir_affine_prediction = None
             self._ir_affine_confidence = None
@@ -409,7 +424,12 @@ class IndependentMMYOLO(nn.Module):
                         flow, conf = self.matchers[s][m-1](
                             commons[s][0], commons[s][m], masks[s][0], masks[s][m],
                             coarse, scene)
-                        conf = torch.maximum(conf, .25 * coarse_conf)
+                        if self.cfg.fusion.fusion_strategy == "v47_trusted_evidence_v1":
+                            # Local correction is conditional on the image-level
+                            # detector accepting that this sample is misaligned.
+                            conf = conf * coarse_conf
+                        else:
+                            conf = torch.maximum(conf, .25 * coarse_conf)
                     else:
                         flow, conf = coarse, coarse_conf
                 elif (m == 1 and
@@ -491,6 +511,14 @@ class IndependentMMYOLO(nn.Module):
                 fusion_block = self.evidence_router[s]
                 fused[s] = fusion_block(
                     values,c,u,mask,confidence[s],rel,state,qual,anchor=base)
+            elif self.cfg.fusion.fusion_strategy == "v47_trusted_evidence_v1":
+                # V4.4 remains the immutable detector route.  The plugin has no
+                # unconditional context branch and can write only target-evidence
+                # gated, bounded IR/Depth residuals.
+                base = self.fusion[s](values,c,u,mask,confidence[s],rel,state,qual)
+                fusion_block = self.evidence_router[s]
+                fused[s] = fusion_block(
+                    values,c,u,mask,confidence[s],rel,state,qual,anchor=base)
             else:
                 fusion_block = self.fusion[s]
                 fused[s] = fusion_block(values,c,u,mask,confidence[s],rel,state,qual)
@@ -513,6 +541,11 @@ class IndependentMMYOLO(nn.Module):
         self._semantic_common = aligned_common
         self._semantic_masks = aligned_masks
         self._semantic_flows = flows
+        self._evidence_logits = {
+            s: list(block.last_evidence_logits)
+            for s, block in self.evidence_router.items()
+            if hasattr(block, "last_evidence_logits")
+        }
         self._last_register_state = state.detach()
         layers = self.backbone.model
         p5 = fused["p5"]
@@ -544,6 +577,22 @@ class IndependentMMYOLO(nn.Module):
         feats = [self.semantic_adapters[s](self._semantic_common[s][m]) for s in SCALES]
         return self.semantic_detect(feats, feats)
     @staticmethod
+    def _objectness_map(targets, size, batch_size, device, dtype):
+        """Rasterize complete GT boxes into a spatial object-evidence target."""
+        h, w = int(size[0]), int(size[1])
+        target = torch.zeros(batch_size, 1, h, w, device=device, dtype=dtype)
+        if not targets["batch_idx"].numel():
+            return target
+        for bi, box in zip(targets["batch_idx"].long(), targets["bboxes"].float()):
+            cx, cy, bw, bh = box
+            x0 = max(0, min(w - 1, int(torch.floor((cx - bw / 2) * w).item())))
+            y0 = max(0, min(h - 1, int(torch.floor((cy - bh / 2) * h).item())))
+            x1 = max(x0 + 1, min(w, int(torch.ceil((cx + bw / 2) * w).item())))
+            y1 = max(y0 + 1, min(h, int(torch.ceil((cy + bh / 2) * h).item())))
+            target[int(bi), 0, y0:y1, x0:x1] = 1
+        return target
+
+    @staticmethod
     def _object_vectors(feature, valid, targets, grid_size=3, min_observed=.5):
         """Differentiable object-region pooling in normalized canvas coordinates."""
         batch_idx = targets["batch_idx"].long()
@@ -569,7 +618,7 @@ class IndependentMMYOLO(nn.Module):
                                 ir_affine_target=None, ir_affine_supervised=None):
         """Return unweighted flow/NCE losses for the current forward pass."""
         zero = next(self.parameters()).new_zeros((), dtype=torch.float32)
-        result = {"flow": zero, "nce": zero, "ir_affine": zero}
+        result = {"flow": zero, "nce": zero, "ir_affine": zero, "evidence": zero}
         if not self.training or self._semantic_common is None:
             self.last_semantic_losses = {k: v.detach() for k, v in result.items()}
             return result
@@ -642,6 +691,33 @@ class IndependentMMYOLO(nn.Module):
                 affine_loss = affine_loss + .02 * (
                     -conf.log() * supervised).sum() / supervised.sum().clamp_min(1)
             result["ir_affine"] = affine_loss
+
+        if (self.cfg.fusion.fusion_strategy == "v47_trusted_evidence_v1" and
+                self._evidence_logits):
+            evidence_terms = []
+            batch_size = int(targets.get("batch_size", 0))
+            for s, logits_all in self._evidence_logits.items():
+                if len(logits_all) != 2:
+                    continue
+                target = self._objectness_map(
+                    targets, logits_all[0].shape[-2:], batch_size,
+                    logits_all[0].device, logits_all[0].dtype)
+                for slot, logits in enumerate(logits_all, start=1):
+                    valid = self._semantic_masks[s][slot].to(logits.dtype)
+                    positive = (target * valid).sum()
+                    negative = ((1 - target) * valid).sum()
+                    pos_weight = (negative / positive.clamp_min(1)).clamp(1, 20).detach()
+                    bce = F.binary_cross_entropy_with_logits(
+                        logits.float(), target.float(), reduction="none",
+                        pos_weight=pos_weight.float())
+                    bce = (bce * valid.float()).sum() / valid.float().sum().clamp_min(1)
+                    probability = logits.float().sigmoid() * valid.float()
+                    intersection = (probability * target.float()).sum()
+                    dice = 1 - (2 * intersection + 1) / (
+                        probability.sum() + (target.float() * valid.float()).sum() + 1)
+                    evidence_terms.append(bce + .25 * dice)
+            result["evidence"] = (torch.stack(evidence_terms).mean()
+                                  if evidence_terms else zero)
 
         self.last_semantic_losses = {k: v.detach() for k, v in result.items()}
         return result
