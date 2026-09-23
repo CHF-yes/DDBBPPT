@@ -17,7 +17,7 @@ from train import (build_optimizer, set_encoder_frozen, apply_bn_policy, make_ta
                    set_residual_fusion_mode, enable_trainable_defaults,
                    adapt_depth_checkpoint_state, reset_rgb_identity_residuals,
                    reset_incremental_router_additions, reset_v48_additions,
-                   fusion_health_measurements)
+                   fusion_health_measurements, fusion_router_stats)
 from data import (MMDataset, AugCfg, collate, scheduled_aug, centered_affine_M,
                   _target_occlusion)
 from independent_fusion import (warp, resize_flow, identity_residual_align,
@@ -248,6 +248,12 @@ class IndependentV3Tests(unittest.TestCase):
         self.assertEqual(set(values), {
             "ir_route_ratio", "ir_shared_mix", "legacy_match", "legacy_gate"})
         self.assertAlmostEqual(float(values["ir_shared_mix"]), .6, places=5)
+
+        logged = fusion_router_stats(Block())
+        self.assertEqual(logged, {
+            "ir_shared_mix": .6,
+            "legacy": [.7, .3],
+        })
 
     def test_target_occlusion_is_reproducible_and_keeps_labels_external(self):
         rgb = np.full((64, 96, 3), 120, np.uint8)

@@ -107,6 +107,24 @@ def fusion_health_measurements(block):
     return measurements
 
 
+def fusion_router_stats(block):
+    """Convert router diagnostics to JSON-safe scalars/lists for logging."""
+    result = {}
+    for name, value in block.last_stats.items():
+        tensor = value.detach().float().cpu() if torch.is_tensor(value) else value
+        if torch.is_tensor(tensor):
+            data = tensor.tolist()
+        elif isinstance(tensor, tuple):
+            data = list(tensor)
+        else:
+            data = tensor
+        if isinstance(data, list):
+            result[name] = [round(float(item), 4) for item in data]
+        else:
+            result[name] = round(float(data), 4)
+    return result
+
+
 def apply_bn_policy(model, policy, frozen=False):
     """Small-batch adaptive stats; affine parameters still follow optimizer groups."""
     if policy not in ("adaptive", "adaptive_no_tail"):
@@ -2096,8 +2114,7 @@ def main():
                 log(f"[train] fusion epoch-mean={ {k: round(float(v/health_n),4) for k,v in health_sum.items()} }")
             log_blocks = (model.evidence_router if len(getattr(model, "evidence_router", {}))
                           else model.fusion)
-            fusion_stats = {s: {m: [round(float(v), 4) for v in pair.cpu()]
-                               for m, pair in block.last_stats.items()}
+            fusion_stats = {s: fusion_router_stats(block)
                             for s, block in log_blocks.items()}
             log(f"[train] fusion last-batch router_stats={fusion_stats}")
         if args.val_every and ((ep + 1) % args.val_every == 0 or ep == args.epochs - 1):
