@@ -805,6 +805,7 @@ def validate_checkpoint(ck: dict, model: MMYOLO, enabled, canvas, exact: bool = 
     current_structure.pop("weights", None)
     for structure in (saved_structure, current_structure):
         structure.setdefault("depth_resampling", "legacy_bilinear_v1")
+        structure.setdefault("ir_read_mode", "legacy_first_channel")
         structure.get("encoder", {}).setdefault("metric_branch", False)
         structure.get("encoder", {}).setdefault("checkpoint_encoder", False)
         if isinstance(structure.get("fusion"), dict):
@@ -835,6 +836,10 @@ def validate_checkpoint(ck: dict, model: MMYOLO, enabled, canvas, exact: bool = 
         current_structure["encoder"].setdefault("depth_init", "relative")
     # init-only 允许 B1 2ch Depth → B2 4ch Depth；权重在下方做显式通道迁移。
     if not exact:
+        # Preprocessing experiments may deliberately reuse detector weights,
+        # but they are never exact resumes because the input distribution has
+        # changed.  Record the new contract in the destination checkpoint.
+        saved_structure["ir_read_mode"] = current_structure["ir_read_mode"]
         saved_structure.get("encoder", {}).pop("depth_input_channels", None)
         current_structure.get("encoder", {}).pop("depth_input_channels", None)
         if getattr(args, "reset_fusion_gates", False):
@@ -907,7 +912,7 @@ def validate_checkpoint(ck: dict, model: MMYOLO, enabled, canvas, exact: bool = 
                 "ir_affine_p", "ir_affine_deg", "ir_affine_shift", "ir_affine_scale",
                 "rare_sample_max", "seed")
         keys += ("weight_decay", "nominal_batch", "grad_clip")
-        keys += ("architecture", "depth_resampling", "metric_branch", "sampler", "rare_extra_frac",
+        keys += ("architecture", "depth_resampling", "ir_read_mode", "metric_branch", "sampler", "rare_extra_frac",
                  "close_aug_frac", "bn_policy", "warmup", "lrf", "calibrate_clip_steps", "memory_control")
         keys += ("scale_min", "scale_max", "translate")
         keys += ("precision", "checkpoint_encoder", "mosaic", "full_data")
@@ -932,6 +937,7 @@ def validate_checkpoint(ck: dict, model: MMYOLO, enabled, canvas, exact: bool = 
                   "rare_sample_max": 1.0, "weight_decay": 5e-4,
                   "nominal_batch": 64, "grad_clip": 10.0}
         legacy.update(architecture="legacy_hook_v1", depth_resampling="legacy_bilinear_v1",
+                      ir_read_mode="legacy_first_channel",
                       metric_branch=False, sampler="legacy", rare_extra_frac=.1,
                       close_aug_frac=0., bn_policy="legacy", warmup=3, lrf=.01, calibrate_clip_steps=0,
                       memory_control="unbounded_v1")
@@ -1093,6 +1099,9 @@ def main():
     ap.add_argument("--memory-control", default="unbounded_v1", choices=["unbounded_v1", "bounded_v2"])
     ap.add_argument("--reset-fusion-gates", action="store_true", help="explicit v1->v2 warm-start, not exact resume")
     ap.add_argument("--depth-resampling", default="legacy_bilinear_v1", choices=["legacy_bilinear_v1", "nearest_valid_v2"])
+    ap.add_argument("--ir-read-mode", default="legacy_first_channel",
+                    choices=["legacy_first_channel", "median_channel"],
+                    help="IR three-channel reduction; median removes weak RGB-like chroma residue")
     ap.add_argument("--metric-branch", action="store_true")
     ap.add_argument("--sampler", default="legacy", choices=["legacy", "coverage"])
     ap.add_argument("--rare-extra-frac", type=float, default=.1)
@@ -1452,6 +1461,7 @@ def main():
                  ir_affine_p=args.ir_affine_p, ir_affine_deg=args.ir_affine_deg,
                  ir_affine_shift=args.ir_affine_shift, ir_affine_scale=args.ir_affine_scale,
                  legacy_lowlight=args.depth_channels == 2,
+                 ir_read_mode=args.ir_read_mode,
                  depth_resampling=args.depth_resampling, total_epochs=args.epochs,
                  close_aug_frac=args.close_aug_frac,
                  mosaic_p=args.mosaic,
@@ -1544,6 +1554,7 @@ def main():
     cfg.fusion.nce_temperature = float(args.nce_temperature)
     cfg.fusion.p2_match_refine = bool(args.p2_match_refine)
     cfg.depth_resampling = args.depth_resampling
+    cfg.ir_read_mode = args.ir_read_mode
     cfg.encoder.metric_branch = args.metric_branch
     cfg.encoder.checkpoint_encoder = args.checkpoint_encoder
     if args.architecture == "independent_p2_memory_v3":

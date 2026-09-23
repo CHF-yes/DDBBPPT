@@ -64,14 +64,31 @@ def read_rgb(path) -> Optional[np.ndarray]:
     return cv2.cvtColor(img[:, :, :3], cv2.COLOR_BGR2RGB)
 
 
-def read_ir(path) -> Optional[np.ndarray]:
+def read_ir(path, mode: str = "legacy_first_channel") -> Optional[np.ndarray]:
+    """Read IR without treating a weak channel tint as the thermal signal.
+
+    ``legacy_first_channel`` is kept for exact compatibility with existing
+    checkpoints.  ``median_channel`` uses the per-pixel median of the three
+    stored channels, which is robust to the small RGB-like chroma residue seen
+    in a subset of the PNG files.
+    """
     img = imread_unicode(path, cv2.IMREAD_UNCHANGED)
     if img is None:
         return None
-    if img.ndim == 3:                       # 近灰度三通道 → 取首通道（D0 实测通道差 ~2 灰阶）
-        img = img[:, :, 0]
-    if img.dtype == np.uint16:              # 万一 IR 是 16bit，压缩到 8bit 供显示/统计
+    if mode not in ("legacy_first_channel", "median_channel"):
+        raise ValueError(f"unknown IR read mode: {mode}")
+    source_dtype = img.dtype
+    if img.ndim == 3:
+        if mode == "median_channel":
+            # Median is insensitive to a weak one-channel color residue and
+            # preserves the dominant thermal brightness structure.
+            img = np.median(img[:, :, :3], axis=2)
+        else:
+            img = img[:, :, 0]
+    if source_dtype == np.uint16:           # 万一 IR 是 16bit，压缩到 8bit 供显示/统计
         img = (img / 256.0).astype(np.uint8)
+    elif img.dtype != np.uint8:
+        img = np.clip(img, 0, 255).astype(np.uint8)
     return img
 
 
@@ -229,6 +246,7 @@ class AugCfg:
     rgb_color_p: float = 0.0                            # RGB 轻量颜色/对比度扰动（默认关闭）
     ir_noise_p: float = 0.0                             # IR 轻微读出噪声（B2 配方显式开）
     ir_gain_p: float = 0.0                              # IR 正增益/偏置，保持热强度次序
+    ir_read_mode: str = "legacy_first_channel"          # legacy 首通道 / median 三通道中位数
     depth_hole_p: float = 0.0                           # Depth 小块失效（同步更新 valid）
     target_crop_p: float = 0.0                          # 三模态同步、目标感知裁剪
     target_occlusion_p: float = 0.0                     # 目标内非对称栏杆/块遮挡；标签保持完整框
@@ -963,7 +981,8 @@ class MMDataset(Dataset):
         # 单模态消融仍需 visible 的尺寸/标签坐标作为参考，但像素会在下面清零，
         # 绝不把 RGB 视觉信息送给 IR-only / Depth-only 模型。
         rgb = read_rgb(paths["visible"])
-        ir = read_ir(paths["infrared"]) if want_ir and "infrared" in paths else None
+        ir = (read_ir(paths["infrared"], mode=aug.ir_read_mode)
+              if want_ir and "infrared" in paths else None)
         dep, valid, metric_available = (read_depth(paths["depth"], return_metric=True,
                                                    legacy_valid=aug.legacy_lowlight)
                                         if want_dep and "depth" in paths

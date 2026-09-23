@@ -189,6 +189,7 @@ def main():
     ds = MMDataset(root, samples, imgsz=imgsz, train=False,
                    aug=AugCfg(imgsz=imgsz,
                               depth_resampling=getattr(model.cfg, "depth_resampling", "legacy_bilinear_v1"),
+                              ir_read_mode=getattr(model.cfg, "ir_read_mode", "legacy_first_channel"),
                               legacy_lowlight=int(model.cfg.encoder.depth_input_channels) == 2),
                    enabled={"rgb": ("rgb",), "ir": ("ir",), "dep": ("dep",),
                             "rgb_ir": ("rgb", "ir"),

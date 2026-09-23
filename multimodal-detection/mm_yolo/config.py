@@ -157,6 +157,7 @@ class MMConfig:
     # 模型
     weights: str = "yolo11s.pt"           # COCO 预训练（离线需自备）
     depth_resampling: str = "legacy_bilinear_v1"
+    ir_read_mode: str = "legacy_first_channel"
     nc: int = 12
     cls_remap: bool = True
     # 子配置
@@ -182,6 +183,7 @@ class MMConfig:
                        "depth_scales": list(self.fusion.depth_scales)},
             "align_mode": self.align.mode,
             "depth_resampling": self.depth_resampling,
+            "ir_read_mode": self.ir_read_mode,
         }
 
     @staticmethod
@@ -202,6 +204,7 @@ class MMConfig:
             cfg.fusion = FusionCfg(**f)
         cfg.align.mode = struct.get("align_mode", cfg.align.mode)
         cfg.depth_resampling = struct.get("depth_resampling", "legacy_bilinear_v1")
+        cfg.ir_read_mode = struct.get("ir_read_mode", "legacy_first_channel")
         return cfg
 
     def resolve_weights(self) -> str:

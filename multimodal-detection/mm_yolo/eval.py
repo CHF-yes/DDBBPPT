@@ -227,6 +227,7 @@ def evaluate_model(model: MMYOLO, root: Path, samples: List[dict], imgsz=960,
     ds = MMDataset(Path(root), samples, imgsz=imgsz, train=False,
                    aug=AugCfg(imgsz=imgsz,
                               depth_resampling=getattr(getattr(model, "cfg", None), "depth_resampling", "legacy_bilinear_v1"),
+                              ir_read_mode=getattr(getattr(model, "cfg", None), "ir_read_mode", "legacy_first_channel"),
                               legacy_lowlight=int(model.cfg.encoder.depth_input_channels) == 2),
                    enabled={"rgb": ("rgb",), "ir": ("ir",), "dep": ("dep",),
                             "rgb_ir": ("rgb", "ir"),
@@ -353,6 +354,9 @@ def main():
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--base-weights", default="",
                     help="服务器上本地预训练权重路径；用于重建 checkpoint 结构")
+    ap.add_argument("--ir-read-mode", default="",
+                    choices=["", "legacy_first_channel", "median_channel"],
+                    help="只读 A/B 覆盖；空值使用 checkpoint 记录的 IR 预处理")
     ap.add_argument("--device", default="auto", help="auto/cpu/cuda/cuda:0")
     ap.add_argument("--root", required=True)
     ap.add_argument("--labels", default="")
@@ -377,6 +381,8 @@ def main():
         if args.device == "auto" else ("cuda:0" if args.device == "cuda" else args.device)
     dev = torch.device(device_arg)
     overrides = {"weights": args.base_weights} if args.base_weights else {}
+    if args.ir_read_mode:
+        overrides["ir_read_mode"] = args.ir_read_mode
     model, ck = load_mm_checkpoint(args.ckpt, device=dev, **overrides)
     model.eval()
     modalities = resolve_infer_modalities(model, args.modalities or None)
