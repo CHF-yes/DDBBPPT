@@ -207,7 +207,8 @@ class IndependentMMYOLO(nn.Module):
         self.semantic_adapters = None
         self.semantic_detect = None
         if (cfg.fusion.branch_aux_weight > 0 or
-                any(float(v) > 0 for v in cfg.fusion.branch_aux_weights)):
+                any(float(v) > 0 for v in cfg.fusion.branch_aux_weights) or
+                cfg.fusion.fusion_strategy == "v47_trusted_evidence_v1"):
             # One shared training-only detector sees the common representation
             # from each modality. Sharing the head makes semantic compatibility
             # operational rather than merely encouraging similar magnitudes.
@@ -219,7 +220,8 @@ class IndependentMMYOLO(nn.Module):
         # consume each encoder's raw pyramid, not fused/common features.
         self.independent_aux = nn.ModuleDict()
         if (cfg.fusion.branch_aux_weight > 0 or
-                any(float(v) > 0 for v in cfg.fusion.branch_aux_weights)):
+                any(float(v) > 0 for v in cfg.fusion.branch_aux_weights) or
+                cfg.fusion.fusion_strategy == "v47_trusted_evidence_v1"):
             self.independent_aux = nn.ModuleDict({
                 m: IndependentBranchDetector(self.backbone.model, self.channels,
                                              self.neck_channels, det)

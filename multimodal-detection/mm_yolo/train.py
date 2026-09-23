@@ -879,7 +879,9 @@ def adapt_depth_checkpoint_state(state: dict, model: MMYOLO) -> tuple:
                    name.startswith("ir_coarse_aligner.") or
                   name.startswith("occlusion_context.") or
                   name == "metric_gain_logit")
-        if name not in out and (name.startswith("independent_aux.") or is_new_switch or
+        if name not in out and (name.startswith("independent_aux.") or
+                                name.startswith("semantic_adapters.") or
+                                name.startswith("semantic_detect.") or is_new_switch or
                                 (legacy_fusion and is_v45)):
             out[name] = target.detach().clone()
             migrated = True
