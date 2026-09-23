@@ -95,6 +95,18 @@ def recipe_for(args):
     return MEMORY_RECIPE if getattr(args, "architecture", "legacy_hook_v1") == "spatial_memory_v1" else TRAINER_RECIPE
 
 
+def fusion_health_measurements(block):
+    """Normalize legacy pair stats and newer named scalar health stats."""
+    measurements = dict(block.last_health)
+    for name, value in block.last_stats.items():
+        if isinstance(value, (tuple, list)) and len(value) == 2:
+            measurements[f"{name}_match"] = value[0]
+            measurements[f"{name}_gate"] = value[1]
+        else:
+            measurements[name] = value
+    return measurements
+
+
 def apply_bn_policy(model, policy, frozen=False):
     """Small-batch adaptive stats; affine parameters still follow optimizer groups."""
     if policy not in ("adaptive", "adaptive_no_tail"):
@@ -2008,10 +2020,7 @@ def main():
                 health_blocks = (model.evidence_router if len(getattr(model, "evidence_router", {}))
                                  else model.fusion)
                 for scale, block in health_blocks.items():
-                    measurements = dict(block.last_health)
-                    for m, pair in block.last_stats.items():
-                        measurements[f"{m}_match"] = pair[0]
-                        measurements[f"{m}_gate"] = pair[1]
+                    measurements = fusion_health_measurements(block)
                     for key, value in measurements.items():
                         k = f"{scale}.{key}"
                         health_sum[k] = health_sum.get(k, 0) + value.detach().float()
