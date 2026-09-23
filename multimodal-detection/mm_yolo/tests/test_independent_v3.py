@@ -242,12 +242,15 @@ class IndependentV3Tests(unittest.TestCase):
             last_stats = {
                 "ir_shared_mix": torch.tensor(.6),
                 "legacy": (torch.tensor(.7), torch.tensor(.3)),
+                "tensor_pair": torch.tensor([.8, .2]),
             }
 
         values = fusion_health_measurements(Block())
         self.assertEqual(set(values), {
-            "ir_route_ratio", "ir_shared_mix", "legacy_match", "legacy_gate"})
+            "ir_route_ratio", "ir_shared_mix", "legacy_match", "legacy_gate",
+            "tensor_pair_match", "tensor_pair_gate"})
         self.assertAlmostEqual(float(values["ir_shared_mix"]), .6, places=5)
+        self.assertAlmostEqual(float(values["tensor_pair_gate"]), .2, places=5)
 
         logged = fusion_router_stats(Block())
         self.assertEqual(logged, {

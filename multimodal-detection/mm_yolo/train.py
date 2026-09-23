@@ -96,12 +96,22 @@ def recipe_for(args):
 
 
 def fusion_health_measurements(block):
-    """Normalize legacy pair stats and newer named scalar health stats."""
+    """Normalize legacy pair stats and newer named scalar health stats.
+
+    Older fusion blocks store ``(match, gate)`` as a length-two tensor from
+    ``torch.stack``; treating that tensor as a scalar made training fail after
+    the first epoch while formatting the health log.  Split both tensor and
+    Python sequence pairs into the same scalar keys.
+    """
     measurements = dict(block.last_health)
     for name, value in block.last_stats.items():
         if isinstance(value, (tuple, list)) and len(value) == 2:
             measurements[f"{name}_match"] = value[0]
             measurements[f"{name}_gate"] = value[1]
+        elif torch.is_tensor(value) and value.numel() == 2:
+            pair = value.reshape(-1)
+            measurements[f"{name}_match"] = pair[0]
+            measurements[f"{name}_gate"] = pair[1]
         else:
             measurements[name] = value
     return measurements
