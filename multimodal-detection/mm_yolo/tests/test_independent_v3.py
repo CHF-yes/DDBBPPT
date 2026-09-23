@@ -256,6 +256,7 @@ class IndependentV3Tests(unittest.TestCase):
         self.assertEqual(logged, {
             "ir_shared_mix": .6,
             "legacy": [.7, .3],
+            "tensor_pair": [.8, .2],
         })
 
     def test_target_occlusion_is_reproducible_and_keeps_labels_external(self):
