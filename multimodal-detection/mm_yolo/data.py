@@ -64,6 +64,36 @@ def read_rgb(path) -> Optional[np.ndarray]:
     return cv2.cvtColor(img[:, :, :3], cv2.COLOR_BGR2RGB)
 
 
+def read_ir_bundle(path, mode: str = "legacy_first_channel"):
+    """Read thermal intensity plus chroma residue from the stored IR image.
+
+    The median channel is the detector input.  The per-pixel channel spread is
+    retained only as a quality/processing-chain signal; it is never subtracted
+    from the thermal image.
+    """
+    img = imread_unicode(path, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        return None, None
+    if mode not in ("legacy_first_channel", "median_channel"):
+        raise ValueError(f"unknown IR read mode: {mode}")
+    source_dtype = img.dtype
+    if img.ndim == 2:
+        channels = np.repeat(img[..., None], 3, axis=2)
+    else:
+        channels = img[:, :, :3]
+    channels = channels.astype(np.float32)
+    if source_dtype == np.uint16:
+        channels /= 256.0
+    channels = np.clip(channels, 0.0, 255.0)
+    if mode == "median_channel":
+        thermal = np.median(channels, axis=2)
+    else:
+        thermal = channels[:, :, 0]
+    # Magnitude of C_IR = IR - mean_c(IR), normalized for quality maps.
+    chroma = np.mean(np.abs(channels - channels.mean(axis=2, keepdims=True)), axis=2) / 255.0
+    return np.clip(thermal, 0, 255).astype(np.uint8), chroma.astype(np.float32)
+
+
 def read_ir(path, mode: str = "legacy_first_channel") -> Optional[np.ndarray]:
     """Read IR without treating a weak channel tint as the thermal signal.
 
@@ -72,24 +102,8 @@ def read_ir(path, mode: str = "legacy_first_channel") -> Optional[np.ndarray]:
     stored channels, which is robust to the small RGB-like chroma residue seen
     in a subset of the PNG files.
     """
-    img = imread_unicode(path, cv2.IMREAD_UNCHANGED)
-    if img is None:
-        return None
-    if mode not in ("legacy_first_channel", "median_channel"):
-        raise ValueError(f"unknown IR read mode: {mode}")
-    source_dtype = img.dtype
-    if img.ndim == 3:
-        if mode == "median_channel":
-            # Median is insensitive to a weak one-channel color residue and
-            # preserves the dominant thermal brightness structure.
-            img = np.median(img[:, :, :3], axis=2)
-        else:
-            img = img[:, :, 0]
-    if source_dtype == np.uint16:           # 万一 IR 是 16bit，压缩到 8bit 供显示/统计
-        img = (img / 256.0).astype(np.uint8)
-    elif img.dtype != np.uint8:
-        img = np.clip(img, 0, 255).astype(np.uint8)
-    return img
+    thermal, _ = read_ir_bundle(path, mode=mode)
+    return thermal
 
 
 def read_depth(path, return_metric: bool = False, legacy_valid: bool = False):
@@ -183,8 +197,8 @@ def _local_stats(gray: np.ndarray, k: int = 15) -> Tuple[np.ndarray, np.ndarray]
 
 def quality_maps(rgb: Optional[np.ndarray], ir: Optional[np.ndarray],
                  dep: Optional[np.ndarray], valid: Optional[np.ndarray],
-                 out_size: Tuple[int, int]) -> Dict[str, np.ndarray]:
-    """每个模态 3 通道质量描述子（低分辨率即可，融合块会插值到自身尺度）。
+                 out_size: Tuple[int, int], ir_chroma: Optional[np.ndarray] = None) -> Dict[str, np.ndarray]:
+    """低分辨率质量描述子；IR 额外保留处理链和边缘可靠性信息。
 
     ⚠️ **只对"本模态真的可用"的输入生成**：不生成质量图 → 融合块对该槽插零，
     与"整路丢弃该模态"语义一致（旧版无条件生成 RGB 质量图，即使 RGB 已被丢掉）。
@@ -192,7 +206,7 @@ def quality_maps(rgb: Optional[np.ndarray], ir: Optional[np.ndarray],
     out: Dict[str, np.ndarray] = {}
     h, w = out_size
 
-    def _down3(chan: Sequence[np.ndarray]) -> np.ndarray:
+    def _down(chan: Sequence[np.ndarray]) -> np.ndarray:
         arrs = [cv2.resize(c.astype(np.float32), (w, h), interpolation=cv2.INTER_AREA) for c in chan]
         return np.nan_to_num(np.stack(arrs, 0).astype(np.float32), nan=0.0,
                              posinf=0.0, neginf=0.0)
@@ -203,7 +217,7 @@ def quality_maps(rgb: Optional[np.ndarray], ir: Optional[np.ndarray],
         mean, std = _local_stats(g)
         lap = np.abs(cv2.Laplacian(g, cv2.CV_32F, ksize=3))
         lap = lap / (np.percentile(lap, 95) + 1e-6)
-        out["rgb"] = _down3([mean / 255.0, np.clip(std / 64.0, 0, 1), np.clip(lap, 0, 1)])
+        out["rgb"] = _down([mean / 255.0, np.clip(std / 64.0, 0, 1), np.clip(lap, 0, 1)])
     # ---- IR：强度 / 局部对比度 / 梯度能量 ----
     if ir is not None and ir.size:
         mean, std = _local_stats(ir)
@@ -211,7 +225,32 @@ def quality_maps(rgb: Optional[np.ndarray], ir: Optional[np.ndarray],
         gy = cv2.Sobel(ir.astype(np.float32), cv2.CV_32F, 0, 1, ksize=3)
         grad = cv2.magnitude(gx, gy)
         grad = grad / (np.percentile(grad, 95) + 1e-6)
-        out["ir"] = _down3([mean / 255.0, np.clip(std / 64.0, 0, 1), np.clip(grad, 0, 1)])
+        edge = np.clip(grad, 0, 1)
+        dark = ((mean < 6.0) | (mean > 249.0)).astype(np.float32)
+        dark_edge = cv2.blur(dark, (9, 9))
+        saturation = cv2.blur(((mean < 2.0) | (mean > 253.0)).astype(np.float32), (7, 7))
+        # Low normalized Laplacian energy is a blur cue; paired edge energy
+        # marks thick/double contours produced by interpolation or ghosting.
+        blur = 1.0 - np.clip(np.abs(cv2.Laplacian(ir.astype(np.float32), cv2.CV_32F, ksize=3)) /
+                             (np.percentile(np.abs(cv2.Laplacian(ir.astype(np.float32), cv2.CV_32F, ksize=3)), 95) + 1e-6), 0, 1)
+        double_edge = np.clip(edge * cv2.blur((edge > .35).astype(np.float32), (5, 5)) * 3.0, 0, 1)
+        chroma = np.zeros_like(mean, dtype=np.float32) if ir_chroma is None else np.clip(ir_chroma, 0, 1)
+        if rgb is not None and rgb.size:
+            rgb_float = rgb.astype(np.float32)
+            rgb_chroma = np.mean(np.abs(rgb_float - rgb_float.mean(axis=2, keepdims=True)), axis=2) / 255.0
+            # Estimate a per-image RGB-like residue coefficient, then retain
+            # only its fit confidence.  The fitted residue never enters T.
+            rgb_chroma = np.clip(rgb_chroma, 0, 1)
+            coeff = float((chroma * rgb_chroma).sum() /
+                          (np.square(rgb_chroma).sum() + 1e-6))
+            coeff = float(np.clip(coeff, 0.0, 1.0))
+            chroma_fit = np.exp(-np.abs(chroma - coeff * rgb_chroma) / .08)
+        else:
+            chroma_fit = np.zeros_like(chroma)
+        out["ir"] = _down([mean / 255.0, np.clip(std / 64.0, 0, 1), edge,
+                           np.clip(dark_edge, 0, 1), np.clip(saturation, 0, 1),
+                           np.clip(blur, 0, 1), np.clip(double_edge, 0, 1),
+                           chroma, np.clip(chroma_fit, 0, 1)])
     # ---- depth：局部有效比例 / 深度梯度 / 局部对比度 ----
     if dep is not None and valid is not None and dep.size:
         rel = relative_depth(dep, valid)
@@ -222,7 +261,7 @@ def quality_maps(rgb: Optional[np.ndarray], ir: Optional[np.ndarray],
         grad = grad / (np.percentile(grad, 95) + 1e-6)
         _, std = _local_stats(filled)
         vr = cv2.blur(valid.astype(np.float32), (15, 15))
-        out["dep"] = _down3([vr, np.clip(grad, 0, 1), np.clip(std * 4, 0, 1)])
+        out["dep"] = _down([vr, np.clip(grad, 0, 1), np.clip(std * 4, 0, 1)])
     return out
 
 
@@ -930,7 +969,13 @@ class MMDataset(Dataset):
         for key in set().union(*(c["quality"] for c in children)):
             tiles = []
             for item,(_,_,hh,ww) in zip(children,rects):
-                value = item["quality"].get(key, torch.zeros(3,1,1))
+                if key in item["quality"]:
+                    value = item["quality"][key]
+                else:
+                    # V5 IR quality maps have nine channels; preserve the
+                    # channel contract when a dropped tile has no descriptor.
+                    channels = 9 if key == "ir" else (1 if key == "scene_id" else 3)
+                    value = torch.zeros(channels, 1, 1)
                 tiles.append(tf.interpolate(value[None],size=(hh,ww),mode="nearest")[0])
             value = torch.cat((torch.cat(tiles[:2],2),torch.cat(tiles[2:],2)),1)
             out["quality"][key] = value if key == "availability" else tf.interpolate(value[None],size=(max(4,h//8),max(4,w//8)),mode="area")[0]
@@ -981,8 +1026,8 @@ class MMDataset(Dataset):
         # 单模态消融仍需 visible 的尺寸/标签坐标作为参考，但像素会在下面清零，
         # 绝不把 RGB 视觉信息送给 IR-only / Depth-only 模型。
         rgb = read_rgb(paths["visible"])
-        ir = (read_ir(paths["infrared"], mode=aug.ir_read_mode)
-              if want_ir and "infrared" in paths else None)
+        ir, ir_chroma = (read_ir_bundle(paths["infrared"], mode=aug.ir_read_mode)
+                         if want_ir and "infrared" in paths else (None, None))
         dep, valid, metric_available = (read_depth(paths["depth"], return_metric=True,
                                                    legacy_valid=aug.legacy_lowlight)
                                         if want_dep and "depth" in paths
@@ -994,6 +1039,7 @@ class MMDataset(Dataset):
         missing = set()
         if ir is None:
             ir = self._blank_like(rgb, "ir")
+            ir_chroma = np.zeros(ir.shape[:2], np.float32)
             if want_ir:
                 missing.add("ir")
         if dep is None:
@@ -1004,6 +1050,10 @@ class MMDataset(Dataset):
         H, W = rgb.shape[:2]
         if ir.shape[:2] != (H, W):
             ir = cv2.resize(ir, (W, H), interpolation=cv2.INTER_AREA)
+        if ir_chroma is None:
+            ir_chroma = np.zeros((H, W), np.float32)
+        elif ir_chroma.shape[:2] != (H, W):
+            ir_chroma = cv2.resize(ir_chroma, (W, H), interpolation=cv2.INTER_AREA)
         metric_map = np.full(dep.shape[:2], 1 if metric_available else 0, dtype=np.uint8)
         if dep.shape[:2] != (H, W):
             dep = cv2.resize(dep, (W, H), interpolation=cv2.INTER_NEAREST)
@@ -1039,6 +1089,7 @@ class MMDataset(Dataset):
         if not want_rgb:
             rgb_w.fill(0)
         ir_w = _warp(ir, M, self.canvas)
+        ir_chroma_w = _warp(ir_chroma, M, self.canvas)
         ir_spatial = _warp(np.ones((H, W), np.uint8), M, self.canvas, nearest=True).astype(np.float32)
         ir_affine_target = np.zeros(4, np.float32)
         ir_affine_supervised = 0.0
@@ -1050,6 +1101,7 @@ class MMDataset(Dataset):
             ds = rng.uniform(-aug.ir_affine_scale, aug.ir_affine_scale)
             A = centered_affine_M(self.canvas, angle, 1.0 + ds, sx, sy)
             ir_w = _warp(ir_w, A, self.canvas)
+            ir_chroma_w = _warp(ir_chroma_w, A, self.canvas)
             ir_spatial = _warp(ir_spatial, A, self.canvas, nearest=True).astype(np.float32)
             # ``warp`` predicts output-reference -> distorted-input sampling.
             # OpenCV rendered the distorted image with source->destination A,
@@ -1102,13 +1154,15 @@ class MMDataset(Dataset):
         Hq, Wq = max(32, Hc // 4), max(32, Wc // 4)
         rgb_q = cv2.resize(rgb_w, (Wq, Hq), interpolation=cv2.INTER_AREA)
         ir_q = cv2.resize(ir_w, (Wq, Hq), interpolation=cv2.INTER_AREA)
+        ir_chroma_q = cv2.resize(ir_chroma_w, (Wq, Hq), interpolation=cv2.INTER_AREA)
         dep_q = cv2.resize(dep_w, (Wq, Hq), interpolation=cv2.INTER_NEAREST)
         val_q = cv2.resize(valid_w.astype(np.uint8), (Wq, Hq),
                            interpolation=cv2.INTER_NEAREST).astype(bool)
         ps = (max(4, Hc // self.prior_stride), max(4, Wc // self.prior_stride))
         prior = depth_prior(dep_q, val_q, ps)
         quality = quality_maps(rgb_q if want_rgb else None, ir_q if want_ir else None,
-                               dep_q if want_dep else None, val_q if want_dep else None, ps)
+                               dep_q if want_dep else None, val_q if want_dep else None, ps,
+                               ir_chroma=ir_chroma_q if want_ir else None)
 
         # ---- modality dropout（整路置零 + 记录 keep）----
         keep = {"rgb": 1.0 if want_rgb else 0.0,
@@ -1243,12 +1297,20 @@ def collate(batch: List[Optional[dict]]) -> Optional[dict]:
     # 每张图分别填零；交集会让一张图 dropout 导致整批都失去质量描述子。
     qkeys = [k for k in ("rgb", "ir", "dep") if k in enabled]
     qshape = (3, *batch[0]["prior"].shape[-2:])
+    qchannels = {}
+    for key in qkeys:
+        for item in batch:
+            if key in item["quality"]:
+                qchannels[key] = int(item["quality"][key].shape[0])
+                break
+        qchannels.setdefault(key, 9 if key == "ir" else 3)
     out = {
         "rgb": torch.stack([b["rgb"] for b in batch]),
         "ir": torch.stack([b["ir"] for b in batch]),
         "depth": torch.stack([b["depth"] for b in batch]),
         "prior": torch.stack([b["prior"] for b in batch]),
-        "quality": {k: torch.stack([b["quality"].get(k, b["prior"].new_zeros(qshape))
+        "quality": {k: torch.stack([b["quality"].get(
+                                    k, b["prior"].new_zeros((qchannels[k], *b["prior"].shape[-2:])))
                                     for b in batch]) for k in qkeys},
         "boxes": [b["boxes"] for b in batch],
         "M": torch.stack([b["M"] for b in batch]),

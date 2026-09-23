@@ -144,6 +144,25 @@ def main():
                 source = run/"stage_a"/"weights"/"best.pt"
                 if not a.dry_run and not source.is_file():
                     raise FileNotFoundError(f"Stage B 缺少 Stage A best.pt: {source}")
+                if not a.dry_run:
+                    # Do not silently hand a collapsed IR branch to Stage B.
+                    # The gate is recorded in the recipe and can be lowered
+                    # explicitly for a difficult dataset, never bypassed by
+                    # accidentally finding a last.pt.
+                    metrics_path = run/"stage_a"/"val_best.json"
+                    if not metrics_path.is_file():
+                        raise FileNotFoundError(
+                            f"Stage B 拒绝启动：缺少 Stage A val_best.json: {metrics_path}")
+                    metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+                    ir_metrics = (metrics.get("branches", {}).get("ir", {})
+                                  if isinstance(metrics.get("branches"), dict) else {})
+                    ir_map = float(ir_metrics.get("map50_95", float("nan")))
+                    threshold = float(cfg.get("stage_a_ir_min_map50_95", .12))
+                    if not (ir_map == ir_map) or ir_map < threshold:
+                        raise RuntimeError(
+                            f"Stage B 拒绝启动：Stage A IR mAP50-95={ir_map:.4f} < "
+                            f"门槛 {threshold:.4f}；请修复 Stage A 或显式调整 stage_a_ir_min_map50_95")
+                    print(f"[pipeline] Stage A IR 独立 AP={ir_map:.4f}，达到门槛 {threshold:.4f}，允许进入 Stage B")
                 cmd += ["--init-checkpoint",str(source)]
             if a.dry_run:
                 print(json.dumps(cmd,ensure_ascii=False)); continue

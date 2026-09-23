@@ -66,6 +66,8 @@ MEMORY_RECIPE = "coverage_spatial_memory_v1"
 
 def recipe_for(args):
     if getattr(args, "architecture", "") == "independent_p2_memory_v3":
+        if getattr(args, "fusion_strategy", "legacy_residual_v2") == "v5_ir_quality_evidence":
+            return "v5_v44_identity_quality_evidence"
         if getattr(args, "fusion_strategy", "legacy_residual_v2") == "v48_embedding_complement_v1":
             return "v48_v44_base_rotation_embedding_complement"
         if getattr(args, "fusion_strategy", "legacy_residual_v2") == "v47_trusted_evidence_v1":
@@ -278,6 +280,29 @@ def reset_v48_additions(model):
     return reset
 
 
+def reset_v5_additions(model):
+    """Reset only V5 quality/evidence additions around the V4.4 route."""
+    reset = []
+    with torch.no_grad():
+        for scale, block in getattr(model, "evidence_router", {}).items():
+            for name in ("shared", "private", "depth_support",
+                         "shared_spatial", "shared_channel",
+                         "private_spatial", "private_channel",
+                         "depth_spatial", "depth_channel",
+                         "ir_evidence", "depth_evidence"):
+                module = getattr(block, name, None)
+                if module is None:
+                    continue
+                last = module[-1]
+                if hasattr(last, "weight"):
+                    last.weight.zero_()
+                    reset.append(f"evidence_router.{scale}.{name}.{len(module)-1}.weight")
+                if hasattr(last, "bias") and name in ("ir_evidence", "depth_evidence"):
+                    last.bias.fill_(-2.1972246)
+                    reset.append(f"evidence_router.{scale}.{name}.{len(module)-1}.bias")
+    return reset
+
+
 # ---------------------------------------------------------------- 批次 → 损失输入
 
 def make_targets(batch: dict, canvas, device) -> dict:
@@ -440,6 +465,11 @@ def set_independent_aux_mode(model: MMYOLO) -> None:
         if module is not None:
             for p in module.parameters():
                 p.requires_grad_(True)
+    # V5 keeps an RGB standalone teacher active as well; the RGB detector
+    # supervision must not be replaced by IR/Depth-only adaptation.
+    if getattr(model.cfg.fusion, "fusion_strategy", "") == "v5_ir_quality_evidence":
+        for p in model.backbone.model[:11].parameters():
+            p.requires_grad_(True)
     for branch in getattr(model, "independent_aux", {}).values():
         dfl = getattr(branch.detector, "dfl", None)
         if dfl is not None:
@@ -465,12 +495,19 @@ def set_residual_fusion_mode(model: MMYOLO, downstream_frozen: bool) -> None:
     incremental = getattr(model.cfg.fusion, "fusion_strategy", "") == "v44_incremental_router_v1"
     trusted = getattr(model.cfg.fusion, "fusion_strategy", "") == "v47_trusted_evidence_v1"
     v48 = getattr(model.cfg.fusion, "fusion_strategy", "") == "v48_embedding_complement_v1"
-    if v48:
+    v5 = getattr(model.cfg.fusion, "fusion_strategy", "") == "v5_ir_quality_evidence"
+    if v48 or v5:
         # Protect the learned V4.4 fusion and RGB backbone.  The short first
         # phase learns only the exact-zero plugin/alignment.  Afterwards the
         # auxiliary representations and downstream detector adapt at low LR.
         enable(getattr(model, "evidence_router", None))
         enable(getattr(model, "ir_coarse_aligner", None))
+        if v5:
+            # Keep the shared semantic auxiliary heads trainable from the
+            # first Stage-B epoch; otherwise their non-zero loss would be a
+            # graph with no trainable path while the RGB anchor is frozen.
+            enable(getattr(model, "semantic_adapters", None))
+            enable(getattr(model, "semantic_detect", None))
         if not downstream_frozen:
             enable(getattr(model, "aux_encoders", None))
             enable(getattr(model, "metric_encoder", None))
@@ -868,12 +905,14 @@ def validate_checkpoint(ck: dict, model: MMYOLO, enabled, canvas, exact: bool = 
                 new_f.get("fusion_strategy") in ("evidence_router_v3",
                                                   "v44_incremental_router_v1",
                                                   "v47_trusted_evidence_v1",
-                                                  "v48_embedding_complement_v1")):
+                                                  "v48_embedding_complement_v1",
+                                                  "v5_ir_quality_evidence")):
             # Explicit V4.4 warm-start paths.  The incremental path keeps the
             # old fusion weights and only initializes newly named tensors below.
             for key in ("fusion_strategy", "ir_coarse_align",
                         "ir_affine_max_degrees", "ir_affine_max_shift",
-                        "ir_affine_max_scale", "ir_affine_identity_weight"):
+                        "ir_affine_max_scale", "ir_affine_identity_weight",
+                        "quality_channels"):
                 old_f[key] = new_f[key]
     # 损失权重与匹配下限是训练超参，不改变 state_dict 的形状：warm-start
     # （--init-checkpoint）必须允许在保留权重的前提下调整它们。精确 --resume
@@ -1274,7 +1313,8 @@ def main():
     ap.add_argument("--fusion-strategy", default="legacy_residual_v2",
                     choices=["legacy_residual_v2", "evidence_router_v3",
                              "v44_incremental_router_v1", "v47_trusted_evidence_v1",
-                             "v48_embedding_complement_v1"])
+                             "v48_embedding_complement_v1",
+                             "v5_ir_quality_evidence"])
     ap.add_argument("--ir-coarse-align", action="store_true",
                     help="启用样本级 IR 小仿射 + P2/P3 局部残差对齐")
     ap.add_argument("--ir-affine-loss-weight", type=float, default=0.0)
@@ -1356,10 +1396,12 @@ def main():
         raise ValueError("v47_trusted_evidence_v1 requires supervised IR coarse alignment")
     if args.fusion_strategy == "v48_embedding_complement_v1" and not args.ir_coarse_align:
         raise ValueError("V4.8 requires confidence-blended IR rotation correction")
+    if args.fusion_strategy == "v5_ir_quality_evidence" and not args.ir_coarse_align:
+        raise ValueError("v5_ir_quality_evidence requires supervised IR coarse alignment")
     if args.ir_coarse_align and args.fusion_strategy not in (
             "evidence_router_v3", "v47_trusted_evidence_v1",
-            "v48_embedding_complement_v1"):
-        raise ValueError("--ir-coarse-align 只适用于 evidence_router_v3/V4.7/V4.8")
+            "v48_embedding_complement_v1", "v5_ir_quality_evidence"):
+        raise ValueError("--ir-coarse-align 只适用于 evidence_router_v3/V4.7/V4.8/V5")
     if args.fusion_strategy == "v48_embedding_complement_v1" and (
             args.ir_affine_p != 0 or args.ir_affine_shift != 0 or
             args.ir_affine_scale != 0 or args.ir_affine_loss_weight != 0 or
@@ -1645,6 +1687,9 @@ def main():
             elif args.fusion_strategy == "v48_embedding_complement_v1":
                 reset_keys = reset_v48_additions(model)
                 log(f"[train] V4.8 V4.4 保底起点：仅重置新增插件 {reset_keys}")
+            elif args.fusion_strategy == "v5_ir_quality_evidence":
+                reset_keys = reset_v5_additions(model)
+                log(f"[train] V5 V4.4 保底起点：仅重置质量/证据插件 {reset_keys}")
             elif args.fusion_strategy in ("v44_incremental_router_v1",
                                            "v47_trusted_evidence_v1"):
                 reset_keys = reset_incremental_router_additions(model)
@@ -1951,14 +1996,15 @@ def main():
                     # ``both`` mode the two graphs are backpropagated one at a
                     # time, so every epoch covers both sensors without retaining
                     # two high-resolution detector graphs at once.
-                    names = ("ir", "dep")
+                    names = tuple(name for name in ("rgb", "ir", "dep")
+                                  if name in model.independent_aux)
                     if args.aux_branch_mode != "both":
                         names = (names[(ep + bi) % len(names)],)
                     item_sum = {}
                     loss_scalar = zero
                     for name in names:
                         branch_aux, active = model.independent_branch_prediction(
-                            name, ir=ir, depth=dep, keep=keep)
+                            name, rgb=rgb, ir=ir, depth=dep, keep=keep)
                         if not active.any():
                             raise RuntimeError(f"Stage A batch has no valid {name} samples")
                         branch_preds, branch_targets = subset_detection_batch(

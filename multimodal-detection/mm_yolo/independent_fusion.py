@@ -492,3 +492,178 @@ class EmbeddingComplementPlugin(nn.Module):
             "2_reliable": reliable[2].detach().float().mean(),
         }
         return fused, depth_delta
+
+
+class V5IRQualityFusion(nn.Module):
+    """V5 additive evidence plugin around the learned V4.4 route.
+
+    The V4.4 ``ComplementaryFusion`` remains the detector anchor.  This block
+    only adds zero-initialized, locally gated residuals, so a V4.4 checkpoint
+    keeps its initial function exactly.  IR common evidence and IR-private
+    evidence have separate projections and gates; the latter never requires
+    RGB agreement.  Depth is restricted to a valid-geometry support branch.
+    """
+
+    def __init__(self, channels, dim=64, memory_dim=128,
+                 ir_quality_channels=9, depth_quality_channels=3):
+        super().__init__()
+        hidden = max(32, min(128, channels // 2))
+        self.channels = int(channels)
+        self.dim = int(dim)
+        self.ir_quality_channels = int(ir_quality_channels)
+        self.query = nn.Sequential(
+            nn.Conv2d(channels, dim, 1, bias=False),
+            nn.GroupNorm(8, dim), nn.SiLU())
+        self.memory = nn.Linear(memory_dim, dim, bias=False)
+        self.ir_quality = nn.Sequential(
+            nn.Conv2d(self.ir_quality_channels, dim, 1, bias=False),
+            nn.GroupNorm(8, dim), nn.SiLU())
+        self.depth_quality = nn.Sequential(
+            nn.Conv2d(depth_quality_channels, dim, 1, bias=False),
+            nn.GroupNorm(8, dim), nn.SiLU())
+
+        # Shared IR evidence uses RGB/IR agreement; private evidence is IR-only
+        # apart from the current RGB query, so hot objects are not rejected.
+        self.shared = nn.Sequential(
+            nn.Conv2d(dim * 6, hidden, 1, bias=False),
+            nn.GroupNorm(max(1, min(16, hidden // 8)), hidden), nn.SiLU(),
+            nn.Conv2d(hidden, channels, 1, bias=False))
+        self.private = nn.Sequential(
+            nn.Conv2d(dim * 4, hidden, 1, bias=False),
+            nn.GroupNorm(max(1, min(16, hidden // 8)), hidden), nn.SiLU(),
+            nn.Conv2d(hidden, channels, 1, bias=False))
+        self.depth_support = nn.Sequential(
+            nn.Conv2d(dim * 6 + 2, hidden, 1, bias=False),
+            nn.GroupNorm(max(1, min(16, hidden // 8)), hidden), nn.SiLU(),
+            nn.Conv2d(hidden, channels, 1, bias=False))
+
+        # Every gate has both a spatial scalar and a per-channel component.
+        # Zero initialization makes the added residual an exact no-op at handoff.
+        gate_in = dim * 4 + 3  # query/common/private/quality + valid/match/reliability
+        self.shared_spatial = self._gate(gate_in, hidden, 1)
+        self.shared_channel = self._gate(gate_in, hidden, channels)
+        self.private_spatial = self._gate(gate_in, hidden, 1)
+        self.private_channel = self._gate(gate_in, hidden, channels)
+        depth_gate_in = dim * 6 + 2
+        self.depth_spatial = self._gate(depth_gate_in, hidden, 1)
+        self.depth_channel = self._gate(depth_gate_in, hidden, channels)
+
+        # Training-only evidence heads.  They are not detector voting; their
+        # logits supervise whether a sensor has complete target evidence.
+        self.ir_evidence = self._evidence_head(dim * 3, hidden)
+        self.depth_evidence = self._evidence_head(dim * 3, hidden)
+        self.last_stats, self.last_health = {}, {}
+        self.last_evidence_logits = []
+
+        for module in (self.shared, self.private, self.depth_support):
+            nn.init.zeros_(module[-1].weight)
+
+    @staticmethod
+    def _gate(in_channels, hidden, out_channels):
+        block = nn.Sequential(
+            nn.Conv2d(in_channels, hidden, 1, bias=False),
+            nn.GroupNorm(max(1, min(16, hidden // 8)), hidden), nn.SiLU(),
+            nn.Conv2d(hidden, out_channels, 1))
+        nn.init.zeros_(block[-1].weight)
+        nn.init.zeros_(block[-1].bias)
+        return block
+
+    @staticmethod
+    def _evidence_head(in_channels, hidden):
+        block = nn.Sequential(
+            nn.Conv2d(in_channels, hidden, 1, bias=False),
+            nn.GroupNorm(max(1, min(16, hidden // 8)), hidden), nn.SiLU(),
+            nn.Conv2d(hidden, 1, 1))
+        nn.init.zeros_(block[-1].weight)
+        nn.init.constant_(block[-1].bias, -2.1972246)  # initial p(object)=0.10
+        return block
+
+    @staticmethod
+    def _match_channels(value, channels):
+        if value.shape[1] == channels:
+            return value
+        if value.shape[1] > channels:
+            return value[:, :channels]
+        return torch.cat((value, value.new_zeros(
+            value.shape[0], channels - value.shape[1], *value.shape[-2:])), 1)
+
+    @staticmethod
+    def _bounded(residual, reference):
+        # Per-location RMS stabilization prevents a bad sensor from exploding,
+        # without the old global .20/.10 route ceiling.
+        scale = reference.detach().float().square().mean(1, keepdim=True).sqrt().clamp_min(.1)
+        return residual / torch.sqrt(
+            1 + residual.float().square().mean(1, keepdim=True) /
+            scale.square()).to(residual.dtype)
+
+    def _quality(self, quality, index, ref, encoder):
+        if quality is None or index >= len(quality) or quality[index] is None:
+            return ref.new_zeros(ref.shape[0], self.dim, *ref.shape[-2:])
+        value = F.interpolate(quality[index].float(), ref.shape[-2:],
+                              mode="bilinear", align_corners=False)
+        value = self._match_channels(value, encoder[0].in_channels)
+        return encoder(value).to(ref.dtype)
+
+    @staticmethod
+    def _gate_pair(spatial, channel, descriptor):
+        return spatial(descriptor).float().sigmoid().to(descriptor.dtype) * \
+               channel(descriptor).float().sigmoid().to(descriptor.dtype)
+
+    def forward(self, raw, common, private, valid, match, reliable, memory,
+                quality=None, anchor=None):
+        state = raw[0] * valid[0] if anchor is None else anchor
+        mem = self.memory(F.layer_norm(
+            memory[:, 3].mean(1).float(), (memory.shape[-1],)))[:, :, None, None]
+        q = self.query(state) + .25 * mem.to(state.dtype)
+        rgb_c, ir_c, dep_c = common
+        ir_u, dep_u = private[1], private[2]
+        ir_q = self._quality(quality, 1, q, self.ir_quality)
+        dep_q = self._quality(quality, 2, q, self.depth_quality)
+
+        ir_descriptor = torch.cat((q, ir_c, ir_u, ir_q,
+                                   valid[1].to(q.dtype), match[1].to(q.dtype),
+                                   reliable[1].to(q.dtype)), 1)
+        shared_gate = self._gate_pair(self.shared_spatial, self.shared_channel,
+                                      ir_descriptor)
+        private_gate = self._gate_pair(self.private_spatial, self.private_channel,
+                                       ir_descriptor)
+        shared_input = torch.cat((q, rgb_c, ir_c, (rgb_c - ir_c).abs(),
+                                  rgb_c * ir_c, ir_q), 1)
+        private_input = torch.cat((q, ir_c, ir_u, ir_q), 1)
+        shared_delta = self._bounded(self.shared(shared_input), state)
+        private_delta = self._bounded(self.private(private_input), state)
+        ir_evidence_logits = self.ir_evidence(torch.cat((q, ir_c, ir_u), 1))
+        ir_evidence = ir_evidence_logits.float().sigmoid().to(state.dtype)
+        ir_update = (shared_delta * shared_gate +
+                     private_delta * private_gate * ir_evidence) * \
+                    valid[1].to(state.dtype) * reliable[1].to(state.dtype)
+
+        depth_input = torch.cat((q, rgb_c, ir_c, dep_c, dep_u, dep_q,
+                                 valid[2].to(q.dtype), reliable[2].to(q.dtype)), 1)
+        depth_descriptor = depth_input
+        depth_gate = self._gate_pair(self.depth_spatial, self.depth_channel,
+                                     depth_descriptor)
+        depth_delta = self._bounded(self.depth_support(depth_input), state)
+        depth_evidence_logits = self.depth_evidence(torch.cat((q, dep_c, dep_u), 1))
+        depth_update = (depth_delta * depth_gate *
+                        valid[2].to(state.dtype) * reliable[2].to(state.dtype))
+        state = state + ir_update + depth_update
+
+        reference = state if anchor is None else anchor
+        base_rms = reference.detach().float().square().mean().sqrt().clamp_min(1e-6)
+        self.last_evidence_logits = [ir_evidence_logits, depth_evidence_logits]
+        self.last_stats = {
+            "ir_shared_gate": shared_gate.detach().mean(),
+            "ir_private_gate": private_gate.detach().mean(),
+            "ir_evidence": ir_evidence.detach().mean(),
+            "depth_gate": depth_gate.detach().mean(),
+        }
+        self.last_health = {
+            "ir_route_ratio": ir_update.detach().float().square().mean().sqrt() / base_rms,
+            "dep_route_ratio": depth_update.detach().float().square().mean().sqrt() / base_rms,
+            "ir_evidence": ir_evidence.detach().float().mean(),
+            "dep_evidence": depth_evidence_logits.detach().float().sigmoid().mean(),
+            "ir_reliable": reliable[1].detach().float().mean(),
+            "dep_reliable": reliable[2].detach().float().mean(),
+        }
+        return state

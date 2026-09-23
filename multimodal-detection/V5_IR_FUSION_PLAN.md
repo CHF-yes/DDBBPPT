@@ -78,6 +78,15 @@ F_fused = F_RGB
 - 不随机独立旋转 IR，不人为制造大幅 RGB--IR 错位。
 - 严格禁止三路同时失活。
 
+## 8. V5 实现合同
+
+- `mm_yolo/data.py` 的 `read_ir_bundle` 输出热灰度中位数和 `C_IR` 质量残差；IR 质量图为 9 通道，旧 V4.4 主路仍只接前三个通用质量通道。
+- `V5IRQualityFusion` 作为 V4.4 `ComplementaryFusion` 外的零初始化插件，维护共有/私有 IR 证据、raw/aligned 两路、IR quality embedding、空间门和通道门；不设 `.20/.10` 的整路全局增益上限。
+- V5 的 raw 主路使用 V4.4 名义网格，aligned IR 只进入插件；P3/P4 可做局部残差对齐，P5 不做自由局部形变，低置信对齐只影响插件。
+- Stage A 同时训练 RGB、IR、Depth 的独立检测支路；Stage B 仍保留 IR/Depth 独立保持损失、证据监督和嵌入监督的非零末值。
+- `train_multimodal.py` 在 Stage A `val_best.json` 的 IR 独立 mAP50-95 未达到门槛时拒绝启动 Stage B，避免从塌缩权重继续训练。
+- V5 配置为 `configs/mm_v5_ir_quality.json`，唯一外部初始化权重是 V4.4 `best.pt`；V4.5--V4.9 不参与结构或权重迁移。
+
 ## 8. 实施顺序与验收
 
 1. 先提交本文件，再实现数据质量链路、IR encoder 输入和 V5 融合插件。
