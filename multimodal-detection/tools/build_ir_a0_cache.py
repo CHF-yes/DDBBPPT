@@ -6,6 +6,7 @@ import argparse
 import json
 import sys
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import cv2
@@ -25,6 +26,61 @@ from mm_yolo.ir_a0 import (SearchCfg, estimate_affine, quality_maps, read_modali
 def _paths(root: Path, sample: dict):
     return (root / "visible" / sample["files"]["visible"],
             root / "infrared" / sample["files"]["infrared"])
+
+
+def _worker_init(opencv_threads: int):
+    # The server has a 16-core cgroup quota.  A few processes with a bounded
+    # OpenCV thread pool fill that quota more reliably than one Python process
+    # iterating the affine candidates while OpenCV repeatedly starts/stops its
+    # own workers.
+    cv2.setNumThreads(max(1, int(opencv_threads)))
+
+
+def _coarse_task(payload):
+    root, sample, cfg = payload
+    root = Path(root)
+    stem = sample["stem"]
+    rgb, thermal, ir3 = read_modalities(*_paths(root, sample))
+    _, _, geometry, _ = quality_maps(rgb, thermal, ir3)
+    return stem, source_group(stem), estimate_affine(rgb, thermal, geometry, cfg)
+
+
+def _refine_task(payload):
+    (root, out, sample, cfg, coarse, prior, prior_conf,
+     use_prior, min_confidence) = payload
+    root, out = Path(root), Path(out)
+    stem, group = sample["stem"], source_group(sample["stem"])
+    rgb, thermal, ir3 = read_modalities(*_paths(root, sample))
+    q, visible, geometry, meta = quality_maps(rgb, thermal, ir3)
+    refine_origin = prior if use_prior else coarse["params"]
+    refined = estimate_affine(rgb, thermal, geometry, cfg, prior=refine_origin)
+    chosen, chosen_source = select_affine_candidate(
+        coarse, refined, prior, prior_conf, use_prior)
+    confidence = float(chosen["confidence"] * (.5 + .5 * meta["valid_ratio"]))
+    save_sample(out / "samples" / f"{stem}.npz", stem=stem,
+                params=chosen["params"], confidence=confidence,
+                quality=q, visible=visible, geometry=geometry, meta=meta,
+                shape=thermal.shape, sequence=group, sequence_prior=prior,
+                sequence_confidence=prior_conf, min_confidence=min_confidence)
+    return {
+        "stem": stem, "sequence": group, "confidence": confidence,
+        "supervised": confidence >= min_confidence,
+        "params": [float(x) for x in chosen["params"]],
+        "chosen_source": chosen_source,
+        "coarse_score": float(coarse["score"]),
+        "coarse_identity_score": float(coarse["identity_score"]),
+        "coarse_improvement": float(coarse["improvement"]),
+        "coarse_uniqueness": float(coarse["uniqueness"]),
+        "coarse_phase_response": float(coarse["phase_response"]),
+        "coarse_confidence": float(coarse["confidence"]),
+        "refined_score": float(refined["score"]),
+        "refined_identity_score": float(refined["identity_score"]),
+        "refined_improvement": float(refined["improvement"]),
+        "refined_uniqueness": float(refined["uniqueness"]),
+        "refined_phase_response": float(refined["phase_response"]),
+        "refined_confidence": float(refined["confidence"]),
+        **meta,
+    }
 
 
 def _preview(rgb, thermal, visible, geometry, params, title):
@@ -60,6 +116,10 @@ def main():
     p.add_argument("--work-width", type=int, default=480)
     p.add_argument("--preview-count", type=int, default=80)
     p.add_argument("--min-confidence", type=float, default=.45)
+    p.add_argument("--workers", type=int, default=4,
+                   help="sample-level worker processes; 4 is tuned for a 16-core quota")
+    p.add_argument("--opencv-threads", type=int, default=4,
+                   help="OpenCV threads per worker")
     a = p.parse_args()
     root, out = Path(a.root), Path(a.out)
     samples = build_index(root, Path(a.labels) if a.labels else None, limit=a.limit)
@@ -68,69 +128,53 @@ def main():
     # Full-resolution RGB/IR arrays and masks are intentionally not retained
     # between the coarse sequence-prior pass and the refinement/write pass.
     first, groups = {}, defaultdict(list)
-    for i, sample in enumerate(samples):
-        stem = sample["stem"]
-        rgb, thermal, ir3 = read_modalities(*_paths(root, sample))
-        q, visible, geometry, meta = quality_maps(rgb, thermal, ir3)
-        estimate = estimate_affine(rgb, thermal, geometry, cfg)
-        first[stem] = estimate
-        groups[source_group(stem)].append(estimate)
-        if (i + 1) % 50 == 0 or i + 1 == len(samples):
-            print(f"[A0] coarse {i+1}/{len(samples)}", flush=True)
+    with ProcessPoolExecutor(max_workers=max(1, a.workers),
+                             initializer=_worker_init,
+                             initargs=(a.opencv_threads,)) as pool:
+        tasks = ((str(root), sample, cfg) for sample in samples)
+        for i, (stem, group, estimate) in enumerate(
+                pool.map(_coarse_task, tasks, chunksize=1)):
+            first[stem] = estimate
+            groups[group].append(estimate)
+            if (i + 1) % 50 == 0 or i + 1 == len(samples):
+                print(f"[A0] coarse {i+1}/{len(samples)}", flush=True)
     prior_usable = {g: g != "PLAIN" and len(rows) >= 2 for g, rows in groups.items()}
     priors = {
         g: (robust_sequence_prior(rows) if prior_usable[g]
             else (np.asarray([0., 0., 0., 1.], np.float32), 0.0))
         for g, rows in groups.items()
     }
-    rows, previews = [], []
-    for i, sample in enumerate(samples):
-        stem, group = sample["stem"], source_group(sample["stem"])
-        rgb, thermal, ir3 = read_modalities(*_paths(root, sample))
-        q, visible, geometry, meta = quality_maps(rgb, thermal, ir3)
-        prior, prior_conf = priors[group]
-        # Real multi-frame sources refine around their robust sequence prior.
-        # PLAIN/singleton inputs refine around their own coarse result and can
-        # never inherit an unrelated cross-image transform.
-        refine_origin = prior if prior_usable[group] else first[stem]["params"]
-        refined = estimate_affine(rgb, thermal, geometry, cfg, prior=refine_origin)
-        chosen, chosen_source = select_affine_candidate(
-            first[stem], refined, prior, prior_conf, prior_usable[group])
-        confidence = float(chosen["confidence"] * (.5 + .5 * meta["valid_ratio"]))
-        save_sample(out / "samples" / f"{stem}.npz", stem=stem,
-                    params=chosen["params"], confidence=confidence,
-                    quality=q, visible=visible, geometry=geometry, meta=meta,
-                    shape=thermal.shape, sequence=group, sequence_prior=prior,
-                    sequence_confidence=prior_conf, min_confidence=a.min_confidence)
-        row = {"stem": stem, "sequence": group, "confidence": confidence,
-               "supervised": confidence >= a.min_confidence,
-               "params": [float(x) for x in chosen["params"]],
-               "chosen_source": chosen_source,
-               "coarse_score": float(first[stem]["score"]),
-               "coarse_identity_score": float(first[stem]["identity_score"]),
-               "coarse_improvement": float(first[stem]["improvement"]),
-               "coarse_uniqueness": float(first[stem]["uniqueness"]),
-               "coarse_phase_response": float(first[stem]["phase_response"]),
-               "coarse_confidence": float(first[stem]["confidence"]),
-               "refined_score": float(refined["score"]),
-               "refined_identity_score": float(refined["identity_score"]),
-               "refined_improvement": float(refined["improvement"]),
-               "refined_uniqueness": float(refined["uniqueness"]),
-               "refined_phase_response": float(refined["phase_response"]),
-               "refined_confidence": float(refined["confidence"]),
-               **meta}
-        rows.append(row)
-        if i < a.preview_count or confidence < a.min_confidence:
-            previews.append((confidence, stem, _preview(
-                rgb, thermal, visible, geometry, chosen["params"],
-                f"{stem} conf={confidence:.3f} seq={group} "
-                f"a={chosen['params'][0]:+.2f} tx={chosen['params'][1]:+.1f} "
-                f"ty={chosen['params'][2]:+.1f} s={chosen['params'][3]:.4f}")))
-        if (i + 1) % 50 == 0 or i + 1 == len(samples):
-            print(f"[A0] refine {i+1}/{len(samples)}", flush=True)
+    rows = []
+    sample_by_stem = {sample["stem"]: sample for sample in samples}
+    with ProcessPoolExecutor(max_workers=max(1, a.workers),
+                             initializer=_worker_init,
+                             initargs=(a.opencv_threads,)) as pool:
+        tasks = []
+        for sample in samples:
+            stem, group = sample["stem"], source_group(sample["stem"])
+            prior, prior_conf = priors[group]
+            tasks.append((str(root), str(out), sample, cfg, first[stem], prior,
+                          prior_conf, prior_usable[group], a.min_confidence))
+        for i, row in enumerate(pool.map(_refine_task, tasks, chunksize=1)):
+            rows.append(row)
+            if (i + 1) % 50 == 0 or i + 1 == len(samples):
+                print(f"[A0] refine {i+1}/{len(samples)}", flush=True)
     preview_dir = out / "previews"; preview_dir.mkdir(parents=True, exist_ok=True)
-    for _, stem, image in sorted(previews, key=lambda x: x[0])[:a.preview_count]:
-        cv2.imwrite(str(preview_dir / f"{stem}.jpg"), image, [cv2.IMWRITE_JPEG_QUALITY, 92])
+    # Re-read only the lowest-confidence audit samples.  Keeping rendered
+    # previews for every weak candidate used several GB without helping the
+    # cache itself.
+    for row in sorted(rows, key=lambda x: x["confidence"])[:a.preview_count]:
+        stem, group = row["stem"], row["sequence"]
+        rgb, thermal, ir3 = read_modalities(*_paths(root, sample_by_stem[stem]))
+        _, visible, geometry, _ = quality_maps(rgb, thermal, ir3)
+        params = row["params"]
+        image = _preview(
+            rgb, thermal, visible, geometry, params,
+            f"{stem} conf={row['confidence']:.3f} seq={group} "
+            f"a={params[0]:+.2f} tx={params[1]:+.1f} "
+            f"ty={params[2]:+.1f} s={params[3]:.4f}")
+        cv2.imwrite(str(preview_dir / f"{stem}.jpg"), image,
+                    [cv2.IMWRITE_JPEG_QUALITY, 92])
     confidences = np.asarray([r["confidence"] for r in rows])
     summary = {
         "version": 2, "n_samples": len(rows), "min_confidence": a.min_confidence,
