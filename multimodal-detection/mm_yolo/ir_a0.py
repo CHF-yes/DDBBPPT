@@ -83,7 +83,14 @@ def border_masks(thermal: np.ndarray):
     mean, std = _local_stats(thermal, 15)
     low = min(12.0, float(np.percentile(thermal, 2)) + 3.0)
     high = max(243.0, float(np.percentile(thermal, 98)) - 3.0)
-    candidate = (((mean <= low) | (mean >= high)) & (std < 5.0)).astype(np.uint8)
+    # A local mean smears a narrow registration border with adjacent scene
+    # content and detects only its outer half.  Include raw extreme pixels when
+    # their neighbourhood is still low texture, then retain *only* components
+    # connected to an image boundary below.  Thus an interior black object is
+    # never removed merely because it is dark.
+    smooth_extreme = ((mean <= low) | (mean >= high)) & (std < 5.0)
+    raw_extreme = ((thermal <= low) | (thermal >= high)) & (std < 12.0)
+    candidate = (smooth_extreme | raw_extreme).astype(np.uint8)
     candidate = cv2.morphologyEx(candidate, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
     n, labels, stats, _ = cv2.connectedComponentsWithStats(candidate, 8)
     invalid = np.zeros_like(candidate)
