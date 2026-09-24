@@ -166,7 +166,7 @@ def main():
                                   if isinstance(metrics.get("branches"), dict) else {})
                     ir_map = float(ir_metrics.get("map50_95", float("nan")))
                     threshold = float(cfg.get("stage_a_ir_min_map50_95", .12))
-                    if not (ir_map == ir_map) or ir_map < threshold:
+                    if not a.smoke and (not (ir_map == ir_map) or ir_map < threshold):
                         raise RuntimeError(
                             f"Stage B 拒绝启动：Stage A IR mAP50-95={ir_map:.4f} < "
                             f"门槛 {threshold:.4f}；请修复 Stage A 或显式调整 stage_a_ir_min_map50_95")
@@ -175,7 +175,7 @@ def main():
                     if rgb_metrics:
                         rgb_map = float(rgb_metrics.get("map50_95", float("nan")))
                         rgb_threshold = float(cfg.get("stage_a_rgb_min_map50_95", 0.0))
-                        if not (rgb_map == rgb_map) or rgb_map < rgb_threshold:
+                        if not a.smoke and (not (rgb_map == rgb_map) or rgb_map < rgb_threshold):
                             raise RuntimeError(
                                 f"Stage B 拒绝启动：Stage A RGB mAP50-95={rgb_map:.4f} < "
                                 f"保底门槛 {rgb_threshold:.4f}")

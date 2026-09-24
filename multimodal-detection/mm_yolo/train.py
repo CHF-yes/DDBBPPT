@@ -1924,7 +1924,7 @@ def main():
                                   require_ir_a0=args.require_ir_a0)
         branches = {}
         try:
-            stage_a_branches = (("rgb", "ir", "dep") if
+            stage_a_branches = (("rgb", "ir") if
                                 args.fusion_strategy == "v511_conditional_ir_v1"
                                 else ("ir", "dep"))
             for branch in stage_a_branches:

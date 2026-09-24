@@ -263,9 +263,22 @@ def estimate_affine(rgb: np.ndarray, thermal: np.ndarray, geometry: np.ndarray,
     identity_score, _ = _candidate_score(re, ie, vm, identity)
     improvement = best[0] - identity_score
     uniqueness = best[0] - second[0]
-    confidence = float(np.clip((best[0] + .05) / .35, 0, 1) *
-                       np.clip((improvement + .01) / .08, 0, 1) *
-                       np.clip((uniqueness + .002) / .025, 0, 1))
+    absolute = float(np.clip((best[0] - .08) / .32, 0, 1))
+    identity_delta = np.asarray(
+        [best[2] - base[0], best[3] - base[1], best[4] - base[2],
+         (best[5] - base[3]) * 100], np.float32)
+    near_prior = float(np.exp(-(
+        abs(identity_delta[0]) / .35 +
+        np.hypot(identity_delta[1], identity_delta[2]) / 4.0 +
+        abs(identity_delta[3]) / .8)))
+    # A well-aligned pair must be allowed to produce a reliable identity label:
+    # requiring improvement over identity makes exact registration impossible
+    # to supervise.  Non-identity corrections still need a unique improvement;
+    # low absolute cross-modal correlation remains explicitly unsupervised.
+    correction_evidence = float(np.clip((improvement + .005) / .06, 0, 1) *
+                                np.clip((uniqueness + .001) / .02, 0, 1))
+    identity_evidence = near_prior * float(np.clip((identity_score - .10) / .25, 0, 1))
+    confidence = absolute * max(identity_evidence, correction_evidence)
     return {
         "params": np.asarray([best[2], best[3], best[4], best[5]], np.float32),
         "score": float(best[0]), "identity_score": float(identity_score),
