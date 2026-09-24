@@ -85,9 +85,11 @@ def main():
         # coarse candidate.  Otherwise the robust sequence prior is safer.
         if refined["confidence"] >= max(.35, .8 * first[stem]["confidence"]):
             chosen = refined
+            chosen_source = "refined"
         else:
             chosen = {**first[stem], "params": prior,
                       "confidence": min(float(prior_conf), first[stem]["confidence"])}
+            chosen_source = "sequence_prior"
         confidence = float(chosen["confidence"] * (.5 + .5 * meta["valid_ratio"]))
         save_sample(out / "samples" / f"{stem}.npz", stem=stem,
                     params=chosen["params"], confidence=confidence,
@@ -96,7 +98,21 @@ def main():
                     sequence_confidence=prior_conf, min_confidence=a.min_confidence)
         row = {"stem": stem, "sequence": group, "confidence": confidence,
                "supervised": confidence >= a.min_confidence,
-               "params": [float(x) for x in chosen["params"]], **meta}
+               "params": [float(x) for x in chosen["params"]],
+               "chosen_source": chosen_source,
+               "coarse_score": float(first[stem]["score"]),
+               "coarse_identity_score": float(first[stem]["identity_score"]),
+               "coarse_improvement": float(first[stem]["improvement"]),
+               "coarse_uniqueness": float(first[stem]["uniqueness"]),
+               "coarse_phase_response": float(first[stem]["phase_response"]),
+               "coarse_confidence": float(first[stem]["confidence"]),
+               "refined_score": float(refined["score"]),
+               "refined_identity_score": float(refined["identity_score"]),
+               "refined_improvement": float(refined["improvement"]),
+               "refined_uniqueness": float(refined["uniqueness"]),
+               "refined_phase_response": float(refined["phase_response"]),
+               "refined_confidence": float(refined["confidence"]),
+               **meta}
         rows.append(row)
         if i < a.preview_count or confidence < a.min_confidence:
             previews.append((confidence, stem, _preview(
