@@ -18,8 +18,8 @@ for item in (ROOT, ROOT / "mm_yolo"):
         sys.path.insert(0, str(item))
 
 from mm_yolo.data import build_index, source_group  # noqa: E402
-from mm_yolo.ir_a0 import (SearchCfg, estimate_affine, quality_maps, read_modalities,
-                           robust_sequence_prior, save_sample,
+from mm_yolo.ir_a0 import (SearchCfg, affine_model_contract, estimate_affine,
+                           quality_maps, read_modalities, robust_sequence_prior, save_sample,
                            select_affine_candidate, write_manifest)  # noqa: E402
 
 
@@ -46,8 +46,9 @@ def _coarse_task(payload):
 
 
 def _refine_task(payload):
-    (root, out, sample, cfg, coarse, prior, prior_conf,
-     use_prior, min_confidence) = payload
+    (root, out, sample, cfg, coarse, prior, prior_conf, use_prior,
+     min_confidence, contract_canvas, contract_angle,
+     contract_shift, contract_scale) = payload
     root, out = Path(root), Path(out)
     stem, group = sample["stem"], source_group(sample["stem"])
     rgb, thermal, ir3 = read_modalities(*_paths(root, sample))
@@ -57,14 +58,20 @@ def _refine_task(payload):
     chosen, chosen_source = select_affine_candidate(
         coarse, refined, prior, prior_conf, use_prior)
     confidence = float(chosen["confidence"] * (.5 + .5 * meta["valid_ratio"]))
+    contract_ok, contract = affine_model_contract(
+        chosen["params"], thermal.shape, contract_canvas, contract_angle,
+        contract_shift, contract_scale)
+    supervised = bool(confidence >= min_confidence and contract_ok)
     save_sample(out / "samples" / f"{stem}.npz", stem=stem,
                 params=chosen["params"], confidence=confidence,
                 quality=q, visible=visible, geometry=geometry, meta=meta,
                 shape=thermal.shape, sequence=group, sequence_prior=prior,
-                sequence_confidence=prior_conf, min_confidence=min_confidence)
+                sequence_confidence=prior_conf, min_confidence=min_confidence,
+                affine_supervised=supervised, affine_contract=contract)
     return {
         "stem": stem, "sequence": group, "confidence": confidence,
-        "supervised": confidence >= min_confidence,
+        "supervised": supervised, "contract_ok": contract_ok,
+        "affine_contract": [float(x) for x in contract],
         "params": [float(x) for x in chosen["params"]],
         "chosen_source": chosen_source,
         "coarse_score": float(coarse["score"]),
@@ -120,10 +127,18 @@ def main():
                    help="sample-level worker processes; 4 is tuned for a 16-core quota")
     p.add_argument("--opencv-threads", type=int, default=4,
                    help="OpenCV threads per worker")
+    p.add_argument("--contract-canvas", default="736x1280",
+                   help="V5.1.1 training canvas used to validate affine labels")
+    p.add_argument("--contract-angle", type=float, default=3.0)
+    p.add_argument("--contract-shift", type=float, default=16.0)
+    p.add_argument("--contract-scale", type=float, default=.04)
     a = p.parse_args()
     root, out = Path(a.root), Path(a.out)
     samples = build_index(root, Path(a.labels) if a.labels else None, limit=a.limit)
     cfg = SearchCfg(work_width=a.work_width, min_confidence=a.min_confidence)
+    contract_canvas = tuple(int(x) for x in a.contract_canvas.lower().split("x", 1))
+    if len(contract_canvas) != 2 or min(contract_canvas) <= 0:
+        raise ValueError(f"invalid --contract-canvas: {a.contract_canvas}")
     # Two-pass streaming keeps memory bounded for the full 2,000-image set.
     # Full-resolution RGB/IR arrays and masks are intentionally not retained
     # between the coarse sequence-prior pass and the refinement/write pass.
@@ -154,7 +169,9 @@ def main():
             stem, group = sample["stem"], source_group(sample["stem"])
             prior, prior_conf = priors[group]
             tasks.append((str(root), str(out), sample, cfg, first[stem], prior,
-                          prior_conf, prior_usable[group], a.min_confidence))
+                          prior_conf, prior_usable[group], a.min_confidence,
+                          contract_canvas, a.contract_angle,
+                          a.contract_shift, a.contract_scale))
         for i, row in enumerate(pool.map(_refine_task, tasks, chunksize=1)):
             rows.append(row)
             if (i + 1) % 50 == 0 or i + 1 == len(samples):
@@ -177,8 +194,16 @@ def main():
                     [cv2.IMWRITE_JPEG_QUALITY, 92])
     confidences = np.asarray([r["confidence"] for r in rows])
     summary = {
-        "version": 2, "n_samples": len(rows), "min_confidence": a.min_confidence,
+        "version": 3, "n_samples": len(rows), "min_confidence": a.min_confidence,
         "supervised": int(sum(r["supervised"] for r in rows)),
+        "model_contract": {
+            "canvas": list(contract_canvas), "angle": a.contract_angle,
+            "shift": a.contract_shift, "scale": a.contract_scale,
+            "rejected": int(sum(not r["contract_ok"] for r in rows)),
+            "rejected_above_confidence": int(sum(
+                (not r["contract_ok"]) and r["confidence"] >= a.min_confidence
+                for r in rows)),
+        },
         "confidence_quantiles": {str(q): float(np.quantile(confidences, q))
                                  for q in (0, .1, .25, .5, .75, .9, 1)},
         "angle_quantiles": {str(q): float(np.quantile([r["params"][0] for r in rows], q))

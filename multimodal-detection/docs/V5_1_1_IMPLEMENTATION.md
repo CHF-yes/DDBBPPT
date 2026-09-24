@@ -28,6 +28,10 @@ Only a named source with at least two supporting images may share a sequence
 prior.  `PLAIN` and singleton images retain their own coarse-to-fine estimate;
 they never inherit a dataset-wide transform.  An unsupervised cached affine is
 also excluded from known synthetic-affine target composition.
+The cache writer additionally conjugates every candidate through the declared
+training canvas and marks transforms outside the aligner's angle/shift/scale
+range as `affine_supervised=0`.  Their correlation confidence remains available
+to the quality path, but they cannot contaminate geometric or synthetic labels.
 
 ## Stage A
 
