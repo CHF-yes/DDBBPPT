@@ -1073,6 +1073,15 @@ def adapt_depth_checkpoint_state(state: dict, model: MMYOLO) -> tuple:
     out = dict(state)
     migrated = False
     target_state = model.state_dict()
+    if getattr(model.cfg.fusion, "fusion_strategy", "") == "v511_conditional_ir_v1":
+        # V4.4 carried an auxiliary Depth detector used only for training.  The
+        # V5.1.1 contract deliberately trains standalone RGB/IR recognition and
+        # uses Depth only as geometry support, so this obsolete head is the one
+        # explicitly permitted source-side removal.
+        removed = [name for name in out if name.startswith("independent_aux.dep.")]
+        for name in removed:
+            out.pop(name)
+        migrated = migrated or bool(removed)
     # V5.1.1 clones standalone RGB/thermal teachers from the learned V4.4
     # encoders and clones its thermal embedding.  Use the checkpoint tensors,
     # not the freshly constructed COCO defaults, whenever a source key exists.
