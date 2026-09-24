@@ -89,7 +89,7 @@ def border_masks(thermal: np.ndarray):
     # connected to an image boundary below.  Thus an interior black object is
     # never removed merely because it is dark.
     smooth_extreme = ((mean <= low) | (mean >= high)) & (std < 5.0)
-    raw_extreme = ((thermal <= low) | (thermal >= high)) & (std < 12.0)
+    raw_extreme = (thermal <= low) | (thermal >= high)
     candidate = (smooth_extreme | raw_extreme).astype(np.uint8)
     candidate = cv2.morphologyEx(candidate, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
     n, labels, stats, _ = cv2.connectedComponentsWithStats(candidate, 8)
