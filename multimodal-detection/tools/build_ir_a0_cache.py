@@ -63,7 +63,10 @@ def main():
     root, out = Path(a.root), Path(a.out)
     samples = build_index(root, Path(a.labels) if a.labels else None, limit=a.limit)
     cfg = SearchCfg(work_width=a.work_width, min_confidence=a.min_confidence)
-    first, groups, loaded = {}, defaultdict(list), {}
+    # Two-pass streaming keeps memory bounded for the full 2,000-image set.
+    # Full-resolution RGB/IR arrays and masks are intentionally not retained
+    # between the coarse sequence-prior pass and the refinement/write pass.
+    first, groups = {}, defaultdict(list)
     for i, sample in enumerate(samples):
         stem = sample["stem"]
         rgb, thermal, ir3 = read_modalities(*_paths(root, sample))
@@ -71,14 +74,14 @@ def main():
         estimate = estimate_affine(rgb, thermal, geometry, cfg)
         first[stem] = estimate
         groups[source_group(stem)].append(estimate)
-        loaded[stem] = (rgb, thermal, ir3, q, visible, geometry, meta)
         if (i + 1) % 50 == 0 or i + 1 == len(samples):
             print(f"[A0] coarse {i+1}/{len(samples)}", flush=True)
     priors = {g: robust_sequence_prior(rows) for g, rows in groups.items()}
     rows, previews = [], []
     for i, sample in enumerate(samples):
         stem, group = sample["stem"], source_group(sample["stem"])
-        rgb, thermal, ir3, q, visible, geometry, meta = loaded[stem]
+        rgb, thermal, ir3 = read_modalities(*_paths(root, sample))
+        q, visible, geometry, meta = quality_maps(rgb, thermal, ir3)
         prior, prior_conf = priors[group]
         refined = estimate_affine(rgb, thermal, geometry, cfg, prior=prior)
         # A residual is accepted only if it is at least as trustworthy as the
