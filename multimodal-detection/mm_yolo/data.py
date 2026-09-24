@@ -43,6 +43,7 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
 from io_utils import imread_unicode                        # noqa: E402
+from ir_a0 import A0_QUALITY_NAMES, load_sample as load_ir_a0_sample, sampling_params
 
 MODS = ("visible", "infrared", "depth")
 MODALITY_KEY = {"visible": "rgb", "infrared": "ir", "depth": "dep"}
@@ -293,6 +294,8 @@ class AugCfg:
     ir_affine_deg: float = 0.0                          # IR 旋转上限（度）
     ir_affine_shift: float = 0.0                        # IR 平移上限（画布像素）
     ir_affine_scale: float = 0.0                        # IR 比例变化上限（fraction）
+    ir_a0_cache: str = ""                               # V5.1.1 offline quality/pseudo-label cache
+    require_ir_a0: bool = False                         # required recipes fail closed on cache misses
     legacy_lowlight: bool = False                       # 仅用于 B1 旧实验的严格续训
     # modality dropout：**只在多模态训练时生效**（enabled 少于 2 路时自动跳过）
     rgb_drop_p: float = 0.05                            # 小概率整路丢 RGB
@@ -877,6 +880,8 @@ class MMDataset(Dataset):
         if not self.enabled:
             raise ValueError("enabled 不能为空")
         self._use_dropout = bool(self.train and len(self.enabled) > 1)
+        self.ir_a0_cache = Path(self.aug.ir_a0_cache) if self.aug.ir_a0_cache else None
+        self._a0_missing_reported = set()
 
     def __len__(self):
         return len(self.samples)
@@ -974,7 +979,9 @@ class MMDataset(Dataset):
                 else:
                     # V5 IR quality maps have nine channels; preserve the
                     # channel contract when a dropped tile has no descriptor.
-                    channels = 9 if key == "ir" else (1 if key == "scene_id" else 3)
+                    channels = next((int(c["quality"][key].shape[0]) for c in children
+                                     if key in c["quality"]),
+                                    10 if key == "ir" else (1 if key == "scene_id" else 3))
                     value = torch.zeros(channels, 1, 1)
                 tiles.append(tf.interpolate(value[None],size=(hh,ww),mode="nearest")[0])
             value = torch.cat((torch.cat(tiles[:2],2),torch.cat(tiles[2:],2)),1)
@@ -990,6 +997,7 @@ class MMDataset(Dataset):
         out["alignment_supervised"] = torch.tensor(0.0, dtype=torch.float32)
         out["ir_affine_target"] = torch.zeros(4, dtype=torch.float32)
         out["ir_affine_supervised"] = torch.tensor(0.0, dtype=torch.float32)
+        out["ir_affine_confidence"] = torch.tensor(0.0, dtype=torch.float32)
         out["keep"] = {m: float(any(c["keep"][m] for c in children)) for m in ("rgb","ir","dep")}
         # Whole-modality dropout applies to the completed Mosaic, never ambiguous individual tiles.
         aug = scheduled_aug(self.aug,epoch)
@@ -1048,6 +1056,7 @@ class MMDataset(Dataset):
             if want_dep:
                 missing.add("dep")
         H, W = rgb.shape[:2]
+        Hc, Wc = self.canvas
         if ir.shape[:2] != (H, W):
             ir = cv2.resize(ir, (W, H), interpolation=cv2.INTER_AREA)
         if ir_chroma is None:
@@ -1060,6 +1069,16 @@ class MMDataset(Dataset):
             valid = cv2.resize(valid.astype(np.uint8), (W, H),
                                interpolation=cv2.INTER_NEAREST).astype(bool)
             metric_map = cv2.resize(metric_map, (W, H), interpolation=cv2.INTER_NEAREST)
+
+        a0 = None
+        if want_ir and self.ir_a0_cache is not None:
+            a0 = load_ir_a0_sample(self.ir_a0_cache, s["stem"])
+            if a0 is None:
+                if aug.require_ir_a0:
+                    raise FileNotFoundError(
+                        f"required IR A0 cache missing: {self.ir_a0_cache}/samples/{s['stem']}.npz")
+                if s["stem"] not in self._a0_missing_reported:
+                    self._a0_missing_reported.add(s["stem"])
 
         # ---- 几何：三模态同一套仿射（错位与 letterbox **合成一次**）----
         if self.train:
@@ -1091,8 +1110,23 @@ class MMDataset(Dataset):
         ir_w = _warp(ir, M, self.canvas)
         ir_chroma_w = _warp(ir_chroma, M, self.canvas)
         ir_spatial = _warp(np.ones((H, W), np.uint8), M, self.canvas, nearest=True).astype(np.float32)
+        ir_input_M = M
         ir_affine_target = np.zeros(4, np.float32)
         ir_affine_supervised = 0.0
+        ir_affine_confidence = 0.0
+        # Cached A0 transforms use output-reference -> IR-source sampling in
+        # original coordinates.  S_canvas = M S_orig M^-1 keeps the label
+        # correct under letterbox, synchronized crop, rotation and flip.
+        sampling_canvas = np.eye(3, dtype=np.float32)
+        if a0 is not None:
+            stored_hw = tuple(int(v) for v in np.asarray(a0["orig_hw"]).reshape(-1))
+            if stored_hw != (H, W):
+                raise ValueError(f"A0 cache/image size mismatch for {s['stem']}: {stored_hw} vs {(H,W)}")
+            S_orig = _mat3(np.asarray(a0["sampling_matrix"], np.float32))
+            M3 = _mat3(M)
+            sampling_canvas = M3 @ S_orig @ np.linalg.inv(M3)
+            ir_affine_confidence = float(np.asarray(a0["affine_confidence"]).reshape(()))
+            ir_affine_supervised = float(np.asarray(a0["affine_supervised"]).reshape(()))
         if (self.train and allow_special and want_ir and aug.ir_affine_p > 0 and
                 rng.random() < aug.ir_affine_p):
             angle = rng.uniform(-aug.ir_affine_deg, aug.ir_affine_deg)
@@ -1103,17 +1137,27 @@ class MMDataset(Dataset):
             ir_w = _warp(ir_w, A, self.canvas)
             ir_chroma_w = _warp(ir_chroma_w, A, self.canvas)
             ir_spatial = _warp(ir_spatial, A, self.canvas, nearest=True).astype(np.float32)
-            # ``warp`` predicts output-reference -> distorted-input sampling.
-            # OpenCV rendered the distorted image with source->destination A,
-            # so an RGB reference coordinate must sample the distorted input at
-            # A(x): the supervised parameters have the same sign as A.
-            ir_affine_target[:] = (
-                angle / max(1e-6, aug.ir_affine_deg),
-                sx / max(1e-6, aug.ir_affine_shift),
-                sy / max(1e-6, aug.ir_affine_shift),
-                ds / max(1e-6, aug.ir_affine_scale),
-            )
+            ir_input_M = (A @ _mat3(M))[:2]
+            # OpenCV rendered source->destination A.  To sample the distorted
+            # input for a reference output coordinate, compose A after the A0
+            # source-sampling transform.
+            sampling_canvas = _mat3(A) @ sampling_canvas
             ir_affine_supervised = 1.0
+            ir_affine_confidence = 1.0
+        if a0 is not None or ir_affine_supervised:
+            physical = sampling_params(sampling_canvas[:2], self.canvas)
+            ir_affine_target[:] = (
+                physical[0] / max(1e-6, aug.ir_affine_deg),
+                physical[1] * Wc / max(1e-6, aug.ir_affine_shift),
+                physical[2] * Hc / max(1e-6, aug.ir_affine_shift),
+                physical[3] / max(1e-6, aug.ir_affine_scale),
+            )
+            if np.max(np.abs(ir_affine_target)) > 1.05:
+                # The aligner is bounded by tanh.  An out-of-contract pseudo
+                # label must not be silently clipped into a different motion.
+                ir_affine_supervised = 0.0
+                ir_affine_confidence = 0.0
+            ir_affine_target = np.clip(ir_affine_target, -1, 1)
         # ⚠️ 审计修复：depth/掩码只用 Md **warp 一次**。旧版先 _warp(dep, M) 再 _warp(dep_w, Mj@M)，
         #    等于把 M 应用了两遍 → 有效像素只剩正确的 2.46%、7/30 张整幅变空。
         if aug.depth_resampling not in ("legacy_bilinear_v1", "nearest_valid_v2"):
@@ -1141,7 +1185,6 @@ class MMDataset(Dataset):
         metric_w *= valid_w.astype(np.float32)
 
         # ---- 标签：原图归一化框 → 画布（letterbox 后），**裁剪到画布并过滤**----
-        Hc, Wc = self.canvas
         out_boxes = canvas_boxes_from_norm(s.get("boxes"), M, (H, W), self.canvas,
                                            min_size=aug.box_min_size,
                                            require_center=aug.box_require_center)
@@ -1163,6 +1206,31 @@ class MMDataset(Dataset):
         quality = quality_maps(rgb_q if want_rgb else None, ir_q if want_ir else None,
                                dep_q if want_dep else None, val_q if want_dep else None, ps,
                                ir_chroma=ir_chroma_q if want_ir else None)
+        if a0 is not None and want_ir:
+            cached_q = np.asarray(a0["quality_maps"], np.float32)
+            source_h, source_w = cached_q.shape[-2:]
+            source_to_orig = np.array([[W / source_w, 0, 0], [0, H / source_h, 0], [0, 0, 1]],
+                                      np.float32)
+            canvas_to_quality = np.array([[ps[1] / Wc, 0, 0], [0, ps[0] / Hc, 0], [0, 0, 1]],
+                                         np.float32)
+            qM = (canvas_to_quality @ _mat3(ir_input_M) @ source_to_orig)[:2]
+            a0_quality = np.stack([
+                cv2.warpAffine(ch, qM, (ps[1], ps[0]), flags=cv2.INTER_LINEAR,
+                               borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+                for ch in cached_q], 0).astype(np.float32)
+            # The cache is authoritative for processing-chain channels.  The
+            # current augmented image still supplies intensity/contrast/edge.
+            base_ir = quality.get("ir")
+            if base_ir is not None:
+                a0_quality[:3] = base_ir[:3]
+            a0_quality[9].fill(ir_affine_confidence)
+            quality["ir"] = a0_quality
+            geom_src = np.asarray(a0["geometry_mask"], np.float32)
+            geom_full_M = (_mat3(ir_input_M) @ source_to_orig)[:2]
+            ir_geometry = cv2.warpAffine(
+                geom_src, geom_full_M, (Wc, Hc), flags=cv2.INTER_NEAREST,
+                borderMode=cv2.BORDER_CONSTANT, borderValue=0).astype(np.float32)
+            ir_spatial *= ir_geometry
 
         # ---- modality dropout（整路置零 + 记录 keep）----
         keep = {"rgb": 1.0 if want_rgb else 0.0,
@@ -1207,6 +1275,7 @@ class MMDataset(Dataset):
                 float(self.train and aug.misalign_px > 0), dtype=torch.float32),
             "ir_affine_target": torch.from_numpy(ir_affine_target),
             "ir_affine_supervised": torch.tensor(ir_affine_supervised, dtype=torch.float32),
+            "ir_affine_confidence": torch.tensor(ir_affine_confidence, dtype=torch.float32),
             "orig_hw": torch.tensor([H, W], dtype=torch.float32),
             "stem": s["stem"],
             "keep": keep,
@@ -1318,6 +1387,7 @@ def collate(batch: List[Optional[dict]]) -> Optional[dict]:
         "alignment_supervised": torch.stack([b.get("alignment_supervised", torch.tensor(0.0)) for b in batch]),
         "ir_affine_target": torch.stack([b.get("ir_affine_target", torch.zeros(4)) for b in batch]),
         "ir_affine_supervised": torch.stack([b.get("ir_affine_supervised", torch.tensor(0.0)) for b in batch]),
+        "ir_affine_confidence": torch.stack([b.get("ir_affine_confidence", torch.tensor(0.0)) for b in batch]),
         "orig_hw": torch.stack([b["orig_hw"] for b in batch]),
         "stems": [b["stem"] for b in batch],
         "keep": {k: torch.tensor([b["keep"][k] for b in batch]) for k in ("rgb", "ir", "dep")},

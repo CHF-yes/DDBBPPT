@@ -97,6 +97,61 @@ class CoarseAffineAligner(nn.Module):
         return raw, confidence
 
 
+class ConditionalIRAligner(nn.Module):
+    """V5.1.1 A1 aligner conditioned on processing quality, not RGB texture.
+
+    RGB/IR common embeddings provide geometry.  The explicit A0 descriptor may
+    adjust the transform and its confidence, but it is never returned as visual
+    evidence to the detector.
+    """
+    def __init__(self, dim, quality_channels=10):
+        super().__init__()
+        hidden = 32
+        self.quality_channels = int(quality_channels)
+        self.quality = nn.Sequential(
+            nn.Conv2d(self.quality_channels, dim, 1, bias=False),
+            nn.GroupNorm(8, dim), nn.SiLU())
+        self.features = nn.Sequential(
+            nn.Conv2d(dim * 5, hidden, 1, bias=False),
+            nn.GroupNorm(8, hidden), nn.SiLU(),
+            nn.Conv2d(hidden, hidden, 3, padding=1, groups=hidden, bias=False),
+            nn.Conv2d(hidden, hidden, 1, bias=False),
+            nn.GroupNorm(8, hidden), nn.SiLU())
+        self.head = nn.Sequential(nn.Linear(hidden * 4 * 8, 96), nn.SiLU(), nn.Linear(96, 5))
+        nn.init.zeros_(self.head[-1].weight)
+        nn.init.zeros_(self.head[-1].bias)
+        self.last_stats = {}
+
+    def forward(self, rgb, ir, rgb_valid, ir_valid, quality=None):
+        mask = rgb_valid.float() * ir_valid.float()
+        r = F.normalize(rgb.float(), dim=1) * mask
+        i = F.normalize(ir.float(), dim=1) * mask
+        if quality is None:
+            q = r.new_zeros(r.shape)
+        else:
+            quality = F.interpolate(quality.float(), r.shape[-2:], mode="bilinear",
+                                    align_corners=False)
+            if quality.shape[1] > self.quality_channels:
+                quality = quality[:, :self.quality_channels]
+            elif quality.shape[1] < self.quality_channels:
+                quality = torch.cat((quality, quality.new_zeros(
+                    quality.shape[0], self.quality_channels - quality.shape[1],
+                    *quality.shape[-2:])), 1)
+            q = self.quality(quality) * mask
+        x = torch.cat((r, i, r - i, r * i, q), 1)
+        x = F.adaptive_avg_pool2d(self.features(x), (4, 8)).flatten(1)
+        out = self.head(x)
+        raw, confidence = out[:, :4].tanh(), out[:, 4:5].sigmoid()
+        accepted = raw * confidence
+        self.last_stats = {
+            "confidence": confidence.detach().mean(),
+            "angle_norm": accepted[:, 0].detach().abs().mean(),
+            "shift_norm": accepted[:, 1:3].detach().square().sum(1).sqrt().mean(),
+            "scale_norm": accepted[:, 3].detach().abs().mean(),
+        }
+        return raw, confidence
+
+
 def identity_residual_align(x, flow, confidence, warped_valid=None):
     """Blend from the nominal sensor grid towards a residual warp.
 
@@ -667,3 +722,173 @@ class V5IRQualityFusion(nn.Module):
             "dep_reliable": reliable[2].detach().float().mean(),
         }
         return state
+
+
+class V511TrustedIRFusion(nn.Module):
+    """Conditional thermal fusion around the immutable V4.4 anchor.
+
+    * aligned common IR is the only new localization evidence;
+    * raw common/private IR supplies thermal-private classification evidence;
+    * A0 processing descriptors control gates and never synthesize class content;
+    * Depth is returned as geometry support and is not added to class features.
+    """
+    def __init__(self, channels, dim=64, memory_dim=128,
+                 ir_quality_channels=10, depth_quality_channels=3):
+        super().__init__()
+        hidden = max(32, min(128, channels // 2))
+        self.dim = int(dim)
+        self.ir_quality_channels = int(ir_quality_channels)
+        self.query = nn.Sequential(nn.Conv2d(channels, dim, 1, bias=False),
+                                   nn.GroupNorm(8, dim), nn.SiLU())
+        self.memory = nn.Linear(memory_dim, dim, bias=False)
+        self.ir_quality = nn.Sequential(
+            nn.Conv2d(self.ir_quality_channels, dim, 1, bias=False),
+            nn.GroupNorm(8, dim), nn.SiLU())
+        self.depth_quality = nn.Sequential(
+            nn.Conv2d(depth_quality_channels, dim, 1, bias=False),
+            nn.GroupNorm(8, dim), nn.SiLU())
+        self.shared = nn.Sequential(
+            nn.Conv2d(dim * 5, hidden, 1, bias=False),
+            nn.GroupNorm(max(1, min(16, hidden // 8)), hidden), nn.SiLU(),
+            nn.Conv2d(hidden, channels, 1, bias=False))
+        self.private = nn.Sequential(
+            nn.Conv2d(dim * 3, hidden, 1, bias=False),
+            nn.GroupNorm(max(1, min(16, hidden // 8)), hidden), nn.SiLU(),
+            nn.Conv2d(hidden, channels, 1, bias=False))
+        self.depth_support = nn.Sequential(
+            nn.Conv2d(dim * 5 + 2, hidden, 1, bias=False),
+            nn.GroupNorm(max(1, min(16, hidden // 8)), hidden), nn.SiLU(),
+            nn.Conv2d(hidden, channels, 1, bias=False))
+        descriptor = dim * 5 + 3
+        self.shared_spatial = self._gate(descriptor, hidden, 1)
+        self.shared_channel = self._gate(descriptor, hidden, channels)
+        self.private_spatial = self._gate(descriptor, hidden, 1)
+        self.private_channel = self._gate(descriptor, hidden, channels)
+        depth_descriptor = dim * 5 + 2
+        self.depth_spatial = self._gate(depth_descriptor, hidden, 1)
+        self.depth_channel = self._gate(depth_descriptor, hidden, channels)
+        self.ir_evidence = self._evidence_head(dim * 3, hidden)
+        self.last_stats, self.last_health, self.last_evidence_logits = {}, {}, []
+        for module in (self.shared, self.private, self.depth_support):
+            nn.init.zeros_(module[-1].weight)
+
+    @staticmethod
+    def _gate(in_channels, hidden, out_channels):
+        block = nn.Sequential(
+            nn.Conv2d(in_channels, hidden, 1, bias=False),
+            nn.GroupNorm(max(1, min(16, hidden // 8)), hidden), nn.SiLU(),
+            nn.Conv2d(hidden, out_channels, 1))
+        nn.init.zeros_(block[-1].weight); nn.init.zeros_(block[-1].bias)
+        return block
+
+    @staticmethod
+    def _evidence_head(in_channels, hidden):
+        block = nn.Sequential(
+            nn.Conv2d(in_channels, hidden, 1, bias=False),
+            nn.GroupNorm(max(1, min(16, hidden // 8)), hidden), nn.SiLU(),
+            nn.Conv2d(hidden, 1, 1))
+        nn.init.zeros_(block[-1].weight); nn.init.constant_(block[-1].bias, -2.1972246)
+        return block
+
+    @staticmethod
+    def _bounded(residual, reference):
+        scale = reference.detach().float().square().mean(1, keepdim=True).sqrt().clamp_min(.1)
+        return residual / torch.sqrt(1 + residual.float().square().mean(
+            1, keepdim=True) / scale.square()).to(residual.dtype)
+
+    @staticmethod
+    def _match_channels(value, channels):
+        if value.shape[1] >= channels:
+            return value[:, :channels]
+        return torch.cat((value, value.new_zeros(
+            value.shape[0], channels - value.shape[1], *value.shape[-2:])), 1)
+
+    def _quality(self, quality, index, ref, encoder):
+        if quality is None or index >= len(quality) or quality[index] is None:
+            raw = ref.new_zeros(ref.shape[0], encoder[0].in_channels, *ref.shape[-2:])
+        else:
+            raw = F.interpolate(quality[index].float(), ref.shape[-2:], mode="bilinear",
+                                align_corners=False)
+            raw = self._match_channels(raw, encoder[0].in_channels)
+        return raw, encoder(raw).to(ref.dtype)
+
+    @staticmethod
+    def _gate_pair(spatial, channel, descriptor):
+        return spatial(descriptor).float().sigmoid().to(descriptor.dtype) * \
+               channel(descriptor).float().sigmoid().to(descriptor.dtype)
+
+    def forward(self, raw_features, raw_common, aligned_common, raw_private,
+                valid, match, reliable, memory, quality=None, raw_quality=None,
+                anchor=None):
+        state = raw_features[0] * valid[0] if anchor is None else anchor
+        mem = self.memory(F.layer_norm(
+            memory[:, 3].mean(1).float(), (memory.shape[-1],)))[:, :, None, None]
+        q = self.query(state) + .25 * mem.to(state.dtype)
+        rgb_c, ir_raw_c, dep_c = raw_common
+        ir_aligned_c = aligned_common[1]
+        ir_u, dep_u = raw_private[1], raw_private[2]
+        # Processing masks used by shared/aligned evidence live on the RGB
+        # reference grid.  Thermal-private evidence stays on the untouched IR
+        # grid and therefore must use the corresponding raw quality map.
+        ir_q_aligned_raw, ir_q = self._quality(quality, 1, q, self.ir_quality)
+        ir_q_raw, _ = self._quality(
+            quality if raw_quality is None else raw_quality, 1, q, self.ir_quality)
+        _, dep_q = self._quality(quality, 2, q, self.depth_quality)
+        aligned_invalid = ir_q_aligned_raw[:, 3:4].clamp(0, 1)
+        aligned_blur = ir_q_aligned_raw[:, 5:6].clamp(0, 1)
+        aligned_ghost = ir_q_aligned_raw[:, 6:7].clamp(0, 1)
+        aligned_leakage = ir_q_aligned_raw[:, 7:8].clamp(0, 1)
+        registration = ir_q_aligned_raw[:, 9:10].clamp(0, 1)
+        raw_invalid = ir_q_raw[:, 3:4].clamp(0, 1)
+        raw_blur = ir_q_raw[:, 5:6].clamp(0, 1)
+        raw_ghost = ir_q_raw[:, 6:7].clamp(0, 1)
+        raw_leakage = ir_q_raw[:, 7:8].clamp(0, 1)
+        thermal = ir_q_raw[:, 8:9].clamp(0, 1)
+        aligned_trust = ((1 - aligned_invalid) * (1 - .4 * aligned_blur) *
+                         (1 - .7 * aligned_ghost))
+        raw_trust = (1 - raw_invalid) * (1 - .4 * raw_blur) * (1 - .7 * raw_ghost)
+
+        descriptor = torch.cat((q, rgb_c, ir_aligned_c, ir_raw_c, ir_q,
+                                valid[1].to(q.dtype), match[1].to(q.dtype),
+                                reliable[1].to(q.dtype)), 1)
+        shared_gate = self._gate_pair(self.shared_spatial, self.shared_channel, descriptor)
+        private_gate = self._gate_pair(self.private_spatial, self.private_channel, descriptor)
+        shared_delta = self._bounded(self.shared(torch.cat((
+            q, rgb_c, ir_aligned_c, (rgb_c - ir_aligned_c).abs(),
+            rgb_c * ir_aligned_c), 1)), state)
+        private_delta = self._bounded(self.private(torch.cat((q, ir_raw_c, ir_u), 1)), state)
+        evidence_logits = self.ir_evidence(torch.cat((q, ir_raw_c, ir_u), 1))
+        evidence = evidence_logits.float().sigmoid().to(state.dtype)
+        shared_weight = aligned_trust * registration * (1 - .5 * aligned_leakage)
+        private_weight = raw_trust * thermal * (1 - raw_leakage)
+        shared_update = shared_delta * shared_gate * shared_weight * valid[1]
+        private_update = private_delta * private_gate * private_weight * evidence * valid[1]
+        state = state + shared_update + private_update
+
+        depth_descriptor = torch.cat((q, rgb_c, ir_raw_c, dep_c, dep_q,
+                                      valid[2].to(q.dtype), reliable[2].to(q.dtype)), 1)
+        depth_gate = self._gate_pair(self.depth_spatial, self.depth_channel, depth_descriptor)
+        depth_delta = self._bounded(self.depth_support(torch.cat((
+            q, rgb_c, ir_raw_c, dep_c, dep_u,
+            valid[2].to(q.dtype), reliable[2].to(q.dtype)), 1)), state)
+        depth_update = depth_delta * depth_gate * valid[2] * reliable[2]
+
+        base_rms = anchor.detach().float().square().mean().sqrt().clamp_min(1e-6)
+        self.last_evidence_logits = [evidence_logits]
+        self.last_stats = {
+            "ir_shared_gate": shared_gate.detach().mean(),
+            "ir_private_gate": private_gate.detach().mean(),
+            "ir_evidence": evidence.detach().mean(),
+            "ir_leakage": raw_leakage.detach().mean(),
+            "ir_registration": registration.detach().mean(),
+            "depth_gate": depth_gate.detach().mean(),
+        }
+        self.last_health = {
+            "ir_route_ratio": (shared_update + private_update).detach().float().square().mean().sqrt() / base_rms,
+            "ir_shared_ratio": shared_update.detach().float().square().mean().sqrt() / base_rms,
+            "ir_private_ratio": private_update.detach().float().square().mean().sqrt() / base_rms,
+            "dep_geometry_ratio": depth_update.detach().float().square().mean().sqrt() / base_rms,
+            "ir_reliable": reliable[1].detach().float().mean(),
+            "dep_reliable": reliable[2].detach().float().mean(),
+        }
+        return state, shared_update, depth_update

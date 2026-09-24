@@ -29,6 +29,8 @@ def main():
     p.add_argument("--workers",type=int)
     p.add_argument("--resume",action="store_true")
     p.add_argument("--init-checkpoint",default="",help="dev 阶段用已有权重热启动（保留超参可变）")
+    p.add_argument("--ir-a0-cache", default="",
+                   help="V5.1.1 A0 cache root; required by its recipe")
     p.add_argument("--smoke",action="store_true")
     p.add_argument("--dry-run",action="store_true")
     a = p.parse_args()
@@ -71,6 +73,11 @@ def main():
               "--memory-control","bounded_v2","--no-prior",
               "--no-deformable","--val-batch",str(cfg.get("val_batch", 1)),
               "--val-conf","0.001","--save-every","1"]
+    ir_a0_cache = a.ir_a0_cache or cfg.get("ir_a0_cache", "")
+    if ir_a0_cache:
+        common += ["--ir-a0-cache", str(Path(ir_a0_cache).resolve())]
+    if cfg.get("require_ir_a0", False):
+        common += ["--require-ir-a0"]
     keys = ("architecture","imgsz","epochs","batch","accum","workers","precision","lr","backbone_lr_mult",
             "fusion_lr_mult","p2_lr_mult","detector_lr_mult","semantic_lr_mult","ir_read_mode",
             "freeze_epochs","warmup","lrf","grad_clip","calibrate_clip_steps","bn_policy","mosaic","close_aug_frac",
@@ -163,6 +170,15 @@ def main():
                         raise RuntimeError(
                             f"Stage B 拒绝启动：Stage A IR mAP50-95={ir_map:.4f} < "
                             f"门槛 {threshold:.4f}；请修复 Stage A 或显式调整 stage_a_ir_min_map50_95")
+                    rgb_metrics = (metrics.get("branches", {}).get("rgb", {})
+                                   if isinstance(metrics.get("branches"), dict) else {})
+                    if rgb_metrics:
+                        rgb_map = float(rgb_metrics.get("map50_95", float("nan")))
+                        rgb_threshold = float(cfg.get("stage_a_rgb_min_map50_95", 0.0))
+                        if not (rgb_map == rgb_map) or rgb_map < rgb_threshold:
+                            raise RuntimeError(
+                                f"Stage B 拒绝启动：Stage A RGB mAP50-95={rgb_map:.4f} < "
+                                f"保底门槛 {rgb_threshold:.4f}")
                     print(f"[pipeline] Stage A IR 独立 AP={ir_map:.4f}，达到门槛 {threshold:.4f}，允许进入 Stage B")
                 cmd += ["--init-checkpoint",str(source)]
             if a.dry_run:

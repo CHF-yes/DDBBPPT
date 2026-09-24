@@ -66,6 +66,8 @@ MEMORY_RECIPE = "coverage_spatial_memory_v1"
 
 def recipe_for(args):
     if getattr(args, "architecture", "") == "independent_p2_memory_v3":
+        if getattr(args, "fusion_strategy", "legacy_residual_v2") == "v511_conditional_ir_v1":
+            return "v511_v44_anchor_conditional_thermal_fusion"
         if getattr(args, "fusion_strategy", "legacy_residual_v2") == "v5_ir_quality_evidence":
             return "v5_v44_identity_quality_evidence"
         if getattr(args, "fusion_strategy", "legacy_residual_v2") == "v48_embedding_complement_v1":
@@ -303,6 +305,20 @@ def reset_v5_additions(model):
     return reset
 
 
+def reset_v511_additions(model):
+    """Reset V5.1.1-only paths while preserving every migrated V4.4 tensor."""
+    reset = reset_v5_additions(model)
+    with torch.no_grad():
+        # The Stage-A aligner and standalone thermal representation are learned
+        # assets.  Preserve them at the A->B hand-off; only Stage-B residuals
+        # around the V4.4 anchor are reset.
+        transition = getattr(model, "v511_localization_transition", None)
+        if transition is not None:
+            transition.zero_()
+            reset.append("v511_localization_transition")
+    return reset
+
+
 # ---------------------------------------------------------------- 批次 → 损失输入
 
 def make_targets(batch: dict, canvas, device) -> dict:
@@ -459,9 +475,12 @@ def set_independent_aux_mode(model: MMYOLO) -> None:
     """
     for p in model.parameters():
         p.requires_grad_(False)
-    for module in (getattr(model, "aux_encoders", None),
-                   getattr(model, "metric_encoder", None),
-                   getattr(model, "independent_aux", None)):
+    v511 = getattr(model.cfg.fusion, "fusion_strategy", "") == "v511_conditional_ir_v1"
+    base_modules = ((getattr(model, "independent_aux", None),) if v511 else (
+        getattr(model, "aux_encoders", None),
+        getattr(model, "metric_encoder", None),
+        getattr(model, "independent_aux", None)))
+    for module in base_modules:
         if module is not None:
             for p in module.parameters():
                 p.requires_grad_(True)
@@ -470,6 +489,18 @@ def set_independent_aux_mode(model: MMYOLO) -> None:
     if getattr(model.cfg.fusion, "fusion_strategy", "") == "v5_ir_quality_evidence":
         for p in model.backbone.model[:11].parameters():
             p.requires_grad_(True)
+    if v511:
+        # A1 and A2 share the same Stage-A batches.  Alignment reads only P4
+        # geometry embeddings and the quality descriptor; the IR detector still
+        # consumes only its own raw encoder pyramid.
+        for module in (getattr(model, "v511_ir_encoder", None),
+                       getattr(model, "v511_ir_embeddings", None),
+                       getattr(model, "ir_coarse_aligner", None)):
+            if module is not None:
+                for p in module.parameters():
+                    p.requires_grad_(True)
+        # The RGB geometry embedding belongs to the protected V4.4 anchor and
+        # is a fixed teacher during Stage A.
     for branch in getattr(model, "independent_aux", {}).values():
         dfl = getattr(branch.detector, "dfl", None)
         if dfl is not None:
@@ -496,22 +527,27 @@ def set_residual_fusion_mode(model: MMYOLO, downstream_frozen: bool) -> None:
     trusted = getattr(model.cfg.fusion, "fusion_strategy", "") == "v47_trusted_evidence_v1"
     v48 = getattr(model.cfg.fusion, "fusion_strategy", "") == "v48_embedding_complement_v1"
     v5 = getattr(model.cfg.fusion, "fusion_strategy", "") == "v5_ir_quality_evidence"
-    if v48 or v5:
+    v511 = getattr(model.cfg.fusion, "fusion_strategy", "") == "v511_conditional_ir_v1"
+    if v48 or v5 or v511:
         # Protect the learned V4.4 fusion and RGB backbone.  The short first
         # phase learns only the exact-zero plugin/alignment.  Afterwards the
         # auxiliary representations and downstream detector adapt at low LR.
         enable(getattr(model, "evidence_router", None))
         enable(getattr(model, "ir_coarse_aligner", None))
-        if v5:
+        if v5 or v511:
             # Keep the shared semantic auxiliary heads trainable from the
             # first Stage-B epoch; otherwise their non-zero loss would be a
             # graph with no trainable path while the RGB anchor is frozen.
             enable(getattr(model, "semantic_adapters", None))
-            enable(getattr(model, "semantic_detect", None))
+        enable(getattr(model, "semantic_detect", None))
         if not downstream_frozen:
-            enable(getattr(model, "aux_encoders", None))
-            enable(getattr(model, "metric_encoder", None))
-            if hasattr(model, "embeddings"):
+            if v511:
+                enable(getattr(model, "v511_ir_encoder", None))
+                enable(getattr(model, "v511_ir_embeddings", None))
+            else:
+                enable(getattr(model, "aux_encoders", None))
+                enable(getattr(model, "metric_encoder", None))
+            if hasattr(model, "embeddings") and not v511:
                 for blocks in model.embeddings.values():
                     for block in blocks[1:]:
                         enable(block)
@@ -522,7 +558,15 @@ def set_residual_fusion_mode(model: MMYOLO, downstream_frozen: bool) -> None:
                 value = getattr(model, name, None)
                 if value is not None:
                     value.requires_grad_(True)
+            transition = getattr(model, "v511_localization_transition", None)
+            if transition is not None:
+                transition.requires_grad_(True)
             enable(model.backbone.model[11:])
+        if v511:
+            for scale in ("p3", "p4"):
+                matchers = getattr(model, "matchers", {})
+                if scale in matchers and len(matchers[scale]):
+                    enable(matchers[scale][0])
         dfl = getattr(model.model[-1], "dfl", None)
         if dfl is not None:
             dfl.requires_grad_(False)
@@ -693,6 +737,7 @@ def build_optimizer(model: MMYOLO, lr: float, backbone_mult: float, wd: float = 
         add("anchor", model.backbone.model[:11])
         add("aux_encoder", getattr(model, "aux_encoders", None))
         add("aux_encoder", getattr(model, "metric_encoder", None))
+        add("aux_encoder", getattr(model, "v511_ir_encoder", None))
         if "fusion" in role_ids and getattr(model, "metric_gain_logit", None) is not None:
             role_ids["fusion"].add(id(model.metric_gain_logit))
         add("fusion", getattr(model, "matchers", None))
@@ -700,6 +745,7 @@ def build_optimizer(model: MMYOLO, lr: float, backbone_mult: float, wd: float = 
         add("fusion", getattr(model, "neck_memory", None))
         add("fusion", getattr(model, "evidence_router", None))
         add("fusion", getattr(model, "ir_coarse_aligner", None))
+        add("fusion", getattr(model, "v511_ir_embeddings", None))
         add("p2", getattr(model, "occlusion_context", None))
         if hasattr(model, "embeddings"):
             for blocks in model.embeddings.values():
@@ -871,6 +917,7 @@ def validate_checkpoint(ck: dict, model: MMYOLO, enabled, canvas, exact: bool = 
             structure["fusion"].setdefault("ir_affine_max_shift", 10.0)
             structure["fusion"].setdefault("ir_affine_max_scale", .04)
             structure["fusion"].setdefault("ir_affine_identity_weight", .02)
+            structure["fusion"].setdefault("quality_channels", 9)
     # B1 结构里还没有该字段，其实际语义就是 2ch。先规范化，保证历史
     # last.pt 仍可严格 --resume；B2 则显式记录 4ch。
     if "encoder" in saved_structure:
@@ -906,7 +953,8 @@ def validate_checkpoint(ck: dict, model: MMYOLO, enabled, canvas, exact: bool = 
                                                   "v44_incremental_router_v1",
                                                   "v47_trusted_evidence_v1",
                                                   "v48_embedding_complement_v1",
-                                                  "v5_ir_quality_evidence")):
+                                                  "v5_ir_quality_evidence",
+                                                  "v511_conditional_ir_v1")):
             # Explicit V4.4 warm-start paths.  The incremental path keeps the
             # old fusion weights and only initializes newly named tensors below.
             for key in ("fusion_strategy", "ir_coarse_align",
@@ -949,7 +997,7 @@ def validate_checkpoint(ck: dict, model: MMYOLO, enabled, canvas, exact: bool = 
                          "不能精确 --resume；可用新的 --name + --init-checkpoint 仅初始化")
     if args is not None:
         old = ts.get("args") or {}
-        keys = ("modalities", "imgsz", "epochs", "batch", "accum", "lr",
+        keys = ("modalities", "imgsz", "epochs", "lr",
                 "backbone_lr_mult", "fusion_lr_mult", "p2_lr_mult", "detector_lr_mult",
                 "semantic_lr_mult", "freeze_epochs", "freeze_bn", "freeze_new_bn",
                 "fusion_tier", "share_tier", "register_bus", "late_bus", "depth_scales",
@@ -975,6 +1023,7 @@ def validate_checkpoint(ck: dict, model: MMYOLO, enabled, canvas, exact: bool = 
                  "independent_preserve_end_weight", "fusion_strategy", "ir_coarse_align",
                  "ir_affine_loss_weight", "ir_affine_loss_end_weight",
                  "evidence_supervision_weight", "evidence_supervision_end_weight")
+        keys += ("ir_a0_cache", "require_ir_a0")
         legacy = {"depth_channels": 2, "depth_view": "both", "depth_init": "relative",
                   "misalign_px": 15.0, "degrade_p": 0.3, "rgb_color_p": 0.0,
                   "ir_noise_p": 0.0, "ir_gain_p": 0.0,
@@ -1003,10 +1052,18 @@ def validate_checkpoint(ck: dict, model: MMYOLO, enabled, canvas, exact: bool = 
                       fusion_strategy="legacy_residual_v2", ir_coarse_align=False,
                       ir_affine_loss_weight=0., ir_affine_loss_end_weight=None,
                       evidence_supervision_weight=0., evidence_supervision_end_weight=None,
+                      ir_a0_cache="", require_ir_a0=False,
                       fusion_lr_mult=1., p2_lr_mult=1.,
                       detector_lr_mult=1., semantic_lr_mult=1., train_stage="standard")
         changed = [k for k in keys
                    if old.get(k, legacy.get(k)) != getattr(args, k, legacy.get(k))]
+        # OOM recovery may redistribute physical batch and accumulation while
+        # preserving the effective batch.  Loss normalization, optimizer-step
+        # count and weight-decay scaling all depend on their product.
+        old_batch = int(old.get("batch", getattr(args, "batch", 1)))
+        old_accum = int(old.get("accum", getattr(args, "accum", 1)))
+        if old_batch * old_accum != int(args.batch) * int(args.accum):
+            changed.append("effective_batch")
         if changed:
             raise ValueError(f"--resume 训练设置发生变化：{changed}；请新开实验")
 
@@ -1016,6 +1073,24 @@ def adapt_depth_checkpoint_state(state: dict, model: MMYOLO) -> tuple:
     out = dict(state)
     migrated = False
     target_state = model.state_dict()
+    # V5.1.1 clones standalone RGB/thermal teachers from the learned V4.4
+    # encoders and clones its thermal embedding.  Use the checkpoint tensors,
+    # not the freshly constructed COCO defaults, whenever a source key exists.
+    clone_prefixes = {
+        "v511_ir_encoder.": "aux_encoders.ir.",
+    }
+    for scale in ("p2", "p3", "p4", "p5"):
+        clone_prefixes[f"v511_ir_embeddings.{scale}."] = f"embeddings.{scale}.1."
+    for name, target in target_state.items():
+        if name in out:
+            continue
+        for destination, source_prefix in clone_prefixes.items():
+            if name.startswith(destination):
+                source = source_prefix + name[len(destination):]
+                out[name] = (state[source].detach().clone()
+                             if source in state else target.detach().clone())
+                migrated = True
+                break
     # V4.3 adds training-only standalone IR/Depth detectors and exact-zero
     # residual switches.  Old V4.2 checkpoints are the intended initialization
     # source; initialize only these named additions from the freshly constructed
@@ -1026,7 +1101,8 @@ def adapt_depth_checkpoint_state(state: dict, model: MMYOLO) -> tuple:
         is_v45 = (name.startswith("evidence_router.") or
                    name.startswith("ir_coarse_aligner.") or
                   name.startswith("occlusion_context.") or
-                  name == "metric_gain_logit")
+                  name == "metric_gain_logit" or
+                  name == "v511_localization_transition")
         if name not in out and (name.startswith("independent_aux.") or
                                 name.startswith("semantic_adapters.") or
                                 name.startswith("semantic_detect.") or is_new_switch or
@@ -1151,6 +1227,10 @@ def main():
     ap.add_argument("--ir-read-mode", default="legacy_first_channel",
                     choices=["legacy_first_channel", "median_channel"],
                     help="IR three-channel reduction; median removes weak RGB-like chroma residue")
+    ap.add_argument("--ir-a0-cache", default="",
+                    help="V5.1.1 offline A0 cache root (contains samples/*.npz)")
+    ap.add_argument("--require-ir-a0", action="store_true",
+                    help="fail closed when any requested IR sample lacks an A0 cache")
     ap.add_argument("--metric-branch", action="store_true")
     ap.add_argument("--sampler", default="legacy", choices=["legacy", "coverage"])
     ap.add_argument("--rare-extra-frac", type=float, default=.1)
@@ -1314,7 +1394,7 @@ def main():
                     choices=["legacy_residual_v2", "evidence_router_v3",
                              "v44_incremental_router_v1", "v47_trusted_evidence_v1",
                              "v48_embedding_complement_v1",
-                             "v5_ir_quality_evidence"])
+                             "v5_ir_quality_evidence", "v511_conditional_ir_v1"])
     ap.add_argument("--ir-coarse-align", action="store_true",
                     help="启用样本级 IR 小仿射 + P2/P3 局部残差对齐")
     ap.add_argument("--ir-affine-loss-weight", type=float, default=0.0)
@@ -1398,9 +1478,16 @@ def main():
         raise ValueError("V4.8 requires confidence-blended IR rotation correction")
     if args.fusion_strategy == "v5_ir_quality_evidence" and not args.ir_coarse_align:
         raise ValueError("v5_ir_quality_evidence requires supervised IR coarse alignment")
+    if args.fusion_strategy == "v511_conditional_ir_v1" and not args.ir_coarse_align:
+        raise ValueError("v511_conditional_ir_v1 requires supervised conditional IR alignment")
+    if args.fusion_strategy == "v511_conditional_ir_v1" and (
+            args.ir_read_mode != "median_channel" or not args.ir_a0_cache or
+            not args.require_ir_a0):
+        raise ValueError("V5.1.1 requires median IR and a fail-closed --ir-a0-cache")
     if args.ir_coarse_align and args.fusion_strategy not in (
             "evidence_router_v3", "v47_trusted_evidence_v1",
-            "v48_embedding_complement_v1", "v5_ir_quality_evidence"):
+            "v48_embedding_complement_v1", "v5_ir_quality_evidence",
+            "v511_conditional_ir_v1"):
         raise ValueError("--ir-coarse-align 只适用于 evidence_router_v3/V4.7/V4.8/V5")
     if args.fusion_strategy == "v48_embedding_complement_v1" and (
             args.ir_affine_p != 0 or args.ir_affine_shift != 0 or
@@ -1520,6 +1607,8 @@ def main():
                  ir_affine_shift=args.ir_affine_shift, ir_affine_scale=args.ir_affine_scale,
                  legacy_lowlight=args.depth_channels == 2,
                  ir_read_mode=args.ir_read_mode,
+                 ir_a0_cache=args.ir_a0_cache,
+                 require_ir_a0=args.require_ir_a0,
                  depth_resampling=args.depth_resampling, total_epochs=args.epochs,
                  close_aug_frac=args.close_aug_frac,
                  mosaic_p=args.mosaic,
@@ -1584,6 +1673,8 @@ def main():
     cfg.fusion.depth_reliability = args.depth_reliability
     cfg.fusion.flow_identity_weight = float(args.flow_identity_weight)
     cfg.fusion.fusion_strategy = args.fusion_strategy
+    if args.fusion_strategy == "v511_conditional_ir_v1":
+        cfg.fusion.quality_channels = 10
     cfg.fusion.ir_coarse_align = bool(args.ir_coarse_align)
     cfg.fusion.ir_affine_max_degrees = float(args.ir_affine_deg)
     cfg.fusion.ir_affine_max_shift = float(args.ir_affine_shift)
@@ -1690,6 +1781,9 @@ def main():
             elif args.fusion_strategy == "v5_ir_quality_evidence":
                 reset_keys = reset_v5_additions(model)
                 log(f"[train] V5 V4.4 保底起点：仅重置质量/证据插件 {reset_keys}")
+            elif args.fusion_strategy == "v511_conditional_ir_v1":
+                reset_keys = reset_v511_additions(model)
+                log(f"[train] V5.1.1 V4.4 保底起点：仅重置条件对齐/可信融合插件 {reset_keys}")
             elif args.fusion_strategy in ("v44_incremental_router_v1",
                                            "v47_trusted_evidence_v1"):
                 reset_keys = reset_incremental_router_additions(model)
@@ -1737,6 +1831,15 @@ def main():
                  "depth_view": args.depth_view, "depth_init": args.depth_init,
                  "split_digest": split_digest, "trainer_recipe": recipe_for(args),
                  "architecture": args.architecture, "depth_resampling": args.depth_resampling}
+    if args.ir_a0_cache:
+        cache_root = Path(args.ir_a0_cache)
+        summary = cache_root / "audit_summary.json"
+        meta_base["ir_a0"] = {
+            "version": "v5.1.1-a0",
+            "required": bool(args.require_ir_a0),
+            "summary_sha256": (hashlib.sha256(summary.read_bytes()).hexdigest()
+                               if summary.is_file() else ""),
+        }
     if args.init_checkpoint:
         meta_base["initialization"] = {"checkpoint": str(Path(args.init_checkpoint).resolve()),
                                        "epoch": ck["epoch"], "best_map": ck.get("best_map"),
@@ -1775,31 +1878,47 @@ def main():
             return evaluate_model(eval_model, Path(args.root), va_eval,
                                   imgsz=imgsz, device=dev, modalities=args.modalities,
                                   conf=args.val_conf, slices=False,
-                                  batch_size=args.val_batch)
+                                  batch_size=args.val_batch,
+                                  ir_a0_cache=args.ir_a0_cache,
+                                  require_ir_a0=args.require_ir_a0)
         branches = {}
         try:
-            for branch in ("ir", "dep"):
+            stage_a_branches = (("rgb", "ir", "dep") if
+                                args.fusion_strategy == "v511_conditional_ir_v1"
+                                else ("ir", "dep"))
+            for branch in stage_a_branches:
                 eval_model.auxiliary_eval_branch = branch
                 branches[branch] = evaluate_model(
                     eval_model, Path(args.root), va_eval, imgsz=imgsz,
                     device=dev, modalities="all", conf=args.val_conf,
-                    slices=False, batch_size=args.val_batch)
+                    slices=False, batch_size=args.val_batch,
+                    ir_a0_cache=args.ir_a0_cache,
+                    require_ir_a0=args.require_ir_a0)
         finally:
             eval_model.auxiliary_eval_branch = None
         keys = range(int(eval_model.nc))
+        v511_stage_a = args.fusion_strategy == "v511_conditional_ir_v1"
+        selection_branch = branches["ir"] if v511_stage_a else None
         combined = {
-            "map50_95": sum(v["map50_95"] for v in branches.values()) / 2,
-            "map50": sum(v["map50"] for v in branches.values()) / 2,
-            "per_class_95": {k: sum(v["per_class_95"][k] for v in branches.values()) / 2
-                             for k in keys},
-            "per_class_50": {k: sum(v["per_class_50"][k] for v in branches.values()) / 2
-                             for k in keys},
-            "n_valid_classes": min(v["n_valid_classes"] for v in branches.values()),
-            "missing_classes": sorted(set().union(
-                *(v["missing_classes"] for v in branches.values()))),
+            "map50_95": (selection_branch["map50_95"] if v511_stage_a else
+                         sum(v["map50_95"] for v in branches.values()) / len(branches)),
+            "map50": (selection_branch["map50"] if v511_stage_a else
+                      sum(v["map50"] for v in branches.values()) / len(branches)),
+            "per_class_95": (selection_branch["per_class_95"] if v511_stage_a else
+                             {k: sum(v["per_class_95"][k] for v in branches.values()) /
+                              len(branches) for k in keys}),
+            "per_class_50": (selection_branch["per_class_50"] if v511_stage_a else
+                             {k: sum(v["per_class_50"][k] for v in branches.values()) /
+                              len(branches) for k in keys}),
+            "n_valid_classes": (selection_branch["n_valid_classes"] if v511_stage_a else
+                                min(v["n_valid_classes"] for v in branches.values())),
+            "missing_classes": (selection_branch["missing_classes"] if v511_stage_a else
+                                sorted(set().union(
+                                    *(v["missing_classes"] for v in branches.values())))),
             "n_images": len(va_eval), "canvas": list(canvas),
-            "modalities": "independent_ir_depth",
-            "selection": "mean_ir_depth_map50_95",
+            "modalities": "independent_" + "_".join(branches),
+            "selection": ("ir_map50_95_with_rgb_floor" if v511_stage_a else
+                          "mean_" + "_".join(branches) + "_map50_95"),
             "branches": branches,
         }
         return combined
@@ -2027,6 +2146,22 @@ def main():
                         del branch_aux, branch_preds, branch_targets, loss_vec, branch_loss
                     loss_items = {key: value / max(1, branch_count)
                                   for key, value in item_sum.items()}
+                    if (args.fusion_strategy == "v511_conditional_ir_v1" and
+                            ir_affine_weight > 0):
+                        model.alignment_prediction(rgb, ir, quality=qual, keep=keep)
+                        affine_loss = model.affine_supervision_loss(
+                            batch["ir_affine_target"].to(dev, non_blocking=non_blocking),
+                            batch["ir_affine_supervised"].to(dev, non_blocking=non_blocking),
+                            batch["ir_affine_confidence"].to(dev, non_blocking=non_blocking))
+                        affine_scaled = (ir_affine_weight * affine_loss *
+                                         (rgb.shape[0] / nominal_samples))
+                        if not torch.isfinite(affine_scaled.detach()):
+                            raise FloatingPointError(
+                                f"non-finite Stage-A IR affine loss at ep={ep+1} batch={bi}")
+                        scaler.scale(affine_scaled).backward()
+                        branch_backward = True
+                        semantic["ir_affine"] = affine_loss
+                        loss_scalar = loss_scalar + affine_scaled.detach()
                     loss = loss_scalar
                 else:
                     preds = model(rgb, ir, dep, quality=qual, prior=prior, keep=keep)
@@ -2045,6 +2180,7 @@ def main():
                         batch["alignment_supervised"].to(dev, non_blocking=non_blocking),
                         batch["ir_affine_target"].to(dev, non_blocking=non_blocking),
                         batch["ir_affine_supervised"].to(dev, non_blocking=non_blocking),
+                        batch["ir_affine_confidence"].to(dev, non_blocking=non_blocking),
                     )
                     loss = loss + (flow_weight * semantic["flow"] +
                                    nce_weight * semantic["nce"] +
@@ -2091,7 +2227,9 @@ def main():
             # never prediction voting.
             if (args.train_stage == "residual_fusion" and not frozen and
                     independent_preserve_weight > 0):
-                preserve_name = ("ir", "dep")[(ep + bi) % 2]
+                preserve_names = (("ir",) if args.fusion_strategy ==
+                                  "v511_conditional_ir_v1" else ("ir", "dep"))
+                preserve_name = preserve_names[(ep + bi) % len(preserve_names)]
                 preserve_aux, preserve_active = model.independent_branch_prediction(
                     preserve_name, ir=ir, depth=dep, keep=keep)
                 if preserve_active.any():

@@ -214,7 +214,8 @@ def evaluate_model(model: MMYOLO, root: Path, samples: List[dict], imgsz=960,
                    device="cuda:0", conf: float = 0.001, iou: float = 0.7, max_det: int = 100,
                    modalities: str = "all", batch_size: int = 4, workers: int = 4,
                    profile: bool = False, slices: bool = True,
-                   ablate_absolute: bool = False, by_depth_format: bool = False) -> dict:
+                   ablate_absolute: bool = False, by_depth_format: bool = False,
+                   ir_a0_cache: str = "", require_ir_a0: bool = False) -> dict:
     """在给定样本上按赛题口径评测；可选模态屏蔽剖面与条件切片。
 
     ⚠️ 坐标必须走**同一套 letterbox 映射**：GT 取 dataset 内部已变换到画布的框
@@ -228,6 +229,8 @@ def evaluate_model(model: MMYOLO, root: Path, samples: List[dict], imgsz=960,
                    aug=AugCfg(imgsz=imgsz,
                               depth_resampling=getattr(getattr(model, "cfg", None), "depth_resampling", "legacy_bilinear_v1"),
                               ir_read_mode=getattr(getattr(model, "cfg", None), "ir_read_mode", "legacy_first_channel"),
+                              ir_a0_cache=ir_a0_cache,
+                              require_ir_a0=require_ir_a0,
                               legacy_lowlight=int(model.cfg.encoder.depth_input_channels) == 2),
                    enabled={"rgb": ("rgb",), "ir": ("ir",), "dep": ("dep",),
                             "rgb_ir": ("rgb", "ir"),
@@ -357,6 +360,8 @@ def main():
     ap.add_argument("--ir-read-mode", default="",
                     choices=["", "legacy_first_channel", "median_channel"],
                     help="只读 A/B 覆盖；空值使用 checkpoint 记录的 IR 预处理")
+    ap.add_argument("--ir-a0-cache", default="",
+                    help="V5.1.1 A0 cache root")
     ap.add_argument("--device", default="auto", help="auto/cpu/cuda/cuda:0")
     ap.add_argument("--root", required=True)
     ap.add_argument("--labels", default="")
@@ -385,6 +390,9 @@ def main():
         overrides["ir_read_mode"] = args.ir_read_mode
     model, ck = load_mm_checkpoint(args.ckpt, device=dev, **overrides)
     model.eval()
+    a0_required = bool((ck.get("meta") or {}).get("ir_a0", {}).get("required", False))
+    if a0_required and not args.ir_a0_cache:
+        raise ValueError("this V5.1.1 checkpoint requires --ir-a0-cache")
     modalities = resolve_infer_modalities(model, args.modalities or None)
     imgsz = parse_imgsz(resolve_infer_canvas(model, parse_imgsz(args.imgsz) if args.imgsz
                                              else None))
@@ -412,7 +420,9 @@ def main():
                          modalities=modalities, profile=args.profile,
                          slices=not args.no_slices, conf=args.conf, batch_size=args.batch,
                          ablate_absolute=args.ablate_absolute,
-                         by_depth_format=args.by_depth_format)
+                         by_depth_format=args.by_depth_format,
+                         ir_a0_cache=args.ir_a0_cache,
+                         require_ir_a0=a0_required)
     res["ckpt"] = str(args.ckpt)
     res["epoch"] = int(ck.get("epoch", 0))
     print(json.dumps(res, ensure_ascii=False, indent=1))

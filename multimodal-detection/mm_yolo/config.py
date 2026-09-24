@@ -95,7 +95,7 @@ class FusionCfg:
     max_offset: float = 3.0       # 可变形偏移上限（像素）
     deformable: Tuple[str, ...] = ("dep",)   # 哪些模态启用**学习式残差对齐**（L3 的按模态版本）
     quality_gate: bool = True     # 把"模态质量描述子"显式喂进门控（亮度/对比度/清晰度…）
-    quality_channels: int = 9     # IR: 强度/对比度/边缘/边界/饱和/模糊/双边缘/色差/拟合
+    quality_channels: int = 9     # V5.1.1 显式设 10；默认 9 保持旧 checkpoint 契约
     prior_film: bool = True       # 用 depth 几何先验做 FiLM（逆深度/法线）
     prior_channels: int = 4       # depth 先验通道数（逆深度/有效/法线x/法线y）
     slot_names: Tuple[str, ...] = ("rgb", "ir", "dep")

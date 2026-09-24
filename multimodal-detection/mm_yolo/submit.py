@@ -153,6 +153,7 @@ def main():
                     help="服务器上本地预训练权重路径；用于重建 checkpoint 结构")
     ap.add_argument("--device", default="auto", help="auto/cpu/cuda/cuda:0")
     ap.add_argument("--root", required=True, help="测试集目录（含 visible/infrared/depth）")
+    ap.add_argument("--ir-a0-cache", default="", help="测试集对应的 V5.1.1 A0 cache root")
     ap.add_argument("--imgsz", default="", help="空=用 checkpoint 记录的训练画布；支持 'HxW'")
     ap.add_argument("--modalities", default="",
                     choices=["", "all", "rgb", "rgb_ir", "rgb_dep", "ir", "dep"],
@@ -175,6 +176,9 @@ def main():
     overrides = {"weights": args.base_weights} if args.base_weights else {}
     model, _ck = load_mm_checkpoint(args.ckpt, device=dev, **overrides)
     model.eval()
+    a0_required = bool((_ck.get("meta") or {}).get("ir_a0", {}).get("required", False))
+    if a0_required and not args.ir_a0_cache:
+        raise ValueError("this V5.1.1 checkpoint requires --ir-a0-cache")
     modalities = resolve_infer_modalities(model, args.modalities or None)
     imgsz = parse_imgsz(resolve_infer_canvas(model, parse_imgsz(args.imgsz) if args.imgsz
                                              else None))
@@ -190,6 +194,8 @@ def main():
                    aug=AugCfg(imgsz=imgsz,
                               depth_resampling=getattr(model.cfg, "depth_resampling", "legacy_bilinear_v1"),
                               ir_read_mode=getattr(model.cfg, "ir_read_mode", "legacy_first_channel"),
+                              ir_a0_cache=args.ir_a0_cache,
+                              require_ir_a0=a0_required,
                               legacy_lowlight=int(model.cfg.encoder.depth_input_channels) == 2),
                    enabled={"rgb": ("rgb",), "ir": ("ir",), "dep": ("dep",),
                             "rgb_ir": ("rgb", "ir"),
