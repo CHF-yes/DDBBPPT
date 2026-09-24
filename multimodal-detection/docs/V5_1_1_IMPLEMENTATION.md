@@ -24,6 +24,10 @@ The stored affine is a **source-sampling transform**: for an RGB/reference
 output coordinate it returns the IR input coordinate that should be sampled.
 The raw IR file is never overwritten.  Weak or conflicting evidence produces
 `affine_supervised=0`; it never produces a fabricated precise transform.
+Only a named source with at least two supporting images may share a sequence
+prior.  `PLAIN` and singleton images retain their own coarse-to-fine estimate;
+they never inherit a dataset-wide transform.  An unsupervised cached affine is
+also excluded from known synthetic-affine target composition.
 
 ## Stage A
 

@@ -1124,9 +1124,14 @@ class MMDataset(Dataset):
                 raise ValueError(f"A0 cache/image size mismatch for {s['stem']}: {stored_hw} vs {(H,W)}")
             S_orig = _mat3(np.asarray(a0["sampling_matrix"], np.float32))
             M3 = _mat3(M)
-            sampling_canvas = M3 @ S_orig @ np.linalg.inv(M3)
             ir_affine_confidence = float(np.asarray(a0["affine_confidence"]).reshape(()))
             ir_affine_supervised = float(np.asarray(a0["affine_supervised"]).reshape(()))
+            # A weak A0 candidate remains useful as a quality descriptor, but
+            # it is not a geometric label.  In particular, do not compose an
+            # uncertain pseudo-transform into an otherwise exact synthetic
+            # affine target below.
+            if ir_affine_supervised:
+                sampling_canvas = M3 @ S_orig @ np.linalg.inv(M3)
         if (self.train and allow_special and want_ir and aug.ir_affine_p > 0 and
                 rng.random() < aug.ir_affine_p):
             angle = rng.uniform(-aug.ir_affine_deg, aug.ir_affine_deg)

@@ -10,7 +10,7 @@ MM = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(MM))
 
 from ir_a0 import (A0_QUALITY_NAMES, border_masks, load_sample, quality_maps,
-                   save_sample, source_to_sampling)
+                   save_sample, select_affine_candidate, source_to_sampling)
 
 
 class IRA0Tests(unittest.TestCase):
@@ -54,6 +54,26 @@ class IRA0Tests(unittest.TestCase):
         destination = source_to_rgb @ points
         restored = sampling @ np.vstack((destination, np.ones(destination.shape[1])))
         self.assertTrue(np.allclose(restored, points[:2], atol=1e-4))
+
+    def test_plain_sample_never_inherits_unrelated_sequence_prior(self):
+        coarse = {"params": np.asarray((1., 2., 3., 1.01), np.float32),
+                  "confidence": .6}
+        refined = {"params": np.asarray((1.1, 2.2, 3.1, 1.01), np.float32),
+                   "confidence": .2}
+        chosen, source = select_affine_candidate(
+            coarse, refined, (-.25, .3, 1.4, 1.01), .8, False)
+        self.assertEqual(source, "coarse_individual")
+        self.assertTrue(np.allclose(chosen["params"], coarse["params"]))
+
+    def test_real_sequence_can_fall_back_to_robust_prior(self):
+        coarse = {"params": np.asarray((1., 2., 3., 1.01), np.float32),
+                  "confidence": .6}
+        refined = {"params": np.asarray((1.1, 2.2, 3.1, 1.01), np.float32),
+                   "confidence": .2}
+        prior = np.asarray((-.25, .3, 1.4, 1.01), np.float32)
+        chosen, source = select_affine_candidate(coarse, refined, prior, .8, True)
+        self.assertEqual(source, "sequence_prior")
+        self.assertTrue(np.allclose(chosen["params"], prior))
 
 
 if __name__ == "__main__":

@@ -21,7 +21,7 @@ try:
 except ImportError:  # tools may import this file as a top-level module
     from io_utils import imread_unicode
 
-A0_VERSION = 1
+A0_VERSION = 2
 A0_QUALITY_NAMES = (
     "intensity", "local_contrast", "edge", "invalid_border", "saturation",
     "blur", "double_edge", "rgb_leakage", "thermal_confidence",
@@ -305,6 +305,29 @@ def robust_sequence_prior(rows: Sequence[dict]):
         values, ww = x[order[:, col], col], weight[order[:, col]]
         result.append(float(values[np.searchsorted(np.cumsum(ww), ww.sum() / 2)]))
     return np.asarray(result, np.float32), float(np.clip(weight.mean() * min(1, len(x) / 3), 0, 1))
+
+
+def select_affine_candidate(coarse: dict, refined: dict,
+                            sequence_prior: Sequence[float],
+                            sequence_confidence: float,
+                            has_sequence_prior: bool):
+    """Select a conservative A0 label without inventing cross-image motion.
+
+    A sequence prior is meaningful only when the filename exposes a real
+    source/sequence and at least two samples support it.  Unidentified
+    ``PLAIN`` images and singleton sources keep their own coarse-to-fine
+    estimate; they must never inherit a transform aggregated from unrelated
+    images.
+    """
+    if refined["confidence"] >= max(.35, .8 * coarse["confidence"]):
+        return dict(refined), "refined"
+    if has_sequence_prior and float(sequence_confidence) > 0:
+        chosen = dict(coarse)
+        chosen["params"] = np.asarray(sequence_prior, np.float32)
+        chosen["confidence"] = min(float(sequence_confidence),
+                                   float(coarse["confidence"]))
+        return chosen, "sequence_prior"
+    return dict(coarse), "coarse_individual"
 
 
 def source_to_sampling(params: Sequence[float], shape: tuple[int, int]):

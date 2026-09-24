@@ -18,7 +18,8 @@ for item in (ROOT, ROOT / "mm_yolo"):
 
 from mm_yolo.data import build_index, source_group  # noqa: E402
 from mm_yolo.ir_a0 import (SearchCfg, estimate_affine, quality_maps, read_modalities,
-                           robust_sequence_prior, save_sample, write_manifest)  # noqa: E402
+                           robust_sequence_prior, save_sample,
+                           select_affine_candidate, write_manifest)  # noqa: E402
 
 
 def _paths(root: Path, sample: dict):
@@ -76,23 +77,25 @@ def main():
         groups[source_group(stem)].append(estimate)
         if (i + 1) % 50 == 0 or i + 1 == len(samples):
             print(f"[A0] coarse {i+1}/{len(samples)}", flush=True)
-    priors = {g: robust_sequence_prior(rows) for g, rows in groups.items()}
+    prior_usable = {g: g != "PLAIN" and len(rows) >= 2 for g, rows in groups.items()}
+    priors = {
+        g: (robust_sequence_prior(rows) if prior_usable[g]
+            else (np.asarray([0., 0., 0., 1.], np.float32), 0.0))
+        for g, rows in groups.items()
+    }
     rows, previews = [], []
     for i, sample in enumerate(samples):
         stem, group = sample["stem"], source_group(sample["stem"])
         rgb, thermal, ir3 = read_modalities(*_paths(root, sample))
         q, visible, geometry, meta = quality_maps(rgb, thermal, ir3)
         prior, prior_conf = priors[group]
-        refined = estimate_affine(rgb, thermal, geometry, cfg, prior=prior)
-        # A residual is accepted only if it is at least as trustworthy as the
-        # coarse candidate.  Otherwise the robust sequence prior is safer.
-        if refined["confidence"] >= max(.35, .8 * first[stem]["confidence"]):
-            chosen = refined
-            chosen_source = "refined"
-        else:
-            chosen = {**first[stem], "params": prior,
-                      "confidence": min(float(prior_conf), first[stem]["confidence"])}
-            chosen_source = "sequence_prior"
+        # Real multi-frame sources refine around their robust sequence prior.
+        # PLAIN/singleton inputs refine around their own coarse result and can
+        # never inherit an unrelated cross-image transform.
+        refine_origin = prior if prior_usable[group] else first[stem]["params"]
+        refined = estimate_affine(rgb, thermal, geometry, cfg, prior=refine_origin)
+        chosen, chosen_source = select_affine_candidate(
+            first[stem], refined, prior, prior_conf, prior_usable[group])
         confidence = float(chosen["confidence"] * (.5 + .5 * meta["valid_ratio"]))
         save_sample(out / "samples" / f"{stem}.npz", stem=stem,
                     params=chosen["params"], confidence=confidence,
@@ -130,7 +133,7 @@ def main():
         cv2.imwrite(str(preview_dir / f"{stem}.jpg"), image, [cv2.IMWRITE_JPEG_QUALITY, 92])
     confidences = np.asarray([r["confidence"] for r in rows])
     summary = {
-        "version": 1, "n_samples": len(rows), "min_confidence": a.min_confidence,
+        "version": 2, "n_samples": len(rows), "min_confidence": a.min_confidence,
         "supervised": int(sum(r["supervised"] for r in rows)),
         "confidence_quantiles": {str(q): float(np.quantile(confidences, q))
                                  for q in (0, .1, .25, .5, .75, .9, 1)},
