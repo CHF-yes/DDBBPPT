@@ -24,7 +24,7 @@
   "require_ir_a0": true,
   "fusion_strategy": "v511_conditional_ir_v1",
   "ir_coarse_align": true,
-  "ir_affine_deg": 3.0,
+  "ir_affine_deg": 4.0,
   "ir_affine_shift": 16.0,
   "ir_affine_scale": 0.04,
   "stage_a_ir_min_map50_95": 0.175,

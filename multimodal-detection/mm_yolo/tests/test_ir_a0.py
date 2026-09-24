@@ -86,6 +86,14 @@ class IRA0Tests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertGreater(float(np.abs(value).max()), 1.05)
 
+        # V5.1.1 keeps a small margin above the observed three-degree search
+        # boundary so high-confidence rotations do not saturate the head.
+        ok, value = affine_model_contract(
+            (3.25, 0.0, 0.0, 1.0), (1080, 1920), (736, 1280),
+            angle_limit=4.0)
+        self.assertTrue(ok)
+        self.assertLessEqual(float(np.abs(value).max()), 1.05)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -129,7 +129,7 @@ def main():
                    help="OpenCV threads per worker")
     p.add_argument("--contract-canvas", default="736x1280",
                    help="V5.1.1 training canvas used to validate affine labels")
-    p.add_argument("--contract-angle", type=float, default=3.0)
+    p.add_argument("--contract-angle", type=float, default=4.0)
     p.add_argument("--contract-shift", type=float, default=16.0)
     p.add_argument("--contract-scale", type=float, default=.04)
     a = p.parse_args()

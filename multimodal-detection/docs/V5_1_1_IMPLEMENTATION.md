@@ -32,6 +32,10 @@ The cache writer additionally conjugates every candidate through the declared
 training canvas and marks transforms outside the aligner's angle/shift/scale
 range as `affine_supervised=0`.  Their correlation confidence remains available
 to the quality path, but they cannot contaminate geometric or synthetic labels.
+The production recipe uses a bounded four-degree angle range.  This preserves a
+small margin above the observed high-confidence three-degree search boundary;
+the translation and scale limits remain conservative and are checked
+independently.
 
 ## Stage A
 
