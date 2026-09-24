@@ -447,7 +447,13 @@ class IndependentMMYOLO(nn.Module):
         weight = supervised * target_confidence.clamp_min(.05)
         geometry = (error * weight).sum() / weight.sum().clamp_min(1)
         predicted = self._ir_affine_confidence.float().reshape(-1).clamp(1e-5, 1-1e-5)
-        return geometry + .05 * F.binary_cross_entropy(predicted, target_confidence)
+        # BCELoss on a sigmoid probability is explicitly rejected by CUDA
+        # autocast.  Recovering the float32 logit keeps the existing aligner
+        # interface while using the numerically stable autocast-safe loss.
+        confidence_logit = torch.logit(predicted)
+        confidence = F.binary_cross_entropy_with_logits(
+            confidence_logit, target_confidence)
+        return geometry + .05 * confidence
 
     def forward(self, rgb, ir=None, depth=None, quality=None, prior=None, keep=None):
         if self.auxiliary_eval_branch is not None:
