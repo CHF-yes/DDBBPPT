@@ -539,7 +539,7 @@ def set_residual_fusion_mode(model: MMYOLO, downstream_frozen: bool) -> None:
             # first Stage-B epoch; otherwise their non-zero loss would be a
             # graph with no trainable path while the RGB anchor is frozen.
             enable(getattr(model, "semantic_adapters", None))
-        enable(getattr(model, "semantic_detect", None))
+            enable(getattr(model, "semantic_detect", None))
         if not downstream_frozen:
             if v511:
                 enable(getattr(model, "v511_ir_encoder", None))
