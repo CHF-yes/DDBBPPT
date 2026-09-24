@@ -1091,6 +1091,38 @@ def adapt_depth_checkpoint_state(state: dict, model: MMYOLO) -> tuple:
                              if source in state else target.detach().clone())
                 migrated = True
                 break
+    # Standalone V5.1.1 RGB/IR heads start from the learned V4.4 detector,
+    # including its P2 path and trained Neck/Detect tensors.  The IR branch has
+    # an independent encoder but can still reuse the modality-agnostic head.
+    aux_head_map = {
+        "p4_top_down.": "backbone.model.13.",
+        "p3_top_down.": "backbone.model.16.",
+        "p3_down.": "backbone.model.17.",
+        "p4_bottom_up.": "backbone.model.19.",
+        "p4_down.": "backbone.model.20.",
+        "p5_bottom_up.": "backbone.model.22.",
+        "p2_lateral.": "p2_lateral.",
+        "p2_neck.": "p2_neck.",
+        "p2_down.": "p2_down.",
+        "p3_refine.": "p3_refine.",
+        "neck_gain": "neck_gain",
+        "detector.": "backbone.model.23.",
+    }
+    for name, target in target_state.items():
+        if name in out or not name.startswith("independent_aux."):
+            continue
+        parts = name.split(".", 2)
+        if len(parts) != 3 or parts[1] not in ("rgb", "ir"):
+            continue
+        suffix = parts[2]
+        for destination, source_prefix in aux_head_map.items():
+            if suffix == destination or suffix.startswith(destination):
+                tail = suffix[len(destination):]
+                source = source_prefix + tail
+                if source in state and tuple(state[source].shape) == tuple(target.shape):
+                    out[name] = state[source].detach().clone()
+                    migrated = True
+                break
     # V4.3 adds training-only standalone IR/Depth detectors and exact-zero
     # residual switches.  Old V4.2 checkpoints are the intended initialization
     # source; initialize only these named additions from the freshly constructed

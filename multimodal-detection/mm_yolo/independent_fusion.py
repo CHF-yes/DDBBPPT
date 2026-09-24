@@ -759,15 +759,21 @@ class V511TrustedIRFusion(nn.Module):
             nn.Conv2d(dim * 5 + 2, hidden, 1, bias=False),
             nn.GroupNorm(max(1, min(16, hidden // 8)), hidden), nn.SiLU(),
             nn.Conv2d(hidden, channels, 1, bias=False))
-        descriptor = dim * 5 + 3
+        descriptor = dim * 6 + 3
         self.shared_spatial = self._gate(descriptor, hidden, 1)
         self.shared_channel = self._gate(descriptor, hidden, channels)
         self.private_spatial = self._gate(descriptor, hidden, 1)
         self.private_channel = self._gate(descriptor, hidden, channels)
-        depth_descriptor = dim * 5 + 2
+        depth_descriptor = dim * 6 + 2
         self.depth_spatial = self._gate(depth_descriptor, hidden, 1)
         self.depth_channel = self._gate(depth_descriptor, hidden, channels)
         self.ir_evidence = self._evidence_head(dim * 3, hidden)
+        # Six image-local states are advanced explicitly from P3 -> P4 -> P5:
+        # RGB, thermal, shared, thermal-private, quality and fused state.  They
+        # influence gates only; no token can synthesize class/spatial content.
+        self.state_cells = nn.ModuleList([nn.GRUCell(dim, dim) for _ in range(6)])
+        self.state_gate = nn.Sequential(
+            nn.Linear(dim * 6, dim, bias=False), nn.LayerNorm(dim), nn.SiLU())
         self.last_stats, self.last_health, self.last_evidence_logits = {}, {}, []
         for module in (self.shared, self.private, self.depth_support):
             nn.init.zeros_(module[-1].weight)
@@ -817,9 +823,23 @@ class V511TrustedIRFusion(nn.Module):
         return spatial(descriptor).float().sigmoid().to(descriptor.dtype) * \
                channel(descriptor).float().sigmoid().to(descriptor.dtype)
 
+    @staticmethod
+    def _token(feature, valid):
+        weight = F.interpolate(valid.float(), feature.shape[-2:], mode="nearest")
+        return (feature.float() * weight).sum((2, 3)) / weight.sum((2, 3)).clamp_min(1)
+
+    def _advance_state(self, observations, prior):
+        batch = observations[0].shape[0]
+        if prior is None:
+            prior = observations[0].new_zeros(batch, 6, self.dim)
+        updated = []
+        for index, (cell, observation) in enumerate(zip(self.state_cells, observations)):
+            updated.append(cell(observation.float(), prior[:, index].float()))
+        return torch.stack(updated, 1)
+
     def forward(self, raw_features, raw_common, aligned_common, raw_private,
                 valid, match, reliable, memory, quality=None, raw_quality=None,
-                anchor=None):
+                cross_scale_state=None, anchor=None):
         state = raw_features[0] * valid[0] if anchor is None else anchor
         mem = self.memory(F.layer_norm(
             memory[:, 3].mean(1).float(), (memory.shape[-1],)))[:, :, None, None]
@@ -848,7 +868,15 @@ class V511TrustedIRFusion(nn.Module):
                          (1 - .7 * aligned_ghost))
         raw_trust = (1 - raw_invalid) * (1 - .4 * raw_blur) * (1 - .7 * raw_ghost)
 
-        descriptor = torch.cat((q, rgb_c, ir_aligned_c, ir_raw_c, ir_q,
+        observations = (
+            self._token(rgb_c, valid[0]), self._token(ir_raw_c, valid[1]),
+            self._token(ir_aligned_c, valid[1]), self._token(ir_u, valid[1]),
+            self._token(ir_q, valid[1]), self._token(q, valid[0]))
+        next_state = self._advance_state(observations, cross_scale_state)
+        gate_context = self.state_gate(next_state.flatten(1))[:, :, None, None]
+        gate_context = gate_context.expand(-1, -1, *q.shape[-2:]).to(q.dtype)
+
+        descriptor = torch.cat((q, rgb_c, ir_aligned_c, ir_raw_c, ir_q, gate_context,
                                 valid[1].to(q.dtype), match[1].to(q.dtype),
                                 reliable[1].to(q.dtype)), 1)
         shared_gate = self._gate_pair(self.shared_spatial, self.shared_channel, descriptor)
@@ -865,7 +893,7 @@ class V511TrustedIRFusion(nn.Module):
         private_update = private_delta * private_gate * private_weight * evidence * valid[1]
         state = state + shared_update + private_update
 
-        depth_descriptor = torch.cat((q, rgb_c, ir_raw_c, dep_c, dep_q,
+        depth_descriptor = torch.cat((q, rgb_c, ir_raw_c, dep_c, dep_q, gate_context,
                                       valid[2].to(q.dtype), reliable[2].to(q.dtype)), 1)
         depth_gate = self._gate_pair(self.depth_spatial, self.depth_channel, depth_descriptor)
         depth_delta = self._bounded(self.depth_support(torch.cat((
@@ -891,4 +919,4 @@ class V511TrustedIRFusion(nn.Module):
             "ir_reliable": reliable[1].detach().float().mean(),
             "dep_reliable": reliable[2].detach().float().mean(),
         }
-        return state, shared_update, depth_update
+        return state, shared_update, depth_update, next_state

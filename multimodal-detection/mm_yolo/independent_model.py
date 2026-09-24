@@ -603,6 +603,7 @@ class IndependentMMYOLO(nn.Module):
                 flows[s].append(flow)
                 confidence[s].append(conf)
         state = None
+        v511_state = None
         fused, geometry, aligned_common, aligned_masks = {}, {}, {}, {}
         alignment_loss = auxiliary.new_zeros(())
         for s in SCALES:
@@ -756,10 +757,12 @@ class IndependentMMYOLO(nn.Module):
                 # plugin sees the conditional aligned candidate.
                 base = self.fusion[s](values, c, u, mask, base_match, rel, state, base_qual)
                 fusion_block = self.evidence_router[s]
-                fused[s], shared_support, depth_support = fusion_block(
+                fused[s], shared_support, depth_support, next_v511_state = fusion_block(
                     plugin_raw, plugin_raw_common, plugin_c, plugin_raw_private, masks[s],
                     confidence[s], reliabilities[s], state, qual,
-                    raw_quality=raw_qual, anchor=base)
+                    raw_quality=raw_qual, cross_scale_state=v511_state, anchor=base)
+                if s != "p2":
+                    v511_state = next_v511_state
             else:
                 fusion_block = self.fusion[s]
                 fused[s] = fusion_block(values,c,u,mask,confidence[s],rel,state,qual)
