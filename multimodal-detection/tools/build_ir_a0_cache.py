@@ -41,8 +41,10 @@ def _coarse_task(payload):
     root = Path(root)
     stem = sample["stem"]
     rgb, thermal, ir3 = read_modalities(*_paths(root, sample))
-    _, _, geometry, _ = quality_maps(rgb, thermal, ir3)
-    return stem, source_group(stem), estimate_affine(rgb, thermal, geometry, cfg)
+    _, _, geometry, _, geometry_thermal = quality_maps(
+        rgb, thermal, ir3, return_preprocessed=True)
+    return stem, source_group(stem), estimate_affine(
+        rgb, geometry_thermal, geometry, cfg)
 
 
 def _refine_task(payload):
@@ -52,9 +54,11 @@ def _refine_task(payload):
     root, out = Path(root), Path(out)
     stem, group = sample["stem"], source_group(sample["stem"])
     rgb, thermal, ir3 = read_modalities(*_paths(root, sample))
-    q, visible, geometry, meta = quality_maps(rgb, thermal, ir3)
+    q, visible, geometry, meta, geometry_thermal = quality_maps(
+        rgb, thermal, ir3, return_preprocessed=True)
     refine_origin = prior if use_prior else coarse["params"]
-    refined = estimate_affine(rgb, thermal, geometry, cfg, prior=refine_origin)
+    refined = estimate_affine(
+        rgb, geometry_thermal, geometry, cfg, prior=refine_origin)
     chosen, chosen_source = select_affine_candidate(
         coarse, refined, prior, prior_conf, use_prior)
     confidence = float(chosen["confidence"] * (.5 + .5 * meta["valid_ratio"]))
@@ -187,10 +191,11 @@ def main():
     for row in sorted(rows, key=lambda x: x["confidence"])[:a.preview_count]:
         stem, group = row["stem"], row["sequence"]
         rgb, thermal, ir3 = read_modalities(*_paths(root, sample_by_stem[stem]))
-        _, visible, geometry, _ = quality_maps(rgb, thermal, ir3)
+        _, visible, geometry, _, geometry_thermal = quality_maps(
+            rgb, thermal, ir3, return_preprocessed=True)
         params = row["params"]
         image = _preview(
-            rgb, thermal, visible, geometry, params,
+            rgb, geometry_thermal, visible, geometry, params,
             f"{stem} conf={row['confidence']:.3f} seq={group} "
             f"a={params[0]:+.2f} tx={params[1]:+.1f} "
             f"ty={params[2]:+.1f} s={params[3]:.4f}")
@@ -198,7 +203,7 @@ def main():
                     [cv2.IMWRITE_JPEG_QUALITY, 92])
     confidences = np.asarray([r["confidence"] for r in rows])
     summary = {
-        "version": 3, "n_samples": len(rows), "min_confidence": a.min_confidence,
+        "version": 4, "n_samples": len(rows), "min_confidence": a.min_confidence,
         "supervised": int(sum(r["supervised"] for r in rows)),
         "model_contract": {
             "canvas": list(contract_canvas), "angle": a.contract_angle,

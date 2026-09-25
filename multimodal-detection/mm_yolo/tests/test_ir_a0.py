@@ -10,11 +10,47 @@ MM = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(MM))
 
 from ir_a0 import (A0_QUALITY_NAMES, affine_model_contract, border_masks,
-                   load_sample, quality_maps, save_sample,
+                   deghost_for_a0, load_sample, quality_maps, save_sample,
                    select_affine_candidate, source_to_sampling)
 
 
 class IRA0Tests(unittest.TestCase):
+    def test_rgb_ghost_is_detected_and_reduced_before_border_analysis(self):
+        rng = np.random.default_rng(13)
+        h, w = 120, 192
+        rgb = rng.integers(0, 256, (h, w, 3), dtype=np.uint8)
+        rgb = cv2.GaussianBlur(rgb, (0, 0), 1.2)
+        truth = np.full((h, w), 92, np.float32)
+        truth[:, :24] = 4
+        truth[:10] = 4
+        truth[38:83, 72:132] = 145
+        rgbf = rgb.astype(np.float32)
+        rgb_high = rgbf - cv2.GaussianBlur(rgbf, (0, 0), 1.5)
+        ghost = np.einsum(
+            "...c,cd->...d", rgb_high,
+            np.asarray([[.18, .03, .02], [.02, .16, .03], [.03, .02, .17]], np.float32))
+        ir3 = np.clip(np.repeat(truth[..., None], 3, 2) + ghost, 0, 255)
+        observed = np.median(ir3, axis=2).astype(np.float32)
+        clean, _, mask, seed, meta = deghost_for_a0(rgb, observed, ir3)
+        border = seed > .5
+        self.assertGreater(meta["ghost_identity_fit"], meta["ghost_control_fit"])
+        self.assertGreater(meta["ghost_score"], .05)
+        self.assertGreater(float(mask.max()), 0)
+        self.assertLess(float(np.abs(clean[border] - truth[border]).mean()),
+                        float(np.abs(observed[border] - truth[border]).mean()))
+
+    def test_unrelated_rgb_does_not_rewrite_clean_thermal_proxy(self):
+        rng = np.random.default_rng(7)
+        h, w = 96, 160
+        rgb = rng.integers(0, 256, (h, w, 3), dtype=np.uint8)
+        thermal = np.full((h, w), 80, np.float32)
+        thermal[:, :16] = 0
+        thermal[25:70, 55:110] = 132
+        ir3 = np.repeat(thermal[..., None], 3, 2)
+        clean, _, _, _, meta = deghost_for_a0(rgb, thermal, ir3)
+        self.assertLess(meta["ghost_score"], .10)
+        self.assertLess(float(np.abs(clean - thermal).mean()), .1)
+
     def test_border_connected_dark_region_is_masked_but_dark_object_is_not(self):
         image = np.full((96, 160), 100, np.float32)
         image[:, :12] = 0

@@ -21,9 +21,10 @@ try:
 except ImportError:  # tools may import this file as a top-level module
     from io_utils import imread_unicode
 
-# Version 3 includes the model-contract decision in affine supervision.
-# Older v2 caches may contain transforms that the train-time aligner cannot express.
-A0_VERSION = 3
+# Version 4 moves RGB-ghost suppression ahead of final border detection and
+# affine estimation.  The suppression creates an analysis proxy only: source
+# IR pixels are never rewritten or cached as replacement imagery.
+A0_VERSION = 4
 A0_QUALITY_NAMES = (
     "intensity", "local_contrast", "edge", "invalid_border", "saturation",
     "blur", "double_edge", "rgb_leakage", "thermal_confidence",
@@ -73,6 +74,157 @@ def _local_stats(x: np.ndarray, k: int = 15):
     mean = cv2.blur(x, (k, k))
     var = cv2.blur(x * x, (k, k)) - mean * mean
     return mean, np.sqrt(np.maximum(var, 0))
+
+
+def _provisional_dark_border(thermal: np.ndarray):
+    """Return a loose border seed without declaring any pixel invalid.
+
+    RGB leakage may draw texture over the true black frame, so this mask is
+    deliberately high-recall and is used only to calibrate the leakage model.
+    Final border detection is performed after deghosting.
+    """
+    x = thermal.astype(np.float32)
+    h, w = x.shape
+    sigma = max(2.0, min(h, w) / 180.0)
+    smooth = cv2.GaussianBlur(x, (0, 0), sigma)
+    _, std = _local_stats(x, 15)
+    p10, p35 = np.percentile(smooth, (10, 35))
+    cutoff = float(np.clip(p10 + 20.0, 20.0, 80.0))
+    band_size = max(8, round(min(h, w) * .18))
+    band = np.zeros((h, w), np.uint8)
+    band[:band_size] = 1; band[-band_size:] = 1
+    band[:, :band_size] = 1; band[:, -band_size:] = 1
+    candidate = band.astype(bool) & (
+        (smooth <= cutoff) | ((smooth <= p35) & (std < 24.0)))
+    candidate = cv2.morphologyEx(candidate.astype(np.uint8), cv2.MORPH_CLOSE,
+                                 np.ones((9, 9), np.uint8))
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(candidate, 8)
+    seed = np.zeros_like(candidate)
+    min_area = max(64, round(h * w * .00075))
+    for i in range(1, n):
+        xx, yy, ww, hh, area = stats[i]
+        touches = xx == 0 or yy == 0 or xx + ww >= w or yy + hh >= h
+        if touches and area >= min_area:
+            seed[labels == i] = 1
+    # A weak fallback remains a calibration seed, never a crop/invalid mask.
+    if seed.mean() < .004:
+        seed = (band.astype(bool) & (smooth <= p35) & (std < 32.0)).astype(np.uint8)
+    return cv2.dilate(seed, np.ones((5, 5), np.uint8), iterations=1).astype(np.float32)
+
+
+def _shift_image(x: np.ndarray, dx: int, dy: int):
+    h, w = x.shape[:2]
+    return cv2.warpAffine(x, np.asarray([[1, 0, dx], [0, 1, dy]], np.float32),
+                          (w, h), flags=cv2.INTER_LINEAR,
+                          borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+
+def _fit_leakage_regression(rgb_high: np.ndarray, ir_high: np.ndarray,
+                            mask: np.ndarray):
+    """Fit a robust 3x3 RGB-high-frequency to IR-residual mapping."""
+    h, w = mask.shape
+    yy, xx = np.indices((h, w))
+    keep = mask > .5
+    train = keep & (((xx + 2 * yy) % 4) != 0)
+    valid = keep & ~train
+    if train.sum() < 192 or valid.sum() < 64:
+        return np.zeros((3, 3), np.float32), 0.0
+    xt, yt = rgb_high[train], ir_high[train]
+    xv, yv = rgb_high[valid], ir_high[valid]
+    # Bound runtime on full-resolution frames without random sampling.
+    if len(xt) > 60000:
+        stride = int(math.ceil(len(xt) / 60000))
+        xt, yt = xt[::stride], yt[::stride]
+    ridge = np.eye(3, dtype=np.float32) * max(float((xt * xt).sum()) * 1e-6, 1e-4)
+    weight = np.ones(len(xt), np.float32)
+    beta = np.zeros((3, 3), np.float32)
+    for _ in range(4):
+        xw = xt * weight[:, None]
+        beta = np.linalg.solve(xw.T @ xt + ridge, xw.T @ yt).astype(np.float32)
+        residual = yt - xt @ beta
+        norm = np.sqrt(np.square(residual).sum(1))
+        delta = max(float(np.median(norm) * 1.5), .5)
+        weight = np.minimum(1.0, delta / np.maximum(norm, 1e-6)).astype(np.float32)
+    prediction = xv @ beta
+    baseline = float(np.square(yv).mean() + 1e-6)
+    score = float(np.clip(1.0 - np.square(yv - prediction).mean() / baseline, 0, 1))
+    return beta, score
+
+
+def deghost_for_a0(rgb: np.ndarray, thermal: np.ndarray, ir3: np.ndarray):
+    """Build a conservative deghosted proxy used only by offline A0 analysis.
+
+    A real RGB ghost is expected to create a sharp zero-displacement fit.  The
+    fit must outperform deliberately shifted RGB controls before any component
+    is subtracted.  Low-frequency thermal content is preserved.
+    """
+    rgbf = rgb.astype(np.float32)
+    irf = ir3.astype(np.float32)
+    seed = _provisional_dark_border(thermal)
+    sigma = max(1.5, min(thermal.shape) / 320.0)
+    rgb_high = rgbf - cv2.GaussianBlur(rgbf, (0, 0), sigma)
+    ir_high = irf - cv2.GaussianBlur(irf, (0, 0), sigma)
+    # A thermal boundary is normally common to all IR channels, whereas RGB
+    # leakage often carries chroma.  Score chroma separately so a strong frame
+    # edge cannot hide a weak ghost.  Also score an eroded dark interior for
+    # grayscale leakage, where the true thermal signal should be nearly flat.
+    ir_chroma = ir_high - ir_high.mean(2, keepdims=True)
+    fit_seed = cv2.erode((seed > .5).astype(np.uint8),
+                         np.ones((9, 9), np.uint8), iterations=1).astype(np.float32)
+    if fit_seed.sum() < 256:
+        fit_seed = seed
+    beta_chroma, chroma_fit = _fit_leakage_regression(
+        rgb_high, ir_chroma, seed)
+    beta_full, full_fit = _fit_leakage_regression(
+        rgb_high, ir_high, fit_seed)
+    if full_fit >= chroma_fit:
+        beta, identity_fit = beta_full, full_fit
+        fit_target, control_seed = ir_high, fit_seed
+    else:
+        beta, identity_fit = beta_chroma, chroma_fit
+        fit_target, control_seed = ir_chroma, seed
+    offset = max(4, round(min(thermal.shape) * .012))
+    control_fits = []
+    for dx, dy in ((offset, 0), (-offset, 0), (0, offset), (0, -offset)):
+        _, score = _fit_leakage_regression(
+            _shift_image(rgb_high, dx, dy), fit_target, control_seed)
+        control_fits.append(score)
+    control_fit = max(control_fits, default=0.0)
+    specificity = max(0.0, identity_fit - control_fit)
+    coverage = float(np.clip(seed.mean() / .025, 0, 1))
+    presence = float(
+        np.clip((identity_fit - .04) / .30, 0, 1) *
+        np.clip((specificity - .01) / .14, 0, 1) * coverage)
+    prediction = np.einsum("...c,cd->...d", rgb_high, beta).astype(np.float32)
+    seed_values = np.abs(ir_high[seed > .5])
+    cap = max(4.0, float(np.percentile(seed_values, 99)) * 1.5) if seed_values.size else 4.0
+    prediction = np.clip(prediction, -cap, cap)
+    residual = fit_target - prediction
+    pred_mag = np.sqrt(np.square(prediction).mean(2))
+    residual_mag = np.sqrt(np.square(residual).mean(2))
+    local_fit = pred_mag / (pred_mag + residual_mag + 1e-3)
+    positive = pred_mag[pred_mag > 0]
+    magnitude_scale = float(np.percentile(positive, 90)) if positive.size else 1.0
+    strength = float(np.clip((presence - .05) / .45, 0, 1))
+    magnitude = np.clip(pred_mag / max(magnitude_scale, 1e-3), 0, 1)
+    ghost_mask = np.clip(strength * magnitude * local_fit * 1.5, 0, 1).astype(np.float32)
+    clean = np.clip(irf - prediction * (strength * local_fit)[..., None], 0, 255)
+    clean_thermal = np.median(clean, axis=2).astype(np.float32)
+    meta = {
+        "alpha_global": float(np.linalg.norm(beta) / math.sqrt(beta.size)),
+        "leakage_confidence": presence,
+        "chroma_fit_error": float(1.0 - identity_fit),
+        "ghost_score": presence,
+        "ghost_identity_fit": float(identity_fit),
+        "ghost_chroma_fit": float(chroma_fit),
+        "ghost_full_fit": float(full_fit),
+        "ghost_control_fit": float(control_fit),
+        "ghost_specificity": float(specificity),
+        "ghost_seed_ratio": float(seed.mean()),
+        "ghost_mask_ratio": float((ghost_mask > .35).mean()),
+        "deghost_mean_change": float(np.abs(clean_thermal - thermal).mean()),
+    }
+    return clean_thermal, clean.astype(np.float32), ghost_mask, seed, meta
 
 
 def border_masks(thermal: np.ndarray):
@@ -154,31 +306,42 @@ def leakage_maps(rgb: np.ndarray, ir3: np.ndarray, valid: np.ndarray):
 
 
 def quality_maps(rgb: np.ndarray, thermal: np.ndarray, ir3: np.ndarray,
-                 out_hw: tuple[int, int] = (96, 160)):
-    visible, geometry, invalid = border_masks(thermal)
-    mean, std = _local_stats(thermal)
-    edge = _normalized_edge(thermal, geometry)
-    lap = np.abs(cv2.Laplacian(thermal, cv2.CV_32F, ksize=3))
+                 out_hw: tuple[int, int] = (96, 160),
+                 return_preprocessed: bool = False):
+    clean_thermal, clean_ir3, ghost, _, ghost_meta = deghost_for_a0(rgb, thermal, ir3)
+    visible, geometry, invalid = border_masks(clean_thermal)
+    # Strong remaining RGB-explainable pixels must not vote on the transform.
+    ghost_exclude = cv2.dilate((ghost > .45).astype(np.uint8),
+                               np.ones((5, 5), np.uint8), iterations=1)
+    reduced_geometry = geometry * (1 - ghost_exclude.astype(np.float32))
+    if reduced_geometry.mean() >= max(.10, geometry.mean() * .55):
+        geometry = reduced_geometry
+    mean, std = _local_stats(clean_thermal)
+    edge = _normalized_edge(clean_thermal, geometry)
+    lap = np.abs(cv2.Laplacian(clean_thermal, cv2.CV_32F, ksize=3))
     lap_scale = float(np.percentile(lap[geometry > .5], 95)) if np.any(geometry > .5) else 1.0
     sharp = np.clip(lap / max(lap_scale, 1e-6), 0, 1)
     blur = 1 - sharp
     dense_edge = cv2.blur((edge > .25).astype(np.float32), (7, 7))
     double_edge = np.clip(edge * dense_edge * 3, 0, 1)
     saturation = ((mean < 2) | (mean > 253)).astype(np.float32)
-    leak, alpha, leak_conf, fit_err = leakage_maps(rgb, ir3, geometry)
-    thermal_conf = geometry * np.clip(std / 24.0, 0, 1) * (1 - .5 * double_edge)
+    leak = ghost
+    thermal_conf = (geometry * np.clip(std / 24.0, 0, 1) *
+                    (1 - .5 * double_edge) * (1 - .75 * ghost))
     channels = [mean / 255.0, np.clip(std / 64.0, 0, 1), edge, invalid,
                 saturation, blur, double_edge, leak, thermal_conf,
                 np.zeros_like(thermal_conf)]
     oh, ow = out_hw
     q = np.stack([cv2.resize(x.astype(np.float32), (ow, oh), interpolation=cv2.INTER_AREA)
                   for x in channels], 0)
-    return q.astype(np.float32), visible, geometry, {
-        "alpha_global": alpha, "leakage_confidence": leak_conf,
-        "chroma_fit_error": fit_err, "valid_ratio": float(visible.mean()),
-        "ghost_score": float((double_edge * geometry).sum() / max(geometry.sum(), 1)),
+    meta = {
+        **ghost_meta, "valid_ratio": float(visible.mean()),
         "thermal_confidence": float(thermal_conf.sum() / max(geometry.sum(), 1)),
     }
+    result = (q.astype(np.float32), visible, geometry, meta)
+    if return_preprocessed:
+        return (*result, clean_thermal)
+    return result
 
 
 def _resize_work(rgb: np.ndarray, thermal: np.ndarray, geometry: np.ndarray, width: int):
@@ -215,6 +378,70 @@ def _candidate_score(rgb_edge, ir_edge, ir_mask, matrix):
     warped_mask = cv2.warpAffine(ir_mask, matrix, (w, h), flags=cv2.INTER_NEAREST,
                                  borderMode=cv2.BORDER_CONSTANT, borderValue=0)
     return _corr(rgb_edge, warped_edge, warped_mask), warped_mask.mean()
+
+
+def _common_support_metrics(rgb_edge, ir_edge, ir_mask, candidate, baseline):
+    """Compare a candidate with its baseline on exactly the same pixels."""
+    h, w = rgb_edge.shape
+    cand_edge = cv2.warpAffine(ir_edge, candidate, (w, h), flags=cv2.INTER_LINEAR,
+                               borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    cand_mask = cv2.warpAffine(ir_mask, candidate, (w, h), flags=cv2.INTER_NEAREST,
+                               borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    base_edge = cv2.warpAffine(ir_edge, baseline, (w, h), flags=cv2.INTER_LINEAR,
+                               borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    base_mask = cv2.warpAffine(ir_mask, baseline, (w, h), flags=cv2.INTER_NEAREST,
+                               borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    common = ((cand_mask > .5) & (base_mask > .5)).astype(np.float32)
+    cand_score = _corr(rgb_edge, cand_edge, common)
+    base_score = _corr(rgb_edge, base_edge, common)
+    gains, locations = [], []
+    for row in range(3):
+        y0, y1 = round(row * h / 3), round((row + 1) * h / 3)
+        for col in range(3):
+            x0, x1 = round(col * w / 3), round((col + 1) * w / 3)
+            tile = np.zeros_like(common)
+            tile[y0:y1, x0:x1] = common[y0:y1, x0:x1]
+            if tile.sum() < max(96, (y1 - y0) * (x1 - x0) * .08):
+                continue
+            c = _corr(rgb_edge, cand_edge, tile)
+            b = _corr(rgb_edge, base_edge, tile)
+            if c > -1 and b > -1:
+                gains.append(c - b); locations.append((row, col))
+    positive = [loc for gain, loc in zip(gains, locations) if gain > .003]
+    # Sparse, strong RGB edges are a conservative foreground proxy: dense
+    # foliage/road texture is downweighted while isolated people, vehicles and
+    # signs retain a veto over a background-dominated global improvement.
+    edge_seed = (rgb_edge > .20) & (common > .5)
+    foreground_candidate = foreground_baseline = foreground_gain = 0.0
+    foreground_support = 0.0
+    if edge_seed.sum() >= 128:
+        density = cv2.blur(edge_seed.astype(np.float32), (21, 21))
+        density_limit = float(np.percentile(density[edge_seed], 60))
+        sparse = edge_seed & (density <= density_limit) & (rgb_edge > .28)
+        foreground = cv2.dilate(sparse.astype(np.uint8),
+                                np.ones((13, 13), np.uint8), iterations=1)
+        foreground = foreground.astype(np.float32) * common
+        if foreground.sum() >= 128:
+            foreground_candidate = _corr(rgb_edge, cand_edge, foreground)
+            foreground_baseline = _corr(rgb_edge, base_edge, foreground)
+            foreground_gain = foreground_candidate - foreground_baseline
+            foreground_support = float(foreground.mean())
+    return {
+        "candidate_score": float(cand_score),
+        "baseline_score": float(base_score),
+        "gain": float(cand_score - base_score),
+        "support": float(common.mean()),
+        "tile_count": len(gains),
+        "tile_positive": len(positive),
+        "tile_median": float(np.median(gains)) if gains else -1.0,
+        "tile_worst": float(min(gains)) if gains else -1.0,
+        "positive_rows": len({x[0] for x in positive}),
+        "positive_cols": len({x[1] for x in positive}),
+        "foreground_candidate": float(foreground_candidate),
+        "foreground_baseline": float(foreground_baseline),
+        "foreground_gain": float(foreground_gain),
+        "foreground_support": float(foreground_support),
+    }
 
 
 def estimate_affine(rgb: np.ndarray, thermal: np.ndarray, geometry: np.ndarray,
@@ -257,15 +484,122 @@ def estimate_affine(rgb: np.ndarray, thermal: np.ndarray, geometry: np.ndarray,
                                (m[0, 2] - affine_matrix(angle, 0, 0, scale, (h, w))[0, 2]) / work_scale,
                                (m[1, 2] - affine_matrix(angle, 0, 0, scale, (h, w))[1, 2]) / work_scale,
                                scale, m))
+    # Phase correlation can lock onto a dominant background edge.  Give the
+    # translation-only mode an explicit bounded grid so a small correction can
+    # compete with a saturated phase-correlation shift.
+    translation_base = affine_matrix(
+        float(base[0]), float(base[1] * work_scale),
+        float(base[2] * work_scale), float(base[3]), (h, w))
+    small_shift = min(max_shift, cfg.residual_shift_px * work_scale)
+    grid_step = max(.75, small_shift / 4.0)
+    grid = np.arange(-small_shift, small_shift + .5 * grid_step, grid_step)
+    for dx in grid:
+        for dy in grid:
+            m = translation_base.copy(); m[:, 2] += (float(dx), float(dy))
+            score, support = _candidate_score(re, ie, vm, m)
+            score = score * math.sqrt(max(support, 1e-4))
+            candidates.append((score, 0.0, float(base[0]),
+                               float(base[1] + dx / work_scale),
+                               float(base[2] + dy / work_scale),
+                               float(base[3]), m))
     candidates.sort(key=lambda x: x[0], reverse=True)
-    best = candidates[0]
-    second = candidates[min(len(candidates) - 1, max(1, len(candidates) // 20))]
     identity = affine_matrix(float(base[0]), float(base[1] * work_scale),
                              float(base[2] * work_scale), float(base[3]), (h, w))
-    identity_score, _ = _candidate_score(re, ie, vm, identity)
-    improvement = best[0] - identity_score
-    uniqueness = best[0] - second[0]
-    absolute = float(np.clip((best[0] - .08) / .32, 0, 1))
+    angle_eps = max(angle_step * .55, .06)
+    scale_eps = max(scale_step * .55, .0015)
+    grouped = {"translation": [], "wide_translation": [], "rigid": [], "full": []}
+    for item in candidates:
+        da, ds = abs(item[2] - base[0]), abs(item[5] - base[3])
+        shift_delta = max(abs(item[3] - base[1]), abs(item[4] - base[2]))
+        if da <= angle_eps and ds <= scale_eps:
+            mode = ("translation" if shift_delta <= cfg.residual_shift_px * 1.05
+                    else "wide_translation")
+        else:
+            mode = "rigid" if ds <= scale_eps else "full"
+        if len(grouped[mode]) < 12:
+            grouped[mode].append(item)
+    policies = {
+        "translation": {"min_gain": .025, "min_tiles": 2, "worst": -.070,
+                        "penalty": .004, "spread": 1},
+        "wide_translation": {"min_gain": .060, "min_tiles": 4, "worst": -.020,
+                             "penalty": .025, "spread": 2},
+        "rigid": {"min_gain": .020, "min_tiles": 3, "worst": -.035,
+                  "penalty": .015, "spread": 2},
+        "full": {"min_gain": .040, "min_tiles": 4, "worst": -.025,
+                 "penalty": .020, "spread": 2},
+    }
+    accepted, diagnostics = [], {}
+    for mode, items in grouped.items():
+        best_mode = None
+        for item in items:
+            metrics = _common_support_metrics(re, ie, vm, item[6], identity)
+            policy = policies[mode]
+            extra = 0.0
+            if mode != "translation" and abs(item[2] - base[0]) > 1.5:
+                extra += .008
+            if mode == "full" and abs(item[5] - base[3]) > .015:
+                extra += .008
+            if mode == "full" and abs(item[5] - base[3]) >= .90 * scale_lim:
+                extra += .025
+            if metrics["baseline_score"] >= .35:
+                if mode in ("translation", "wide_translation"):
+                    extra += .040
+                elif mode == "rigid":
+                    extra += .040
+                elif mode == "full":
+                    extra += .045
+            shift_work = np.hypot((item[3] - base[1]) * work_scale,
+                                  (item[4] - base[2]) * work_scale)
+            if shift_work > .85 * max_shift:
+                extra += .010
+            worst_limit = policy["worst"]
+            if (mode == "full" and metrics["foreground_gain"] > .08 and
+                    metrics["tile_positive"] >= 8):
+                worst_limit = -.18
+            passes = (
+                metrics["candidate_score"] >= .10 and
+                metrics["gain"] >= policy["min_gain"] + extra and
+                metrics["tile_positive"] >= policy["min_tiles"] and
+                metrics["tile_median"] >= 0 and
+                metrics["tile_worst"] >= worst_limit and
+                max(metrics["positive_rows"], metrics["positive_cols"]) >=
+                policy["spread"])
+            objective = metrics["candidate_score"] - policy["penalty"]
+            record = (objective, item, metrics, passes, mode)
+            if best_mode is None or objective > best_mode[0]:
+                best_mode = record
+            if passes:
+                accepted.append(record)
+        if best_mode is not None:
+            item, metrics = best_mode[1], best_mode[2]
+            diagnostics[mode] = {
+                "params": [float(item[2]), float(item[3]), float(item[4]), float(item[5])],
+                **metrics, "accepted": bool(best_mode[3]),
+            }
+    if accepted:
+        accepted.sort(key=lambda x: x[0], reverse=True)
+        _, best, best_metrics, _, selected_mode = accepted[0]
+    else:
+        identity_score, identity_support = _candidate_score(re, ie, vm, identity)
+        best = (identity_score * math.sqrt(max(identity_support, 1e-4)), 0.0,
+                float(base[0]), float(base[1]), float(base[2]), float(base[3]), identity)
+        best_metrics = {
+            "candidate_score": float(identity_score), "baseline_score": float(identity_score),
+            "gain": 0.0, "support": float(identity_support), "tile_count": 0,
+            "tile_positive": 0, "tile_median": 0.0, "tile_worst": 0.0,
+            "positive_rows": 0, "positive_cols": 0,
+            "foreground_candidate": float(identity_score),
+            "foreground_baseline": float(identity_score),
+            "foreground_gain": 0.0, "foreground_support": 0.0,
+        }
+        selected_mode = "identity"
+    alternatives = sorted((x[1][0] for x in accepted
+                           if x[1] is not best), reverse=True)
+    identity_score = best_metrics["baseline_score"]
+    improvement = best_metrics["gain"]
+    uniqueness = max(0.0, best_metrics["candidate_score"] -
+                     (alternatives[0] if alternatives else identity_score))
+    absolute = float(np.clip((best_metrics["candidate_score"] - .08) / .32, 0, 1))
     identity_delta = np.asarray(
         [best[2] - base[0], best[3] - base[1], best[4] - base[2],
          (best[5] - base[3]) * 100], np.float32)
@@ -277,7 +611,7 @@ def estimate_affine(rgb: np.ndarray, thermal: np.ndarray, geometry: np.ndarray,
     # requiring improvement over identity makes exact registration impossible
     # to supervise.  Non-identity corrections still need a unique improvement;
     # low absolute cross-modal correlation remains explicitly unsupervised.
-    correction_evidence = float(np.clip((improvement + .005) / .06, 0, 1) *
+    correction_evidence = float(np.clip((improvement + .002) / .06, 0, 1) *
                                 np.clip((uniqueness + .001) / .02, 0, 1))
     identity_evidence = near_prior * float(np.clip((identity_score - .10) / .25, 0, 1))
     confidence = absolute * max(identity_evidence, correction_evidence)
@@ -286,6 +620,11 @@ def estimate_affine(rgb: np.ndarray, thermal: np.ndarray, geometry: np.ndarray,
         "score": float(best[0]), "identity_score": float(identity_score),
         "improvement": float(improvement), "uniqueness": float(uniqueness),
         "phase_response": float(best[1]), "confidence": confidence,
+        "selected_mode": selected_mode, "mode_diagnostics": diagnostics,
+        "common_support": float(best_metrics["support"]),
+        "tile_positive": int(best_metrics["tile_positive"]),
+        "tile_median_gain": float(best_metrics["tile_median"]),
+        "tile_worst_gain": float(best_metrics["tile_worst"]),
     }
 
 
