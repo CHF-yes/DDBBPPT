@@ -9,9 +9,10 @@ import numpy as np
 MM = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(MM))
 
-from ir_a0 import (A0_QUALITY_NAMES, affine_model_contract, border_masks,
-                   deghost_for_a0, load_sample, quality_maps, save_sample,
-                   select_affine_candidate, source_to_sampling)
+from ir_a0 import (A0_QUALITY_NAMES, SearchCfg, affine_model_contract,
+                   border_masks, deghost_for_a0, estimate_affine, load_sample,
+                   quality_maps, save_sample, select_affine_candidate,
+                   source_to_sampling)
 
 
 class IRA0Tests(unittest.TestCase):
@@ -31,13 +32,13 @@ class IRA0Tests(unittest.TestCase):
             np.asarray([[.18, .03, .02], [.02, .16, .03], [.03, .02, .17]], np.float32))
         ir3 = np.clip(np.repeat(truth[..., None], 3, 2) + ghost, 0, 255)
         observed = np.median(ir3, axis=2).astype(np.float32)
-        clean, _, mask, seed, meta = deghost_for_a0(rgb, observed, ir3)
-        border = seed > .5
+        clean, _, mask, support, meta = deghost_for_a0(rgb, observed, ir3)
+        fitted = support > .5
         self.assertGreater(meta["ghost_identity_fit"], meta["ghost_control_fit"])
         self.assertGreater(meta["ghost_score"], .05)
         self.assertGreater(float(mask.max()), 0)
-        self.assertLess(float(np.abs(clean[border] - truth[border]).mean()),
-                        float(np.abs(observed[border] - truth[border]).mean()))
+        self.assertLess(float(np.abs(clean[fitted] - truth[fitted]).mean()),
+                        float(np.abs(observed[fitted] - truth[fitted]).mean()))
 
     def test_unrelated_rgb_does_not_rewrite_clean_thermal_proxy(self):
         rng = np.random.default_rng(7)
@@ -51,15 +52,33 @@ class IRA0Tests(unittest.TestCase):
         self.assertLess(meta["ghost_score"], .10)
         self.assertLess(float(np.abs(clean - thermal).mean()), .1)
 
-    def test_border_connected_dark_region_is_masked_but_dark_object_is_not(self):
-        image = np.full((96, 160), 100, np.float32)
-        image[:, :12] = 0
-        image[35:60, 70:95] = 0
+    def test_polygon_exterior_is_masked_but_dark_object_inside_is_not(self):
+        image = np.full((120, 192), 4, np.float32)
+        polygon = np.asarray([[18, 12], [178, 18], [170, 108], [12, 102]], np.int32)
+        cv2.fillConvexPoly(image, polygon, 100)
+        image[45:72, 78:108] = 0
         visible, geometry, invalid = border_masks(image)
-        self.assertGreater(float(invalid[:, :8].mean()), .9)
-        self.assertLess(float(invalid[40:55, 75:90].mean()), .1)
-        self.assertLess(float(geometry[:, :12].mean()), .1)
-        self.assertGreater(float(visible[40:55, 75:90].mean()), .9)
+        self.assertGreater(float(invalid[:6, :6].mean()), .9)
+        self.assertLess(float(invalid[50:65, 85:100].mean()), .1)
+        self.assertLess(float(geometry[:8, :8].mean()), .1)
+        self.assertGreater(float(visible[50:65, 85:100].mean()), .9)
+
+    def test_wide_rotation_search_exceeds_old_three_degree_limit(self):
+        h, w = 160, 240
+        gray = np.zeros((h, w), np.uint8)
+        cv2.rectangle(gray, (34, 28), (198, 126), 120, 3)
+        cv2.line(gray, (45, 115), (184, 42), 230, 4)
+        cv2.circle(gray, (150, 92), 22, 180, 3)
+        rgb = np.repeat(gray[..., None], 3, 2)
+        source_to_rgb = cv2.getRotationMatrix2D(((w - 1) / 2, (h - 1) / 2),
+                                                16.0, 1.0)
+        rgb_to_source = cv2.invertAffineTransform(source_to_rgb)
+        thermal = cv2.warpAffine(gray, rgb_to_source, (w, h),
+                                 borderMode=cv2.BORDER_CONSTANT, borderValue=0).astype(np.float32)
+        result = estimate_affine(rgb, thermal, np.ones((h, w), np.float32),
+                                 SearchCfg(work_width=w, angle_step=4.0))
+        self.assertGreater(abs(float(result["params"][0])), 8.0)
+        self.assertLess(abs(float(result["params"][0]) - 16.0), 1.5)
 
     def test_quality_contract_and_cache_roundtrip(self):
         rgb = np.zeros((72, 128, 3), np.uint8)

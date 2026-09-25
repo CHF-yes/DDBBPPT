@@ -24,7 +24,7 @@ except ImportError:  # tools may import this file as a top-level module
 # Version 4 moves RGB-ghost suppression ahead of final border detection and
 # affine estimation.  The suppression creates an analysis proxy only: source
 # IR pixels are never rewritten or cached as replacement imagery.
-A0_VERSION = 4
+A0_VERSION = 5
 A0_QUALITY_NAMES = (
     "intensity", "local_contrast", "edge", "invalid_border", "saturation",
     "blur", "double_edge", "rgb_leakage", "thermal_confidence",
@@ -35,12 +35,14 @@ A0_QUALITY_NAMES = (
 @dataclass(frozen=True)
 class SearchCfg:
     work_width: int = 480
-    angle_limit: float = 3.0
-    angle_step: float = 0.25
+    angle_limit: float = 25.0
+    angle_step: float = 2.0
+    refine_angle_step: float = 0.5
+    fine_angle_step: float = 0.125
     scale_limit: float = 0.03
     scale_step: float = 0.01
     max_shift_frac: float = 0.02
-    residual_angle: float = 0.75
+    residual_angle: float = 4.0
     residual_scale: float = 0.005
     residual_shift_px: float = 12.0
     min_confidence: float = 0.45
@@ -76,40 +78,21 @@ def _local_stats(x: np.ndarray, k: int = 15):
     return mean, np.sqrt(np.maximum(var, 0))
 
 
-def _provisional_dark_border(thermal: np.ndarray):
-    """Return a loose border seed without declaring any pixel invalid.
-
-    RGB leakage may draw texture over the true black frame, so this mask is
-    deliberately high-recall and is used only to calibrate the leakage model.
-    Final border detection is performed after deghosting.
-    """
-    x = thermal.astype(np.float32)
-    h, w = x.shape
-    sigma = max(2.0, min(h, w) / 180.0)
-    smooth = cv2.GaussianBlur(x, (0, 0), sigma)
-    _, std = _local_stats(x, 15)
-    p10, p35 = np.percentile(smooth, (10, 35))
-    cutoff = float(np.clip(p10 + 20.0, 20.0, 80.0))
-    band_size = max(8, round(min(h, w) * .18))
-    band = np.zeros((h, w), np.uint8)
-    band[:band_size] = 1; band[-band_size:] = 1
-    band[:, :band_size] = 1; band[:, -band_size:] = 1
-    candidate = band.astype(bool) & (
-        (smooth <= cutoff) | ((smooth <= p35) & (std < 24.0)))
-    candidate = cv2.morphologyEx(candidate.astype(np.uint8), cv2.MORPH_CLOSE,
-                                 np.ones((9, 9), np.uint8))
-    n, labels, stats, _ = cv2.connectedComponentsWithStats(candidate, 8)
-    seed = np.zeros_like(candidate)
-    min_area = max(64, round(h * w * .00075))
-    for i in range(1, n):
-        xx, yy, ww, hh, area = stats[i]
-        touches = xx == 0 or yy == 0 or xx + ww >= w or yy + hh >= h
-        if touches and area >= min_area:
-            seed[labels == i] = 1
-    # A weak fallback remains a calibration seed, never a crop/invalid mask.
-    if seed.mean() < .004:
-        seed = (band.astype(bool) & (smooth <= p35) & (std < 32.0)).astype(np.uint8)
-    return cv2.dilate(seed, np.ones((5, 5), np.uint8), iterations=1).astype(np.float32)
+def _ghost_fit_support(rgb_high: np.ndarray):
+    """Select distributed RGB detail without making any black-frame guess."""
+    energy = np.sqrt(np.square(rgb_high).mean(2))
+    positive = energy[energy > 0]
+    if positive.size == 0:
+        return np.ones(energy.shape, np.float32)
+    cutoff = float(np.percentile(positive, 55))
+    support = (energy >= cutoff).astype(np.uint8)
+    support = cv2.morphologyEx(support, cv2.MORPH_OPEN,
+                               np.ones((3, 3), np.uint8))
+    # Keep support spatially distributed.  This is a ghost-fitting mask, not a
+    # border mask, and therefore deliberately spans the complete image.
+    if support.mean() < .05:
+        support = (energy >= np.percentile(positive, 35)).astype(np.uint8)
+    return support.astype(np.float32)
 
 
 def _shift_image(x: np.ndarray, dx: int, dy: int):
@@ -160,44 +143,41 @@ def deghost_for_a0(rgb: np.ndarray, thermal: np.ndarray, ir3: np.ndarray):
     """
     rgbf = rgb.astype(np.float32)
     irf = ir3.astype(np.float32)
-    seed = _provisional_dark_border(thermal)
     sigma = max(1.5, min(thermal.shape) / 320.0)
     rgb_high = rgbf - cv2.GaussianBlur(rgbf, (0, 0), sigma)
     ir_high = irf - cv2.GaussianBlur(irf, (0, 0), sigma)
+    support = _ghost_fit_support(rgb_high)
     # A thermal boundary is normally common to all IR channels, whereas RGB
-    # leakage often carries chroma.  Score chroma separately so a strong frame
-    # edge cannot hide a weak ghost.  Also score an eroded dark interior for
-    # grayscale leakage, where the true thermal signal should be nearly flat.
+    # leakage often carries chroma.  Score chroma separately.  No black-frame
+    # estimate is allowed here: ghost removal must precede the one and only
+    # polygon-frame detection pass.
     ir_chroma = ir_high - ir_high.mean(2, keepdims=True)
-    fit_seed = cv2.erode((seed > .5).astype(np.uint8),
-                         np.ones((9, 9), np.uint8), iterations=1).astype(np.float32)
-    if fit_seed.sum() < 256:
-        fit_seed = seed
     beta_chroma, chroma_fit = _fit_leakage_regression(
-        rgb_high, ir_chroma, seed)
+        rgb_high, ir_chroma, support)
     beta_full, full_fit = _fit_leakage_regression(
-        rgb_high, ir_high, fit_seed)
+        rgb_high, ir_high, support)
     if full_fit >= chroma_fit:
         beta, identity_fit = beta_full, full_fit
-        fit_target, control_seed = ir_high, fit_seed
+        fit_target = ir_high
     else:
         beta, identity_fit = beta_chroma, chroma_fit
-        fit_target, control_seed = ir_chroma, seed
+        fit_target = ir_chroma
     offset = max(4, round(min(thermal.shape) * .012))
     control_fits = []
     for dx, dy in ((offset, 0), (-offset, 0), (0, offset), (0, -offset)):
         _, score = _fit_leakage_regression(
-            _shift_image(rgb_high, dx, dy), fit_target, control_seed)
+            _shift_image(rgb_high, dx, dy), fit_target, support)
         control_fits.append(score)
     control_fit = max(control_fits, default=0.0)
     specificity = max(0.0, identity_fit - control_fit)
-    coverage = float(np.clip(seed.mean() / .025, 0, 1))
+    coverage = float(np.clip(support.mean() / .12, 0, 1))
     presence = float(
         np.clip((identity_fit - .04) / .30, 0, 1) *
         np.clip((specificity - .01) / .14, 0, 1) * coverage)
     prediction = np.einsum("...c,cd->...d", rgb_high, beta).astype(np.float32)
-    seed_values = np.abs(ir_high[seed > .5])
-    cap = max(4.0, float(np.percentile(seed_values, 99)) * 1.5) if seed_values.size else 4.0
+    support_values = np.abs(ir_high[support > .5])
+    cap = (max(4.0, float(np.percentile(support_values, 99)) * 1.5)
+           if support_values.size else 4.0)
     prediction = np.clip(prediction, -cap, cap)
     residual = fit_target - prediction
     pred_mag = np.sqrt(np.square(prediction).mean(2))
@@ -220,55 +200,102 @@ def deghost_for_a0(rgb: np.ndarray, thermal: np.ndarray, ir3: np.ndarray):
         "ghost_full_fit": float(full_fit),
         "ghost_control_fit": float(control_fit),
         "ghost_specificity": float(specificity),
-        "ghost_seed_ratio": float(seed.mean()),
+        "ghost_seed_ratio": float(support.mean()),
         "ghost_mask_ratio": float((ghost_mask > .35).mean()),
         "deghost_mean_change": float(np.abs(clean_thermal - thermal).mean()),
     }
-    return clean_thermal, clean.astype(np.float32), ghost_mask, seed, meta
+    return clean_thermal, clean.astype(np.float32), ghost_mask, support, meta
 
 
 def border_masks(thermal: np.ndarray):
-    """Return visible and conservative geometry masks.
+    """Detect the single straight-edged polygon enclosing useful IR content.
 
-    Darkness alone is not invalid.  A candidate must be low-texture and
-    connected to the image boundary, preventing ordinary dark objects from
-    being removed.
+    The black frame is the dark, low-information exterior *outside* that
+    polygon.  Ordinary dark objects inside the polygon remain valid.
     """
-    mean, std = _local_stats(thermal, 15)
-    low = min(12.0, float(np.percentile(thermal, 2)) + 3.0)
-    high = max(243.0, float(np.percentile(thermal, 98)) - 3.0)
-    # A local mean smears a narrow registration border with adjacent scene
-    # content and detects only its outer half.  Include raw extreme pixels when
-    # their neighbourhood is still low texture, then retain *only* components
-    # connected to an image boundary below.  Thus an interior black object is
-    # never removed merely because it is dark.
-    smooth_extreme = ((mean <= low) | (mean >= high)) & (std < 5.0)
-    raw_extreme = (thermal <= low) | (thermal >= high)
-    candidate = (smooth_extreme | raw_extreme).astype(np.uint8)
-    candidate = cv2.morphologyEx(candidate, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
-    n, labels, stats, _ = cv2.connectedComponentsWithStats(candidate, 8)
-    invalid = np.zeros_like(candidate)
-    h, w = candidate.shape
-    min_area = max(32, round(h * w * 0.0005))
+    x = thermal.astype(np.float32)
+    h, w = x.shape
+    smooth = cv2.GaussianBlur(x, (0, 0), max(1.2, min(h, w) / 420.0))
+    _, std = _local_stats(smooth, 11)
+    band_width = max(3, round(min(h, w) * .025))
+    border_band = np.zeros((h, w), np.uint8)
+    border_band[:band_width] = 1; border_band[-band_width:] = 1
+    border_band[:, :band_width] = 1; border_band[:, -band_width:] = 1
+    border_values = smooth[border_band > 0]
+    central = smooth[h // 4: max(h // 4 + 1, 3 * h // 4),
+                     w // 4: max(w // 4 + 1, 3 * w // 4)]
+    exterior_level = float(np.median(border_values))
+    interior_level = float(np.median(central)) if central.size else float(np.median(smooth))
+    contrast = interior_level - exterior_level
+    if contrast < 4.0:
+        valid = np.ones((h, w), np.float32)
+        return valid, valid.copy(), np.zeros((h, w), np.float32)
+
+    threshold = float(min(exterior_level + max(3.0, .35 * contrast),
+                          np.percentile(smooth, 42)))
+    dark = ((smooth <= threshold) &
+            ((std <= max(10.0, np.percentile(std, 65))) |
+             (smooth <= exterior_level + 2.0))).astype(np.uint8)
+    dark = cv2.morphologyEx(dark, cv2.MORPH_CLOSE,
+                            np.ones((7, 7), np.uint8))
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(dark, 8)
+    exterior = np.zeros_like(dark)
     for i in range(1, n):
-        x, y, ww, hh, area = stats[i]
-        touches = x == 0 or y == 0 or x + ww >= w or y + hh >= h
-        if touches and area >= min_area:
-            invalid[labels == i] = 1
-    invalid = cv2.morphologyEx(invalid, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
-    visible = 1 - cv2.dilate(invalid, np.ones((3, 3), np.uint8), iterations=1)
-    geometry = cv2.erode(visible, np.ones((7, 7), np.uint8), iterations=1)
+        xx, yy, ww, hh, area = stats[i]
+        if xx == 0 or yy == 0 or xx + ww >= w or yy + hh >= h:
+            exterior[labels == i] = 1
+    exterior = cv2.morphologyEx(exterior, cv2.MORPH_CLOSE,
+                                np.ones((11, 11), np.uint8))
+    if exterior.mean() < .008:
+        valid = np.ones((h, w), np.float32)
+        return valid, valid.copy(), np.zeros((h, w), np.float32)
+
+    content = (1 - exterior).astype(np.uint8)
+    contours, _ = cv2.findContours(content, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        valid = np.ones((h, w), np.float32)
+        return valid, valid.copy(), np.zeros((h, w), np.float32)
+    contour = max(contours, key=cv2.contourArea)
+    area_ratio = cv2.contourArea(contour) / max(float(h * w), 1.0)
+    if not .25 <= area_ratio <= .995:
+        valid = np.ones((h, w), np.float32)
+        return valid, valid.copy(), np.zeros((h, w), np.float32)
+    hull = cv2.convexHull(contour)
+    perimeter = cv2.arcLength(hull, True)
+    polygon = cv2.approxPolyDP(hull, max(1.5, .012 * perimeter), True)
+    if len(polygon) < 4 or len(polygon) > 12:
+        polygon = cv2.approxPolyDP(hull, max(2.0, .025 * perimeter), True)
+    if len(polygon) < 4:
+        valid = np.ones((h, w), np.float32)
+        return valid, valid.copy(), np.zeros((h, w), np.float32)
+
+    visible = np.zeros((h, w), np.uint8)
+    cv2.fillPoly(visible, [polygon], 1)
+    invalid = 1 - visible
+    # The straight frame line itself is not a scene edge.  Remove a guard band
+    # on its inner side before any Sobel or phase-correlation calculation.
+    guard = max(5, round(min(h, w) * .012))
+    geometry = cv2.erode(visible, np.ones((guard, guard), np.uint8), iterations=1)
     return visible.astype(np.float32), geometry.astype(np.float32), invalid.astype(np.float32)
 
 
 def _normalized_edge(gray: np.ndarray, valid: Optional[np.ndarray] = None):
     x = gray.astype(np.float32)
+    safe = None
+    if valid is not None:
+        valid8 = (valid > .5).astype(np.uint8)
+        if valid8.mean() > .05 and valid8.mean() < .999:
+            outside = ((1 - valid8) * 255).astype(np.uint8)
+            x = cv2.inpaint(np.clip(x, 0, 255).astype(np.uint8), outside,
+                            3, cv2.INPAINT_TELEA).astype(np.float32)
+        safe = cv2.erode(valid8, np.ones((3, 3), np.uint8), iterations=1)
     x = cv2.GaussianBlur(x, (5, 5), 0)
     gx = cv2.Sobel(x, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(x, cv2.CV_32F, 0, 1, ksize=3)
     edge = cv2.magnitude(gx, gy)
-    if valid is not None:
-        edge *= valid.astype(np.float32)
+    if safe is not None:
+        edge *= safe.astype(np.float32)
     scale = float(np.percentile(edge[edge > 0], 95)) if np.any(edge > 0) else 1.0
     return np.clip(edge / max(scale, 1e-6), 0, 1)
 
@@ -444,8 +471,8 @@ def _common_support_metrics(rgb_edge, ir_edge, ir_mask, candidate, baseline):
     }
 
 
-def estimate_affine(rgb: np.ndarray, thermal: np.ndarray, geometry: np.ndarray,
-                    cfg: SearchCfg, prior: Optional[Sequence[float]] = None):
+def _estimate_affine_v4(rgb: np.ndarray, thermal: np.ndarray, geometry: np.ndarray,
+                        cfg: SearchCfg, prior: Optional[Sequence[float]] = None):
     """Estimate an IR-source -> RGB-destination OpenCV affine candidate.
 
     The cache writer inverts it before storage because the model consumes a
@@ -628,6 +655,225 @@ def estimate_affine(rgb: np.ndarray, thermal: np.ndarray, geometry: np.ndarray,
     }
 
 
+def estimate_affine(rgb: np.ndarray, thermal: np.ndarray, geometry: np.ndarray,
+                    cfg: SearchCfg, prior: Optional[Sequence[float]] = None):
+    """Search raw and old-A0 baselines with a hierarchical +/-25 degree range."""
+    rg, th, vm, work_scale = _resize_work(rgb, thermal, geometry, cfg.work_width)
+    re, ie = _normalized_edge(rg), _normalized_edge(th, vm)
+    h, w = re.shape
+    raw = np.asarray((0., 0., 0., 1.), np.float32)
+    old = np.asarray(prior if prior is not None else raw, np.float32).copy()
+    old[0] = np.clip(old[0], -cfg.angle_limit, cfg.angle_limit)
+    old[3] = np.clip(old[3], 1.0 - cfg.scale_limit, 1.0 + cfg.scale_limit)
+
+    def make_matrix(params):
+        return affine_matrix(float(params[0]), float(params[1] * work_scale),
+                             float(params[2] * work_scale), float(params[3]),
+                             (h, w))
+
+    def evaluate(params, origin, mode, response=0.0):
+        params = np.asarray(params, np.float32)
+        matrix = make_matrix(params)
+        score, support = _candidate_score(re, ie, vm, matrix)
+        return {
+            "params": params, "origin": np.asarray(origin, np.float32),
+            "mode": mode, "matrix": matrix, "score": float(score),
+            "support": float(support), "rank": float(
+                score * math.sqrt(max(support, 1e-4))),
+            "response": float(response),
+        }
+
+    max_shift = max(cfg.residual_shift_px * work_scale,
+                    cfg.max_shift_frac * max(h, w))
+
+    def phase_item(angle, scale, tx, ty, origin, mode):
+        m0 = affine_matrix(float(angle), float(tx * work_scale),
+                           float(ty * work_scale), float(scale), (h, w))
+        rotated = cv2.warpAffine(ie, m0, (w, h), flags=cv2.INTER_LINEAR,
+                                 borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        mask0 = cv2.warpAffine(vm, m0, (w, h), flags=cv2.INTER_NEAREST,
+                              borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        try:
+            shift, response = cv2.phaseCorrelate(
+                (rotated * mask0).astype(np.float32),
+                (re * mask0).astype(np.float32))
+        except cv2.error:
+            shift, response = (0., 0.), 0.
+        dx = float(np.clip(shift[0], -max_shift, max_shift))
+        dy = float(np.clip(shift[1], -max_shift, max_shift))
+        return evaluate((angle, tx + dx / work_scale,
+                         ty + dy / work_scale, scale),
+                        origin, mode, response)
+
+    raw_item = evaluate(raw, raw, "raw")
+    old_item = evaluate(old, old, "old_a0")
+    distinct_old = bool(prior is not None and np.max(np.abs(old - raw)) > 1e-4)
+    simple = (old_item if distinct_old and
+              old_item["score"] > raw_item["score"] + .010 else raw_item)
+    simple_score = float(simple["score"])
+    candidates = []
+
+    # Explicit translation-only candidates prevent angle/scale drift when only
+    # tx/ty is needed.  Both raw and the old A0 receive the same opportunity.
+    shift = max(1.0, cfg.residual_shift_px * work_scale)
+    step = max(.75, shift / 4.0)
+    grid = np.arange(-shift, shift + .5 * step, step)
+    bases = [(raw, "raw_translation")]
+    if distinct_old:
+        bases.append((old, "old_translation"))
+    for base, mode in bases:
+        for dx in grid:
+            for dy in grid:
+                candidates.append(evaluate(
+                    (base[0], base[1] + dx / work_scale,
+                     base[2] + dy / work_scale, base[3]), base, mode))
+
+    # Dense residual search around the old A0.
+    if distinct_old:
+        lo = max(-cfg.angle_limit, float(old[0] - cfg.residual_angle))
+        hi = min(cfg.angle_limit, float(old[0] + cfg.residual_angle))
+        for angle in np.arange(lo, hi + 1e-6, cfg.refine_angle_step):
+            candidates.append(phase_item(angle, old[3], old[1], old[2],
+                                         old, "old_rigid"))
+
+    # Wide raw rescue: coarse +/-25 degrees, then two local refinements.
+    broad = []
+    angles = list(np.arange(-cfg.angle_limit, cfg.angle_limit + 1e-6,
+                            cfg.angle_step)) + [0.0, float(old[0])]
+    for angle in sorted(set(round(float(x), 4) for x in angles)):
+        # Translation-only is already covered by the bounded explicit grid.
+        # Do not let an angle-zero phase estimate jump to its shift boundary.
+        if abs(angle) < cfg.fine_angle_step:
+            continue
+        item = phase_item(angle, 1.0, 0.0, 0.0, raw, "raw_rescue")
+        candidates.append(item); broad.append(item)
+    refined = []
+    for seed in sorted(broad, key=lambda x: x["rank"], reverse=True)[:6]:
+        centre = float(seed["params"][0])
+        for angle in np.arange(max(-cfg.angle_limit, centre - cfg.angle_step),
+                               min(cfg.angle_limit, centre + cfg.angle_step) + 1e-6,
+                               cfg.refine_angle_step):
+            item = phase_item(angle, 1.0, 0.0, 0.0, raw, "raw_rescue")
+            candidates.append(item); refined.append(item)
+    for seed in sorted(refined, key=lambda x: x["rank"], reverse=True)[:4]:
+        centre = float(seed["params"][0])
+        for angle in np.arange(max(-cfg.angle_limit, centre - cfg.refine_angle_step),
+                               min(cfg.angle_limit, centre + cfg.refine_angle_step) + 1e-7,
+                               cfg.fine_angle_step):
+            candidates.append(phase_item(angle, 1.0, 0.0, 0.0,
+                                         raw, "raw_rescue"))
+
+    # Scale is only opened after a rigid candidate is already competitive.
+    rigid = [x for x in candidates if x["mode"] in ("old_rigid", "raw_rescue")]
+    for seed in sorted(rigid, key=lambda x: x["rank"], reverse=True)[:6]:
+        origin = seed["origin"]
+        for scale in np.arange(1.0 - cfg.scale_limit,
+                               1.0 + cfg.scale_limit + 1e-7, cfg.scale_step):
+            if abs(float(scale) - float(seed["params"][3])) < .005:
+                continue
+            mode = "old_full" if seed["mode"] == "old_rigid" else "raw_full"
+            candidates.append(phase_item(float(seed["params"][0]), scale,
+                                         float(origin[1]), float(origin[2]),
+                                         origin, mode))
+
+    policies = {
+        "raw_translation": (.025, 2, -.070, 1, .004),
+        "old_translation": (.018, 2, -.060, 1, .004),
+        "old_rigid": (.025, 3, -.035, 2, .015),
+        "raw_rescue": (.040, 4, -.025, 2, .018),
+        "old_full": (.040, 4, -.025, 2, .022),
+        "raw_full": (.045, 4, -.020, 2, .024),
+    }
+    grouped = {name: [] for name in policies}
+    for item in sorted(candidates, key=lambda x: x["rank"], reverse=True):
+        if len(grouped[item["mode"]]) < 16:
+            grouped[item["mode"]].append(item)
+
+    accepted, diagnostics = [], {}
+    for mode, items in grouped.items():
+        min_gain, min_tiles, worst, spread, penalty = policies[mode]
+        best_mode = None
+        for item in items:
+            metrics = _common_support_metrics(
+                re, ie, vm, item["matrix"], make_matrix(item["origin"]))
+            large = abs(float(item["params"][0] - item["origin"][0])) > 8.0
+            tiles = max(min_tiles, 5 if large else 0)
+            shift_delta = np.hypot(
+                float(item["params"][1] - item["origin"][1]) * work_scale,
+                float(item["params"][2] - item["origin"][2]) * work_scale)
+            shift_saturated = shift_delta >= .95 * max_shift
+            scale_saturated = (mode.endswith("full") and
+                               abs(float(item["params"][3]) - 1.0) >=
+                               .95 * cfg.scale_limit)
+            high_baseline_extra = .040 if metrics["baseline_score"] >= .35 else 0.0
+            foreground_ok = not (
+                metrics["foreground_support"] >= .01 and
+                metrics["foreground_gain"] < -.005)
+            passes = (
+                metrics["candidate_score"] >= max(.10, simple_score + .004) and
+                metrics["gain"] >= min_gain + high_baseline_extra and
+                metrics["tile_positive"] >= tiles and
+                metrics["tile_median"] >= 0 and
+                metrics["tile_worst"] >= worst and
+                metrics["positive_rows"] >= spread and
+                metrics["positive_cols"] >= spread and foreground_ok and
+                not shift_saturated and not scale_saturated)
+            objective = metrics["candidate_score"] - penalty
+            record = (objective, item, metrics, passes, mode)
+            if best_mode is None or objective > best_mode[0]:
+                best_mode = record
+            if passes and objective > simple_score + .005:
+                accepted.append(record)
+        if best_mode is not None:
+            item, metrics = best_mode[1], best_mode[2]
+            diagnostics[mode] = {
+                "params": [float(x) for x in item["params"]],
+                **metrics, "accepted": bool(best_mode[3]),
+            }
+
+    if accepted:
+        accepted.sort(key=lambda x: x[0], reverse=True)
+        _, best, best_metrics, _, selected_mode = accepted[0]
+    else:
+        best, selected_mode = simple, simple["mode"]
+        best_metrics = {
+            "candidate_score": simple["score"], "baseline_score": simple["score"],
+            "gain": 0.0, "support": simple["support"], "tile_count": 0,
+            "tile_positive": 0, "tile_median": 0.0, "tile_worst": 0.0,
+            "positive_rows": 0, "positive_cols": 0,
+            "foreground_candidate": simple["score"],
+            "foreground_baseline": simple["score"], "foreground_gain": 0.0,
+            "foreground_support": 0.0,
+        }
+
+    alternatives = ([x[2]["candidate_score"] for x in accepted if x[1] is not best]
+                    + [simple_score])
+    improvement = float(best_metrics["gain"])
+    uniqueness = max(0.0, float(best_metrics["candidate_score"]) -
+                     max(alternatives, default=simple_score))
+    absolute = float(np.clip((best_metrics["candidate_score"] - .08) / .32, 0, 1))
+    if selected_mode in ("raw", "old_a0"):
+        evidence = float(np.clip((best_metrics["candidate_score"] - .10) / .25, 0, 1))
+    else:
+        evidence = float(np.clip((improvement + .002) / .06, 0, 1) *
+                         np.clip((uniqueness + .001) / .02, 0, 1))
+    return {
+        "params": np.asarray(best["params"], np.float32),
+        "score": float(best["rank"]),
+        "identity_score": float(raw_item["score"]),
+        "old_a0_score": float(old_item["score"]),
+        "baseline_mode": simple["mode"],
+        "improvement": improvement, "uniqueness": float(uniqueness),
+        "phase_response": float(best["response"]),
+        "confidence": absolute * evidence,
+        "selected_mode": selected_mode, "mode_diagnostics": diagnostics,
+        "common_support": float(best_metrics["support"]),
+        "tile_positive": int(best_metrics["tile_positive"]),
+        "tile_median_gain": float(best_metrics["tile_median"]),
+        "tile_worst_gain": float(best_metrics["tile_worst"]),
+    }
+
+
 def robust_sequence_prior(rows: Sequence[dict]):
     good = [r for r in rows if r["confidence"] >= .45]
     if not good:
@@ -692,7 +938,7 @@ def sampling_params(matrix: np.ndarray, shape: tuple[int, int]):
 
 def affine_model_contract(params: Sequence[float], shape: tuple[int, int],
                           canvas: tuple[int, int] = (736, 1280),
-                          angle_limit: float = 3.0,
+                          angle_limit: float = 25.0,
                           shift_limit: float = 16.0,
                           scale_limit: float = .04,
                           tolerance: float = 1.05):

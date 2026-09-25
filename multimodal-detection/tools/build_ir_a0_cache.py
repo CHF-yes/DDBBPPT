@@ -28,6 +28,16 @@ def _paths(root: Path, sample: dict):
             root / "infrared" / sample["files"]["infrared"])
 
 
+def _old_params(cache: Path | None, stem: str):
+    if cache is None:
+        return None
+    path = cache / "samples" / f"{stem}.npz"
+    if not path.is_file():
+        return None
+    with np.load(path, allow_pickle=False) as z:
+        return np.asarray(z["source_to_rgb_params"], np.float32)
+
+
 def _worker_init(opencv_threads: int):
     # The server has a 16-core cgroup quota.  A few processes with a bounded
     # OpenCV thread pool fill that quota more reliably than one Python process
@@ -37,14 +47,15 @@ def _worker_init(opencv_threads: int):
 
 
 def _coarse_task(payload):
-    root, sample, cfg = payload
+    root, sample, cfg, old_cache = payload
     root = Path(root)
     stem = sample["stem"]
     rgb, thermal, ir3 = read_modalities(*_paths(root, sample))
     _, _, geometry, _, geometry_thermal = quality_maps(
         rgb, thermal, ir3, return_preprocessed=True)
+    old = _old_params(Path(old_cache) if old_cache else None, stem)
     return stem, source_group(stem), estimate_affine(
-        rgb, geometry_thermal, geometry, cfg)
+        rgb, geometry_thermal, geometry, cfg, prior=old)
 
 
 def _refine_task(payload):
@@ -125,6 +136,8 @@ def main():
     p.add_argument("--exclude-stems", default="",
                    help="versioned cross-modal mismatch list")
     p.add_argument("--out", required=True)
+    p.add_argument("--old-cache", default="",
+                   help="old A0 cache used as a competing baseline, never truth")
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--work-width", type=int, default=480)
     p.add_argument("--preview-count", type=int, default=80)
@@ -135,7 +148,7 @@ def main():
                    help="OpenCV threads per worker")
     p.add_argument("--contract-canvas", default="736x1280",
                    help="V5.1.1 training canvas used to validate affine labels")
-    p.add_argument("--contract-angle", type=float, default=4.0)
+    p.add_argument("--contract-angle", type=float, default=25.0)
     p.add_argument("--contract-shift", type=float, default=16.0)
     p.add_argument("--contract-scale", type=float, default=.04)
     a = p.parse_args()
@@ -154,7 +167,7 @@ def main():
     with ProcessPoolExecutor(max_workers=max(1, a.workers),
                              initializer=_worker_init,
                              initargs=(a.opencv_threads,)) as pool:
-        tasks = ((str(root), sample, cfg) for sample in samples)
+        tasks = ((str(root), sample, cfg, a.old_cache) for sample in samples)
         for i, (stem, group, estimate) in enumerate(
                 pool.map(_coarse_task, tasks, chunksize=1)):
             first[stem] = estimate
@@ -203,7 +216,7 @@ def main():
                     [cv2.IMWRITE_JPEG_QUALITY, 92])
     confidences = np.asarray([r["confidence"] for r in rows])
     summary = {
-        "version": 4, "n_samples": len(rows), "min_confidence": a.min_confidence,
+        "version": 5, "n_samples": len(rows), "min_confidence": a.min_confidence,
         "supervised": int(sum(r["supervised"] for r in rows)),
         "model_contract": {
             "canvas": list(contract_canvas), "angle": a.contract_angle,
