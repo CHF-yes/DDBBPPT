@@ -797,7 +797,14 @@ class IndependentMMYOLO(nn.Module):
                     v511_state = next_v511_state
             else:
                 fusion_block = self.fusion[s]
-                fused[s] = fusion_block(values,c,u,mask,confidence[s],rel,state,qual)
+                # V5.2/V5.2.1 expose ten IR quality channels to the explicit
+                # geometry adapter, but the protected V4.4 fusion gates were
+                # constructed for the original three-channel quality contract.
+                # Do not leak the seven geometry-only channels into that route.
+                fusion_quality = (base_qual if self.cfg.fusion.fusion_strategy in
+                                  ("v52_stage_a_v1", "v521_stage_a_v1") else qual)
+                fused[s] = fusion_block(
+                    values, c, u, mask, confidence[s], rel, state, fusion_quality)
             fusion_block.last_health["ir_flow_rms"] = flows[s][0].detach().float().square().mean().sqrt()
             fusion_block.last_health["dep_flow_rms"] = flows[s][1].detach().float().square().mean().sqrt()
             # values are already identity/residual aligned in V4.2, so match must

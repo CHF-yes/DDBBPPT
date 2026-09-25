@@ -5,6 +5,7 @@ same explicit A0/residual adapter runs in Stage A and Stage B, that Stage-A RGB
 is geometry-only, and that the Stage-B opt-in uses its dedicated low-LR group.
 """
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -135,6 +136,13 @@ def main():
     enable_trainable_defaults(stage_b)
     set_residual_fusion_mode(
         stage_b, downstream_frozen=False, train_v52_ir_input=True)
+    # A freshly constructed detector intentionally starts as RGB identity, so
+    # its auxiliary residual scales are zero.  Open a bounded IR route here to
+    # audit graph connectivity; the real T0 audit separately loads learned
+    # V4.4 fusion weights and must not modify those scales.
+    with torch.no_grad():
+        for block in stage_b.fusion.values():
+            block.residual_scale[1:].fill_(0.2)
     role_mults = {
         "anchor": 0.0, "aux_encoder": 0.25, "fusion": 1.0,
         "p2": 1.0, "detector": 1.0, "semantic": 1.0, "geometry": 0.1,
@@ -171,7 +179,11 @@ def main():
     }
     assert not results["stage_b_trainable"]["pixel_blend_enabled"]
     results["passed"] = True
-    print(json.dumps(results, indent=2, ensure_ascii=False))
+    payload = json.dumps(results, indent=2, ensure_ascii=False)
+    output = os.environ.get("V61_AUDIT_OUT")
+    if output:
+        Path(output).write_text(payload, encoding="utf-8")
+    print(payload)
 
 
 if __name__ == "__main__":
