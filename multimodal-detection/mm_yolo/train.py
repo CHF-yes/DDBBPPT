@@ -472,7 +472,8 @@ def set_aux_adaptation_mode(model: MMYOLO) -> None:
                     p.requires_grad_(True)
 
 
-def set_independent_aux_mode(model: MMYOLO) -> None:
+def set_independent_aux_mode(model: MMYOLO,
+                             train_v52_ir_input: bool = True) -> None:
     """Stage A: train IR/Depth as real standalone detectors.
 
     The RGB encoder, fused route, shared semantic head and memory are completely
@@ -491,7 +492,8 @@ def set_independent_aux_mode(model: MMYOLO) -> None:
         if module is not None:
             for p in module.parameters():
                 p.requires_grad_(True)
-    if getattr(model, "v52_ir_input", None) is not None:
+    if (train_v52_ir_input and
+            getattr(model, "v52_ir_input", None) is not None):
         model.v52_ir_input.requires_grad_(True)
     # V5 keeps an RGB standalone teacher active as well; the RGB detector
     # supervision must not be replaced by IR/Depth-only adaptation.
@@ -516,7 +518,8 @@ def set_independent_aux_mode(model: MMYOLO) -> None:
             dfl.requires_grad_(False)
 
 
-def set_residual_fusion_mode(model: MMYOLO, downstream_frozen: bool) -> None:
+def set_residual_fusion_mode(model: MMYOLO, downstream_frozen: bool,
+                             train_v52_ir_input: bool = False) -> None:
     """Stage B: open zero-initialized IR/Depth residuals around a fixed RGB path.
 
     During the initial fusion-only period even the independently trained
@@ -591,6 +594,10 @@ def set_residual_fusion_mode(model: MMYOLO, downstream_frozen: bool) -> None:
             if scale in matchers and len(matchers[scale]):
                 enable(matchers[scale][0])
         return
+    # V5.2/V5.2.1 always run the Stage-A adapter in the fused forward. Stage B
+    # may fine-tune it only after the initial fusion-only freeze period.
+    if train_v52_ir_input and not downstream_frozen:
+        enable(getattr(model, "v52_ir_input", None))
     # In the incremental recipe the learned V4.4 route is frozen during the
     # warm-up; only new corrections and auxiliary evidence adapt first.
     if hasattr(model, "fusion") and (not incremental or not downstream_frozen):
@@ -755,6 +762,7 @@ def build_optimizer(model: MMYOLO, lr: float, backbone_mult: float, wd: float = 
         add("fusion", getattr(model, "evidence_router", None))
         add("fusion", getattr(model, "ir_coarse_aligner", None))
         add("fusion", getattr(model, "v511_ir_embeddings", None))
+        add("geometry", getattr(model, "v52_ir_input", None))
         add("p2", getattr(model, "occlusion_context", None))
         if hasattr(model, "embeddings"):
             for blocks in model.embeddings.values():
@@ -788,7 +796,7 @@ def build_optimizer(model: MMYOLO, lr: float, backbone_mult: float, wd: float = 
 
         # Resolve aliases/overlap by priority: the new P2 head must not inherit
         # the slower pretrained detector rate; the frozen anchor always wins.
-        priority = ("anchor", "p2", "semantic", "aux_encoder", "fusion", "detector")
+        priority = ("anchor", "p2", "semantic", "geometry", "aux_encoder", "fusion", "detector")
         owner = {}
         for role in reversed(priority):
             for pid in role_ids.get(role, ()):
@@ -1319,6 +1327,8 @@ def main():
                     help="anchored_joint 中预训练 Neck/Detect 相对基础 lr")
     ap.add_argument("--semantic-lr-mult", type=float, default=1.0,
                     help="anchored_joint 中训练期辅助检测头相对基础 lr")
+    ap.add_argument("--ir-geometry-lr-mult", type=float, default=0.1,
+                    help="Stage B 中 V5.2/V5.2.1 IR 几何 Adapter 相对基础 lr")
     ap.add_argument("--weight-decay", type=float, default=5e-4,
                     help="名义 batch 下的 AdamW 衰减；会按有效 batch/nominal-batch 缩放")
     ap.add_argument("--nominal-batch", type=int, default=64,
@@ -1334,6 +1344,10 @@ def main():
     ap.add_argument("--preserve-init-fusion", action="store_true",
                     help="仅用于新实验 --init-checkpoint：保留 checkpoint 的融合/记忆/定位状态，"
                          "不重置为 RGB 恒等起点")
+    ap.add_argument("--train-v52-ir-input-stage-b", action="store_true",
+                    help="Stage B 冻结期结束后以低学习率解冻 V5.2/V5.2.1 IR 几何 Adapter")
+    ap.add_argument("--freeze-v52-ir-input-stage-a", action="store_true",
+                    help="Stage A 对照组：运行 Adapter 前向但冻结其参数")
     ap.add_argument("--aux-branch-mode", default="alternate",
                     choices=["alternate", "both"],
                     help="Stage A 辅助分支调度；both 在同一批顺序反传 IR/Depth，完整覆盖每轮")
@@ -1814,13 +1828,14 @@ def main():
     effective_batch = args.batch * args.accum
     scaled_wd = args.weight_decay * effective_batch / args.nominal_batch
     role_mults = None
-    if args.train_stage in ("anchored_joint", "residual_fusion"):
+    if args.train_stage in ("anchored_joint", "residual_fusion", "aux_independent"):
         role_mults = {"anchor": 0.0,
                       "aux_encoder": args.backbone_lr_mult,
                       "fusion": args.fusion_lr_mult,
                       "p2": args.p2_lr_mult,
                       "detector": args.detector_lr_mult,
-                      "semantic": args.semantic_lr_mult}
+                      "semantic": args.semantic_lr_mult,
+                      "geometry": args.ir_geometry_lr_mult}
     opt = build_optimizer(model, args.lr, args.backbone_lr_mult, wd=scaled_wd,
                           role_mults=role_mults)
     log(f"[train] 优化器 AdamW：有效 batch={effective_batch}，"
@@ -2047,10 +2062,14 @@ def main():
         t_ep = time.time()
         frozen = ep < args.freeze_epochs
         if args.train_stage == "aux_independent":
-            set_independent_aux_mode(model)
+            set_independent_aux_mode(
+                model,
+                train_v52_ir_input=not args.freeze_v52_ir_input_stage_a)
             frozen = True
         elif args.train_stage == "residual_fusion":
-            set_residual_fusion_mode(model, downstream_frozen=frozen)
+            set_residual_fusion_mode(
+                model, downstream_frozen=frozen,
+                train_v52_ir_input=args.train_v52_ir_input_stage_b)
         elif args.train_stage == "aux_adapt":
             set_aux_adaptation_mode(model)
             frozen = True
@@ -2343,7 +2362,8 @@ def main():
                                   "v511_conditional_ir_v1" else ("ir", "dep"))
                 preserve_name = preserve_names[(ep + bi) % len(preserve_names)]
                 preserve_aux, preserve_active = model.independent_branch_prediction(
-                    preserve_name, ir=ir, depth=dep, keep=keep)
+                    preserve_name, rgb=rgb, ir=ir, depth=dep,
+                    keep=keep, quality=qual)
                 if preserve_active.any():
                     preserve_preds, preserve_targets = subset_detection_batch(
                         preserve_aux, tgt, preserve_active)

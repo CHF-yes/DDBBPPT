@@ -490,6 +490,15 @@ class IndependentMMYOLO(nn.Module):
         depth = rgb.new_zeros(b,4,h,w) if depth is None else depth
         raw = [self._encode(rgb,"rgb",present[:,0]), self._encode(ir,"ir",present[:,1]),
                self._encode(depth[:,:1],"dep",present[:,2])]
+        # Stage B consumes the same A0 plus learned residual IR representation
+        # trained by the standalone Stage-A IR detector. RGB contributes only
+        # detached low-level geometry inside the adapter, never semantic input.
+        if self.v52_ir_input is not None:
+            if self.cfg.fusion.fusion_strategy == "v521_stage_a_v1":
+                raw[1] = self.v52_ir_input(
+                    raw[1], quality, ir.shape[-2:], rgb=rgb, ir=ir)
+            else:
+                raw[1] = self.v52_ir_input(raw[1], quality, ir.shape[-2:])
         raw[2], absolute, metric_valid = self._add_depth_metric(raw[2], depth, present[:,2])
         thermal_raw = (self._encode(ir, "v511_ir", present[:, 1])
                        if self.v511_ir_encoder is not None else raw[1])
