@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd /root/autodl-tmp/DDBBPPT_v52/multimodal-detection
+exec /root/miniconda3/envs/EFYOLO/bin/python -u mm_yolo/train.py \
+  --root /root/autodl-tmp/data/train_extracted \
+  --labels /root/autodl-tmp/data/new_labels_2000 \
+  --exclude-stems /root/autodl-tmp/a0_v3d_inputs/pair_reject_stems_v1.txt \
+  --out /root/autodl-tmp/runs/mm_v52_stage_a_ir_depth_rect_s42 \
+  --name stage_a \
+  --weights /root/autodl-tmp/weights/yolo11s.pt \
+  --device auto --modalities all --imgsz 736x1280 \
+  --epochs 36 --batch 4 --architecture independent_p2_memory_v3 \
+  --precision bf16 --checkpoint-encoder --mosaic 0 \
+  --memory-control bounded_v2 --depth-resampling nearest_valid_v2 \
+  --ir-read-mode median_channel \
+  --ir-a0-cache /root/autodl-tmp/cache/ir_a0_v52_rotation_input_v1 \
+  --require-ir-a0 --metric-branch --sampler coverage \
+  --rare-extra-frac 0.1 --close-aug-frac 0.25 \
+  --scale-min 0.92 --scale-max 1.08 --translate 0.025 \
+  --bn-policy adaptive_no_tail --warmup 3 --lrf 0.1 \
+  --calibrate-clip-steps 64 --val-batch 2 --accum 4 \
+  --workers 8 --lr 0.0002 --backbone-lr-mult 0.25 \
+  --weight-decay 0.0005 --nominal-batch 64 --grad-clip 60 \
+  --freeze-epochs 0 --train-stage aux_independent \
+  --aux-branch-mode both --fusion-tier L2 --share-tier a \
+  --register-bus --depth-scales all --depth-channels 4 \
+  --depth-view both --depth-init relative --no-prior --no-deformable \
+  --rgb-dropout 0 --aux-dropout 0 --dropout-start-epoch 0 \
+  --misalign-px 0 --degrade-p 0 --rgb-color-p 0.04 \
+  --ir-noise-p 0.12 --ir-gain-p 0.2 --depth-hole-p 0.04 \
+  --target-crop-p 0.08 --rotate-deg 0 --target-occlusion-p 0 \
+  --ir-affine-p 0 --ir-affine-deg 0 --ir-affine-shift 0 \
+  --ir-affine-scale 0 --rare-sample-max 3 --prefetch \
+  --val-ratio 0.2 --seed 42 --amp --save-every 1 \
+  --val-every 5 --eval-initial \
+  --init-checkpoint /root/autodl-tmp/runs/mm_v44_multimodal_ceiling_rect_s42_b4a4/stage_b/weights/best.pt \
+  --split-file /root/autodl-tmp/cache/ir_a0_v52_rotation_input_v1/split_s42_v52.json \
+  --val-limit 0 --val-conf 0.001 --branch-aux-weight 0 \
+  --flow-supervision-weight 0 --cross-modal-nce-weight 0 \
+  --p2-match-refine --match-floor 0 \
+  --alignment-mode identity_residual_v2 \
+  --depth-reliability valid_support_v2 --flow-identity-weight 0 \
+  --branch-aux-weights 1 1 0.6 \
+  --branch-aux-end-weights 1 1 0.6 \
+  --flow-supervision-end-weight 0 --cross-modal-nce-end-weight 0 \
+  --embedding-recon-weight 0 --embedding-recon-end-weight 0 \
+  --embedding-alignment-weight 0 --embedding-alignment-end-weight 0 \
+  --independent-preserve-weight 0 --independent-preserve-end-weight 0 \
+  --fusion-strategy v52_stage_a_v1 \
+  --ir-affine-loss-weight 0 --ir-affine-loss-end-weight 0 \
+  --evidence-supervision-weight 0 --evidence-supervision-end-weight 0

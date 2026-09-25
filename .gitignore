@@ -185,3 +185,17 @@ calibration_*.npy
 /ultralytics/cfg/datasets/dota8_MINE.yaml
 /val2.py
 /heatmap_RGBT_test.py
+
+# Local experiment, smoke-test, and recovery artifacts
+*.bundle
+/_*_worktree/
+/*_audit_preview/
+/_smoke_*
+/_diag_*
+/tmp/
+/multimodal-detection/tmp_*.py
+/test_aux_*/
+/test_aux_modalities.tar
+/*_compress_test.*
+/preview_*_test*_preview/
+/_v*_probe_*.py

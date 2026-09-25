@@ -47,8 +47,11 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 _HERE = Path(__file__).resolve().parent
 _CODE = _HERE.parent
 for _p in (str(_CODE), str(_CODE / "vendor"), str(_HERE)):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+    # Direct script execution already has _HERE on sys.path. Reposition it
+    # after adding the root/vendor so a stale root data.py cannot shadow ours.
+    if _p in sys.path:
+        sys.path.remove(_p)
+    sys.path.insert(0, _p)
 
 from ultralytics.utils.loss import v8DetectionLoss          # noqa: E402
 from ultralytics.utils.torch_utils import ModelEMA          # noqa: E402
@@ -68,6 +71,8 @@ def recipe_for(args):
     if getattr(args, "architecture", "") == "independent_p2_memory_v3":
         if getattr(args, "fusion_strategy", "legacy_residual_v2") == "v511_conditional_ir_v1":
             return "v511_v44_anchor_conditional_thermal_fusion"
+        if getattr(args, "fusion_strategy", "legacy_residual_v2") == "v52_stage_a_v1":
+            return "v52_v44_anchor_independent_rgb_ir_depth_rotation_input"
         if getattr(args, "fusion_strategy", "legacy_residual_v2") == "v5_ir_quality_evidence":
             return "v5_v44_identity_quality_evidence"
         if getattr(args, "fusion_strategy", "legacy_residual_v2") == "v48_embedding_complement_v1":
@@ -484,6 +489,8 @@ def set_independent_aux_mode(model: MMYOLO) -> None:
         if module is not None:
             for p in module.parameters():
                 p.requires_grad_(True)
+    if getattr(model, "v52_ir_input", None) is not None:
+        model.v52_ir_input.requires_grad_(True)
     # V5 keeps an RGB standalone teacher active as well; the RGB detector
     # supervision must not be replaced by IR/Depth-only adaptation.
     if getattr(model.cfg.fusion, "fusion_strategy", "") == "v5_ir_quality_evidence":
@@ -954,7 +961,7 @@ def validate_checkpoint(ck: dict, model: MMYOLO, enabled, canvas, exact: bool = 
                                                   "v47_trusted_evidence_v1",
                                                   "v48_embedding_complement_v1",
                                                   "v5_ir_quality_evidence",
-                                                  "v511_conditional_ir_v1")):
+                                                  "v511_conditional_ir_v1", "v52_stage_a_v1")):
             # Explicit V4.4 warm-start paths.  The incremental path keeps the
             # old fusion weights and only initializes newly named tensors below.
             for key in ("fusion_strategy", "ir_coarse_align",
@@ -1147,6 +1154,7 @@ def adapt_depth_checkpoint_state(state: dict, model: MMYOLO) -> tuple:
         if name not in out and (name.startswith("independent_aux.") or
                                 name.startswith("semantic_adapters.") or
                                 name.startswith("semantic_detect.") or is_new_switch or
+                                name.startswith("v52_ir_input.") or
                                 (legacy_fusion and is_v45)):
             out[name] = target.detach().clone()
             migrated = True
@@ -1243,6 +1251,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", required=True, help="含 visible/infrared/depth 的训练目录")
     ap.add_argument("--labels", required=True, help="标签目录（用官方修正版 new_labels_2000）")
+    ap.add_argument("--exclude-stems", default="",
+                    help="版本化排除清单；样本从索引/训练/验证中移除但不删除原图")
     ap.add_argument("--out", default=str(_CODE / "runs"))
     ap.add_argument("--name", default="mm_run")
     ap.add_argument("--weights", default="yolo11s.pt",
@@ -1435,7 +1445,7 @@ def main():
                     choices=["legacy_residual_v2", "evidence_router_v3",
                              "v44_incremental_router_v1", "v47_trusted_evidence_v1",
                              "v48_embedding_complement_v1",
-                             "v5_ir_quality_evidence", "v511_conditional_ir_v1"])
+                             "v5_ir_quality_evidence", "v511_conditional_ir_v1", "v52_stage_a_v1"])
     ap.add_argument("--ir-coarse-align", action="store_true",
                     help="启用样本级 IR 小仿射 + P2/P3 局部残差对齐")
     ap.add_argument("--ir-affine-loss-weight", type=float, default=0.0)
@@ -1509,6 +1519,11 @@ def main():
             args.ir_affine_shift < 0 or not 0 <= args.ir_affine_scale < 1 or
             args.rare_sample_max < 1):
         raise ValueError("几何增强范围无效或 rare-sample-max < 1")
+    if args.fusion_strategy == "v52_stage_a_v1":
+        if (args.train_stage != "aux_independent" or args.ir_coarse_align or
+                not args.require_ir_a0 or not args.ir_a0_cache or args.ir_affine_p or
+                args.ir_affine_loss_weight or args.mosaic or args.misalign_px):
+            raise ValueError("V5.2 is Stage A only: required rotation cache, no old affine loss/mosaic")
     if args.fusion_strategy == "evidence_router_v3" and not args.ir_coarse_align:
         raise ValueError("evidence_router_v3 必须启用 --ir-coarse-align")
     if args.fusion_strategy == "v44_incremental_router_v1" and args.ir_coarse_align:
@@ -1586,10 +1601,16 @@ def main():
             f.flush()                                    # 不 flush 会卡在缓冲区，看不出进度
 
     log(f"[train] 设备 {dev} | 配置 {vars(args)}")
+    if args.fusion_strategy == "v52_stage_a_v1":
+        data_path = Path(sys.modules[MMDataset.__module__].__file__).resolve()
+        if data_path != _HERE / "data.py":
+            raise RuntimeError(f"V5.2 imported an unexpected dataset module: {data_path}")
+        log(f"[V5.2] dataset_module={data_path}")
     log(f"[train] 防休眠: {prevent_sleep(True)}（SetThreadExecutionState）")
 
     # ---- 数据 ----
-    idx = build_index(Path(args.root), Path(args.labels), limit=args.limit)
+    idx = build_index(Path(args.root), Path(args.labels), limit=args.limit,
+                      exclude_stems=Path(args.exclude_stems) if args.exclude_stems else None)
     split_path = out_dir / "split.json"
     if args.resume and not split_path.exists():
         raise FileNotFoundError(f"精确续训缺少 split.json：{split_path}")
@@ -1714,7 +1735,7 @@ def main():
     cfg.fusion.depth_reliability = args.depth_reliability
     cfg.fusion.flow_identity_weight = float(args.flow_identity_weight)
     cfg.fusion.fusion_strategy = args.fusion_strategy
-    if args.fusion_strategy == "v511_conditional_ir_v1":
+    if args.fusion_strategy in ("v511_conditional_ir_v1", "v52_stage_a_v1"):
         cfg.fusion.quality_channels = 10
     cfg.fusion.ir_coarse_align = bool(args.ir_coarse_align)
     cfg.fusion.ir_affine_max_degrees = float(args.ir_affine_deg)
@@ -1876,7 +1897,7 @@ def main():
         cache_root = Path(args.ir_a0_cache)
         summary = cache_root / "audit_summary.json"
         meta_base["ir_a0"] = {
-            "version": "v5.1.1-a0",
+            "version": "v52_rotation_input_v1" if args.fusion_strategy == "v52_stage_a_v1" else "v5.1.1-a0",
             "required": bool(args.require_ir_a0),
             "summary_sha256": (hashlib.sha256(summary.read_bytes()).hexdigest()
                                if summary.is_file() else ""),
@@ -1924,10 +1945,9 @@ def main():
                                   require_ir_a0=args.require_ir_a0)
         branches = {}
         try:
-            stage_a_branches = (("rgb", "ir") if
-                                args.fusion_strategy == "v511_conditional_ir_v1"
-                                else ("ir", "dep"))
+            stage_a_branches = tuple(eval_model.independent_aux.keys())
             for branch in stage_a_branches:
+                log(f"[train] 开始独立 {branch} 验证：{len(va_eval)} 张")
                 eval_model.auxiliary_eval_branch = branch
                 branches[branch] = evaluate_model(
                     eval_model, Path(args.root), va_eval, imgsz=imgsz,
@@ -1935,10 +1955,11 @@ def main():
                     slices=False, batch_size=args.val_batch,
                     ir_a0_cache=args.ir_a0_cache,
                     require_ir_a0=args.require_ir_a0)
+                log(f"[train] 独立 {branch} 验证完成 mAP50-95={branches[branch]['map50_95']:.5f}")
         finally:
             eval_model.auxiliary_eval_branch = None
         keys = range(int(eval_model.nc))
-        v511_stage_a = args.fusion_strategy == "v511_conditional_ir_v1"
+        v511_stage_a = args.fusion_strategy in ("v511_conditional_ir_v1", "v52_stage_a_v1")
         selection_branch = branches["ir"] if v511_stage_a else None
         combined = {
             "map50_95": (selection_branch["map50_95"] if v511_stage_a else
@@ -1958,16 +1979,19 @@ def main():
                                     *(v["missing_classes"] for v in branches.values())))),
             "n_images": len(va_eval), "canvas": list(canvas),
             "modalities": "independent_" + "_".join(branches),
-            "selection": ("ir_map50_95_with_rgb_floor" if v511_stage_a else
+            "selection": ("ir_map50_95_manual_stage_b_gate" if args.fusion_strategy == "v52_stage_a_v1" else "ir_map50_95_with_rgb_floor" if v511_stage_a else
                           "mean_" + "_".join(branches) + "_map50_95"),
             "branches": branches,
         }
         return combined
 
     best = best0
+    branch_best_file = out_dir / "branch_best.json"
+    branch_best = json.loads(branch_best_file.read_text()) if args.resume and branch_best_file.exists() else {}
     if args.eval_initial and not args.resume:
         log("[train] 开始 ep0 迁移起点验证（未做任何梯度更新）")
         initial = _evaluate_for_stage(ema.ema)
+        (out_dir / "val_initial.json").write_text(json.dumps(initial, indent=2, default=str))
         best = float(initial["map50_95"])
         _save(out_dir / "weights" / "best.pt", 0, best)
         (out_dir / "val_best.json").write_text(json.dumps(
@@ -2164,13 +2188,15 @@ def main():
                     loss_scalar = zero
                     for name in names:
                         branch_aux, active = model.independent_branch_prediction(
-                            name, rgb=rgb, ir=ir, depth=dep, keep=keep)
+                            name, rgb=rgb, ir=ir, depth=dep, keep=keep, quality=qual)
                         if not active.any():
                             raise RuntimeError(f"Stage A batch has no valid {name} samples")
                         branch_preds, branch_targets = subset_detection_batch(
                             branch_aux, tgt, active)
                         loss_vec, branch_items = crit(branch_preds, branch_targets)
                         branch_loss = aux_w[name] * accumulation_loss(loss_vec, nominal_samples)
+                        if name == "ir" and getattr(model, "v52_ir_input", None) is not None:
+                            branch_loss = branch_loss + .01 * model.v52_ir_input.last_penalty * (rgb.shape[0]/nominal_samples)
                         if not torch.isfinite(branch_loss.detach()):
                             raise FloatingPointError(f"non-finite {name} auxiliary loss at ep={ep+1} batch={bi}")
                         # Backpropagate and release this branch before building
@@ -2377,6 +2403,19 @@ def main():
                 res = _evaluate_for_stage(ema.ema)
                 (out_dir / "val_latest.json").write_text(json.dumps(res, ensure_ascii=False, indent=2,
                     default=lambda x: x.tolist() if hasattr(x, "tolist") else str(x)), encoding="utf-8")
+                if args.fusion_strategy == "v52_stage_a_v1":
+                    log("[V5.2] branch AP50-95=" + str({k:round(v['map50_95'],5) for k,v in res['branches'].items()}))
+                    log("[V5.2] IR residual=" + str(model.v52_ir_input.last_stats))
+                    with (out_dir / "branch_metrics.jsonl").open("a") as stream:
+                        stream.write(json.dumps({'epoch':ep+1, 'branches':{k:v['map50_95'] for k,v in res['branches'].items()}})+'\n')
+                    for branch, metric in res['branches'].items():
+                        ap = float(metric['map50_95'])
+                        if ap > branch_best.get(branch, {}).get('map50_95', -1):
+                            branch_best[branch] = {'epoch':ep+1,'map50_95':ap}
+                            save_mm_checkpoint(out_dir / 'weights' / f'best_{branch}.pt', ema.ema,
+                                               epoch=ep+1, best_map=ap,
+                                               meta={**meta_base, 'selected_branch':branch})
+                    branch_best_file.write_text(json.dumps(branch_best, indent=2))
                 msg += f" | val mAP50-95={res['map50_95']:.4f} mAP50={res['map50']:.4f}"
                 # 选模只在"某类完全缺失"时才有方差风险 → 明确告警，不静默
                 nz = [c for c, v in res["per_class_95"].items() if v == v]

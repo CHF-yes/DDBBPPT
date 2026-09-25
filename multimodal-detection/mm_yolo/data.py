@@ -56,6 +56,19 @@ HASH_BITS = 256         # dHash 位数（17×16 网格 → 16 列 × 16 行 = 25
 INDEX_VER = 5           # 索引缓存格式版本；加入源文件签名
 
 
+def load_exclude_stems(path: Optional[Path]) -> set[str]:
+    """Read a versioned fail-closed stem list without deleting source data."""
+    if path is None:
+        return set()
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"exclude stem list not found: {path}")
+    return {
+        line.strip() for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
+
+
 # ---------------------------------------------------------------- 读图
 
 def read_rgb(path) -> Optional[np.ndarray]:
@@ -1264,6 +1277,14 @@ class MMDataset(Dataset):
         quality["availability"] = np.stack((spatial*keep["rgb"], ir_spatial*keep["ir"],
                                              valid_w*keep["dep"])).astype(np.float32)
         quality["scene_id"] = np.ones((1,*self.canvas),np.float32)
+        if a0 is not None and "v52_coarse_matrix" in a0:
+            if aug.mosaic_p or aug.ir_affine_p or aug.misalign_px:
+                raise ValueError("V5.2 raw/coarse geometry requires no mosaic or sensor-only perturbation")
+            # Keep raw pixels intact. Transport the inverse coarse rotation
+            # through the actual crop/flip/letterbox, for feature resampling.
+            C = _mat3(np.asarray(a0["v52_coarse_matrix"], np.float32))
+            Q = _mat3(M) @ np.linalg.inv(C) @ np.linalg.inv(_mat3(M))
+            quality["v52_ir_sampling"] = Q[:2].astype(np.float32)
         return {
             "rgb": torch.from_numpy(rgb_w.transpose(2, 0, 1).copy()).float() / 255.0,
             "ir": torch.from_numpy(ir_w[None].copy()).float() / 255.0,
@@ -1402,6 +1423,10 @@ def collate(batch: List[Optional[dict]]) -> Optional[dict]:
         if any(key in b["quality"] for b in batch):
             shape = (channels,*batch[0]["rgb"].shape[-2:])
             out["quality"][key] = torch.stack([b["quality"].get(key,torch.ones(shape)) for b in batch])
+    if any("v52_ir_sampling" in b["quality"] for b in batch):
+        if not all("v52_ir_sampling" in b["quality"] for b in batch):
+            raise ValueError("Mixed V5.2/cache-free samples")
+        out["quality"]["v52_ir_sampling"] = torch.stack([b["quality"]["v52_ir_sampling"] for b in batch])
     # 缺失模态整路置零（承重配方）。⚠️ 这里只清图像；质量描述子/先验在 __getitem__ 里就已按 keep 清除。
     for m in ("rgb", "ir"):
         out[m] = out[m] * out["keep"][m].view(-1, 1, 1, 1)
@@ -1438,7 +1463,8 @@ def _index_source_signature(root: Path, label_dir: Optional[Path]) -> str:
 
 def build_index(root: Path, label_dir: Optional[Path] = None, limit: int = 0,
                 hash_size: int = 32, cache_dir: Optional[Path] = None,
-                use_cache: bool = True) -> List[dict]:
+                use_cache: bool = True,
+                exclude_stems: Optional[Path] = None) -> List[dict]:
     """扫描三模态 + 标签，返回样本列表（含 dHash 供分组用）。
 
     ⚠️ dHash 要对每张 visible **全分辨率解码**，2000 张单线程要 5–10 分钟。
@@ -1447,6 +1473,7 @@ def build_index(root: Path, label_dir: Optional[Path] = None, limit: int = 0,
     """
     root = Path(root)
     label_dir = Path(label_dir) if label_dir else None
+    excluded = load_exclude_stems(exclude_stems)
     signature = _index_source_signature(root, label_dir) if use_cache else None
     cache_dir = Path(cache_dir) if cache_dir else (root.parent / "_mm_index_cache")
     cache = cache_dir / (f"index_{root.name}__{label_dir.name if label_dir else 'nolab'}"
@@ -1458,12 +1485,12 @@ def build_index(root: Path, label_dir: Optional[Path] = None, limit: int = 0,
                 raise ValueError("缓存版本/哈希位数不匹配")
             if obj.get("source_signature") != signature:
                 raise ValueError("图像/标签清单或文件元数据已变化")
-            idx = obj["samples"]
+            idx = [s for s in obj["samples"] if s["stem"] not in excluded]
             for s in idx:
                 s["boxes"] = (np.array(s["boxes"], np.float32).reshape(-1, 5) if s["boxes"]
                               else np.zeros((0, 5), np.float32))
                 s["_hash_int"] = int(s["_hash"])
-            print(f"[index] 命中缓存 {cache.name}（{len(idx)} 样本）")
+            print(f"[index] 命中缓存 {cache.name}（{len(idx)} 样本；排除 {len(excluded)}）")
             return idx
         except Exception as exc:                                     # noqa: BLE001
             print(f"[index] 缓存不可用，重建：{exc}")
@@ -1474,6 +1501,9 @@ def build_index(root: Path, label_dir: Optional[Path] = None, limit: int = 0,
             raise SystemExit(f"缺少模态目录: {d}")
         per_mod[m] = {p.stem: p.name for p in d.iterdir() if p.suffix.lower() in EXTS}
     stems = sorted(set.intersection(*[set(v) for v in per_mod.values()]))
+    if excluded:
+        stems = [st for st in stems if st not in excluded]
+        print(f"[index] 按 {Path(exclude_stems).name} 排除 {len(excluded)} 个 stem")
     missing = {m: len(set(per_mod[m]) - set(stems)) for m in MODS}
     if any(missing.values()):
         print(f"[index] 警告：三模态未完全配对，各模态独有文件数 {missing}")
