@@ -2,13 +2,20 @@
 set -euo pipefail
 
 CODE=/root/autodl-tmp/DDBBPPT_v61/multimodal-detection
-OUT=/root/autodl-tmp/runs/v61_short_validation_20260926_v1
 INIT=/root/autodl-tmp/runs/v61_t0_real_batch_20260926_v1/v61_base_init.pt
 CACHE=/root/autodl-tmp/cache/ir_a0_v521_explicit_v2
+MODE=pair
+if (( $# > 0 )); then
+  MODE=$1
+fi
+OUT=/root/autodl-tmp/runs/v61_short_validation_20260926_v1
+mkdir -p /root/v61_runtime_tmp
+export TMPDIR=/root/v61_runtime_tmp
+export PYTHONDONTWRITEBYTECODE=1
 
 mkdir -p "$OUT"
 echo '4ee9ad69f8dcbc3296b63411ad5c8fef5af06f76e9c867d9a25f84bb72067467  /root/autodl-tmp/runs/v61_t0_real_batch_20260926_v1/v61_base_init.pt' | sha256sum -c -
-git -C /root/autodl-tmp/DDBBPPT_v61 rev-parse HEAD > "$OUT/code_commit.txt"
+git -C /root/autodl-tmp/DDBBPPT_v61 rev-parse HEAD > "$OUT/code_commit_$MODE.txt"
 
 run_stage_a() {
   local name="$1"
@@ -63,7 +70,22 @@ run_stage_a() {
     "$@"
 }
 
-run_stage_a a1_adapter_frozen --freeze-v52-ir-input-stage-a
-run_stage_a a2_adapter_trainable
-
-echo completed > "$OUT/stage_a_pair_status.txt"
+case "$MODE" in
+  a1)
+    run_stage_a a1_adapter_frozen --freeze-v52-ir-input-stage-a
+    echo a1_completed > "$OUT/stage_a_pair_status.txt"
+    ;;
+  a2)
+    run_stage_a a2_adapter_trainable
+    echo a2_completed > "$OUT/stage_a_pair_status.txt"
+    ;;
+  pair)
+    run_stage_a a1_adapter_frozen --freeze-v52-ir-input-stage-a
+    run_stage_a a2_adapter_trainable
+    echo completed > "$OUT/stage_a_pair_status.txt"
+    ;;
+  *)
+    echo "usage: $0 [a1|a2|pair]" >&2
+    exit 2
+    ;;
+esac
