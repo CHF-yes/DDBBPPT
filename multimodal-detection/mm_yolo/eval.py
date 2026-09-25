@@ -24,8 +24,9 @@ import torch
 _HERE = Path(__file__).resolve().parent
 _CODE = _HERE.parent
 for _p in (str(_CODE), str(_CODE / "vendor"), str(_HERE)):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+    if _p in sys.path:
+        sys.path.remove(_p)
+    sys.path.insert(0, _p)
 
 from ultralytics.utils.nms import non_max_suppression          # noqa: E402
 
@@ -227,6 +228,12 @@ def evaluate_model(model: MMYOLO, root: Path, samples: List[dict], imgsz=960,
     """
     ds = MMDataset(Path(root), samples, imgsz=imgsz, train=False,
                    aug=AugCfg(imgsz=imgsz,
+                              # Evaluation must not enable sensor-only or
+                              # mosaic geometry: V5.2's cached coarse
+                              # sampling is transported through the single
+                              # deterministic canvas transform below.
+                              misalign_px=0.0,
+                              mosaic_p=0.0,
                               depth_resampling=getattr(getattr(model, "cfg", None), "depth_resampling", "legacy_bilinear_v1"),
                               ir_read_mode=getattr(getattr(model, "cfg", None), "ir_read_mode", "legacy_first_channel"),
                               ir_a0_cache=ir_a0_cache,
@@ -365,6 +372,8 @@ def main():
     ap.add_argument("--device", default="auto", help="auto/cpu/cuda/cuda:0")
     ap.add_argument("--root", required=True)
     ap.add_argument("--labels", default="")
+    ap.add_argument("--exclude-stems", default="",
+                    help="与训练一致的版本化排除清单")
     ap.add_argument("--imgsz", default="", help="空=用 checkpoint 记录的训练画布；支持 'HxW'")
     ap.add_argument("--limit", type=int, default=0, help="只评测前 N 张（0=全量 val）")
     ap.add_argument("--split", default="", help="指定 split.json（默认找 <ckpt>/../../<name>/split.json）")
@@ -398,7 +407,8 @@ def main():
                                              else None))
     if not args.imgsz:
         print(f"[eval] 使用 checkpoint 记录的训练画布 {canvas_of(imgsz)}")
-    idx = build_index(Path(args.root), Path(args.labels) if args.labels else None, limit=0)
+    idx = build_index(Path(args.root), Path(args.labels) if args.labels else None, limit=0,
+                      exclude_stems=Path(args.exclude_stems) if args.exclude_stems else None)
     # 验证集必须与训练时**完全一致**（否则成绩不可比）：优先用训练产物里的 split.json
     split_path = Path(args.split) if args.split else None
     if split_path is None:

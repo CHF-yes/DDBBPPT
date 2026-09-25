@@ -21,7 +21,9 @@ try:
 except ImportError:  # tools may import this file as a top-level module
     from io_utils import imread_unicode
 
-A0_VERSION = 2
+# Version 3 includes the model-contract decision in affine supervision.
+# Older v2 caches may contain transforms that the train-time aligner cannot express.
+A0_VERSION = 3
 A0_QUALITY_NAMES = (
     "intensity", "local_contrast", "edge", "invalid_border", "saturation",
     "blur", "double_edge", "rgb_leakage", "thermal_confidence",
@@ -349,11 +351,44 @@ def sampling_params(matrix: np.ndarray, shape: tuple[int, int]):
     return np.asarray([angle, shift[0] / max(w, 1), shift[1] / max(h, 1), scale - 1], np.float32)
 
 
+def affine_model_contract(params: Sequence[float], shape: tuple[int, int],
+                          canvas: tuple[int, int] = (736, 1280),
+                          angle_limit: float = 3.0,
+                          shift_limit: float = 16.0,
+                          scale_limit: float = .04,
+                          tolerance: float = 1.05):
+    """Return whether an A0 affine is representable by the V5.1.1 head.
+
+    The cached candidate is expressed in original-image pixels while the
+    aligner predicts normalized motion on the letterboxed training canvas.
+    Conjugating through the nominal letterbox makes offline supervision and
+    the DataLoader's fail-closed range check use the same geometry.
+    """
+    h, w = (int(shape[0]), int(shape[1]))
+    hc, wc = (int(canvas[0]), int(canvas[1]))
+    factor = min(wc / max(w, 1), hc / max(h, 1))
+    ox, oy = (wc - w * factor) / 2.0, (hc - h * factor) / 2.0
+    letterbox = np.asarray([[factor, 0, ox], [0, factor, oy], [0, 0, 1]],
+                           np.float32)
+    sampling = np.vstack((source_to_sampling(params, shape), [0, 0, 1])).astype(np.float32)
+    on_canvas = letterbox @ sampling @ np.linalg.inv(letterbox)
+    physical = sampling_params(on_canvas[:2], canvas)
+    normalized = np.asarray((
+        physical[0] / max(angle_limit, 1e-6),
+        physical[1] * wc / max(shift_limit, 1e-6),
+        physical[2] * hc / max(shift_limit, 1e-6),
+        physical[3] / max(scale_limit, 1e-6),
+    ), np.float32)
+    return bool(np.max(np.abs(normalized)) <= tolerance), normalized
+
+
 def save_sample(path: Path, *, stem: str, params: Sequence[float], confidence: float,
                 quality: np.ndarray, visible: np.ndarray, geometry: np.ndarray,
                 meta: dict, shape: tuple[int, int], sequence: str,
                 sequence_prior: Sequence[float], sequence_confidence: float,
-                min_confidence: float = .45):
+                min_confidence: float = .45,
+                affine_supervised: Optional[bool] = None,
+                affine_contract: Optional[Sequence[float]] = None):
     sampling = source_to_sampling(params, shape)
     model_params = sampling_params(sampling, shape)
     q = quality.copy()
@@ -364,7 +399,11 @@ def save_sample(path: Path, *, stem: str, params: Sequence[float], confidence: f
         source_to_rgb_params=np.asarray(params, np.float32),
         sampling_matrix=sampling, affine_physical=model_params,
         affine_confidence=np.float32(confidence),
-        affine_supervised=np.uint8(confidence >= min_confidence),
+        affine_supervised=np.uint8(
+            confidence >= min_confidence if affine_supervised is None else affine_supervised),
+        affine_contract=np.asarray(
+            np.zeros(4, np.float32) if affine_contract is None else affine_contract,
+            np.float32),
         sequence=np.asarray(sequence), sequence_prior=np.asarray(sequence_prior, np.float32),
         sequence_confidence=np.float32(sequence_confidence),
         quality_maps=q.astype(np.float16),

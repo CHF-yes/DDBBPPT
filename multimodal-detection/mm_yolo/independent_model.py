@@ -179,7 +179,8 @@ class IndependentMMYOLO(nn.Module):
         if cfg.fusion.fusion_strategy not in (
                 "legacy_residual_v2", "evidence_router_v3", "v44_incremental_router_v1",
                 "v47_trusted_evidence_v1", "v48_embedding_complement_v1",
-                "v5_ir_quality_evidence", "v511_conditional_ir_v1"):
+                "v5_ir_quality_evidence", "v511_conditional_ir_v1", "v52_stage_a_v1",
+                "v521_stage_a_v1"):
             raise ValueError(f"unknown fusion strategy: {cfg.fusion.fusion_strategy}")
         self.evidence_router = nn.ModuleDict()
         if cfg.fusion.fusion_strategy in ("evidence_router_v3", "v44_incremental_router_v1"):
@@ -260,7 +261,8 @@ class IndependentMMYOLO(nn.Module):
                                                "v511_conditional_ir_v1")):
             if cfg.fusion.fusion_strategy == "v511_conditional_ir_v1":
                 aux_names = ("rgb", "ir")
-            elif cfg.fusion.fusion_strategy == "v5_ir_quality_evidence":
+            elif cfg.fusion.fusion_strategy in ("v5_ir_quality_evidence", "v52_stage_a_v1",
+                                                "v521_stage_a_v1"):
                 aux_names = MODES
             else:
                 aux_names = ("ir", "dep")
@@ -269,6 +271,16 @@ class IndependentMMYOLO(nn.Module):
                                              self.neck_channels, det)
                 for m in aux_names
             })
+        if cfg.fusion.fusion_strategy == "v52_stage_a_v1":
+            from v52_stage_a import IRResidualInput
+            self.v52_ir_input = IRResidualInput(self.channels["p4"])
+        elif cfg.fusion.fusion_strategy == "v521_stage_a_v1":
+            from v521_stage_a import ExplicitCoarseIRInput
+            self.v52_ir_input = ExplicitCoarseIRInput(
+                self.channels["p4"], max_angle=15., max_shift=.20,
+                max_scale=1.25, local_shift=.06)
+        else:
+            self.v52_ir_input = None
         self.neck_memory = NeckMemoryRead(p2_ch, md, cfg.fusion.heads)
         self.localization = nn.ModuleList([Conv(self.channels[s], c, 1) for s,c in zip(SCALES,self.neck_channels)])
         self.occlusion_context = nn.ModuleList()
@@ -374,7 +386,7 @@ class IndependentMMYOLO(nn.Module):
             raw[s] = raw[s] + gain*self.metric_encoder[s](values) * (fraction > 0)
         return raw, absolute, metric_valid
 
-    def independent_branch_prediction(self, name, rgb=None, ir=None, depth=None, keep=None):
+    def independent_branch_prediction(self, name, rgb=None, ir=None, depth=None, keep=None, quality=None):
         """Predict from one auxiliary sensor with no RGB/fusion information."""
         if name not in self.independent_aux:
             raise ValueError(f"independent auxiliary detector is unavailable: {name}")
@@ -395,6 +407,11 @@ class IndependentMMYOLO(nn.Module):
         else:
             raw = self._encode(
                 ir, "v511_ir" if self.v511_ir_encoder is not None else "ir", present)
+            if self.v52_ir_input is not None:
+                if self.cfg.fusion.fusion_strategy == "v521_stage_a_v1":
+                    raw = self.v52_ir_input(raw, quality, ir.shape[-2:], rgb=rgb, ir=ir)
+                else:
+                    raw = self.v52_ir_input(raw, quality, ir.shape[-2:])
         return self.independent_aux[name](raw), present
 
     def alignment_prediction(self, rgb, ir, quality=None, keep=None):
@@ -458,7 +475,7 @@ class IndependentMMYOLO(nn.Module):
     def forward(self, rgb, ir=None, depth=None, quality=None, prior=None, keep=None):
         if self.auxiliary_eval_branch is not None:
             return self.independent_branch_prediction(
-                self.auxiliary_eval_branch, rgb=rgb, ir=ir, depth=depth, keep=keep)[0]
+                self.auxiliary_eval_branch, rgb=rgb, ir=ir, depth=depth, keep=keep, quality=quality)[0]
         b, _, h, w = rgb.shape
         if h % 32 or w % 32:
             raise ValueError("v3 rectangular canvas height/width must both be multiples of 32")

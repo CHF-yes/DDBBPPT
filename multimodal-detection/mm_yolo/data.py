@@ -56,6 +56,19 @@ HASH_BITS = 256         # dHash 位数（17×16 网格 → 16 列 × 16 行 = 25
 INDEX_VER = 5           # 索引缓存格式版本；加入源文件签名
 
 
+def load_exclude_stems(path: Optional[Path]) -> set[str]:
+    """Read a versioned fail-closed stem list without deleting source data."""
+    if path is None:
+        return set()
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"exclude stem list not found: {path}")
+    return {
+        line.strip() for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
+
+
 # ---------------------------------------------------------------- 读图
 
 def read_rgb(path) -> Optional[np.ndarray]:
@@ -294,6 +307,11 @@ class AugCfg:
     ir_affine_deg: float = 0.0                          # IR 旋转上限（度）
     ir_affine_shift: float = 0.0                        # IR 平移上限（画布像素）
     ir_affine_scale: float = 0.0                        # IR 比例变化上限（fraction）
+    v521_explicit: bool = False                         # V5.2.1 显式大范围几何监督
+    v521_angle_deg: float = 15.0
+    v521_shift_frac: float = 0.20
+    v521_scale_min: float = 0.80
+    v521_scale_max: float = 1.25
     ir_a0_cache: str = ""                               # V5.1.1 offline quality/pseudo-label cache
     require_ir_a0: bool = False                         # required recipes fail closed on cache misses
     legacy_lowlight: bool = False                       # 仅用于 B1 旧实验的严格续训
@@ -1134,11 +1152,17 @@ class MMDataset(Dataset):
                 sampling_canvas = M3 @ S_orig @ np.linalg.inv(M3)
         if (self.train and allow_special and want_ir and aug.ir_affine_p > 0 and
                 rng.random() < aug.ir_affine_p):
-            angle = rng.uniform(-aug.ir_affine_deg, aug.ir_affine_deg)
-            sx = rng.uniform(-aug.ir_affine_shift, aug.ir_affine_shift)
-            sy = rng.uniform(-aug.ir_affine_shift, aug.ir_affine_shift)
-            ds = rng.uniform(-aug.ir_affine_scale, aug.ir_affine_scale)
-            A = centered_affine_M(self.canvas, angle, 1.0 + ds, sx, sy)
+            if aug.v521_explicit:
+                angle = rng.uniform(-aug.v521_angle_deg, aug.v521_angle_deg)
+                sx = rng.uniform(-aug.v521_shift_frac * Wc, aug.v521_shift_frac * Wc)
+                sy = rng.uniform(-aug.v521_shift_frac * Hc, aug.v521_shift_frac * Hc)
+                scale_ir = rng.uniform(aug.v521_scale_min, aug.v521_scale_max)
+            else:
+                angle = rng.uniform(-aug.ir_affine_deg, aug.ir_affine_deg)
+                sx = rng.uniform(-aug.ir_affine_shift, aug.ir_affine_shift)
+                sy = rng.uniform(-aug.ir_affine_shift, aug.ir_affine_shift)
+                scale_ir = 1.0 + rng.uniform(-aug.ir_affine_scale, aug.ir_affine_scale)
+            A = centered_affine_M(self.canvas, angle, scale_ir, sx, sy)
             ir_w = _warp(ir_w, A, self.canvas)
             ir_chroma_w = _warp(ir_chroma_w, A, self.canvas)
             ir_spatial = _warp(ir_spatial, A, self.canvas, nearest=True).astype(np.float32)
@@ -1151,12 +1175,24 @@ class MMDataset(Dataset):
             ir_affine_confidence = 1.0
         if a0 is not None or ir_affine_supervised:
             physical = sampling_params(sampling_canvas[:2], self.canvas)
-            ir_affine_target[:] = (
-                physical[0] / max(1e-6, aug.ir_affine_deg),
-                physical[1] * Wc / max(1e-6, aug.ir_affine_shift),
-                physical[2] * Hc / max(1e-6, aug.ir_affine_shift),
-                physical[3] / max(1e-6, aug.ir_affine_scale),
-            )
+            if aug.v521_explicit:
+                ir_affine_target[:] = (
+                    physical[0] / max(1e-6, aug.v521_angle_deg),
+                    physical[1] / max(1e-6, aug.v521_shift_frac),
+                    physical[2] / max(1e-6, aug.v521_shift_frac),
+                    # sampling_params stores (scale - 1), while the model
+                    # decodes a log-scale.  Use the same parameterization on
+                    # both sides so 0.80 and 1.25 map exactly to -1 and +1.
+                    np.log(max(1e-6, physical[3] + 1.0)) /
+                    max(1e-6, np.log(aug.v521_scale_max)),
+                )
+            else:
+                ir_affine_target[:] = (
+                    physical[0] / max(1e-6, aug.ir_affine_deg),
+                    physical[1] * Wc / max(1e-6, aug.ir_affine_shift),
+                    physical[2] * Hc / max(1e-6, aug.ir_affine_shift),
+                    physical[3] / max(1e-6, aug.ir_affine_scale),
+                )
             if np.max(np.abs(ir_affine_target)) > 1.05:
                 # The aligner is bounded by tanh.  An out-of-contract pseudo
                 # label must not be silently clipped into a different motion.
@@ -1230,6 +1266,37 @@ class MMDataset(Dataset):
                 a0_quality[:3] = base_ir[:3]
             a0_quality[9].fill(ir_affine_confidence)
             quality["ir"] = a0_quality
+            # 显式告诉模型粗处理链的组成。这里的 ghost 仍是投影概率代理，
+            # 不宣称已经恢复出纯 Thermal，也不执行固定 IR-alpha*RGB。
+            def _a0_map(name, fallback):
+                src = np.asarray(a0[name], np.float32) if name in a0 else fallback
+                if src.ndim == 3:
+                    src = src[0]
+                return cv2.warpAffine(
+                    src, qM, (ps[1], ps[0]), flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_CONSTANT, borderValue=0).astype(np.float32)[None]
+            visible_src = np.asarray(a0.get("visible_mask", np.ones_like(cached_q[7])), np.float32)
+            hard_src = np.clip(1 - visible_src, 0, 1)
+            soft_src = np.clip(.45 * cached_q[5] + .35 * cached_q[6] + .20 * cached_q[4], 0, 1)
+            exclude_src = hard_src.copy()
+            band_y = max(2, round(exclude_src.shape[0] * .04))
+            band_x = max(2, round(exclude_src.shape[1] * .04))
+            exclude_src[:band_y] = exclude_src[-band_y:] = 1
+            exclude_src[:, :band_x] = exclude_src[:, -band_x:] = 1
+            quality["v521_ghost_probability"] = _a0_map(
+                "ghost_probability", np.clip(cached_q[7], 0, 1))
+            ghost_conf = float(np.asarray(a0.get("ghost_transform_confidence", 0.)).reshape(()))
+            coarse_available = float(np.asarray(
+                a0.get("coarse_candidate_available", a0.get("v52_coarse_usable", 0.))).reshape(()))
+            quality["v521_ghost_confidence"] = np.full(
+                (1, ps[0], ps[1]), ghost_conf, np.float32)
+            quality["v521_coarse_available"] = np.full(
+                (1, ps[0], ps[1]), coarse_available, np.float32)
+            quality["v521_thermal_confidence"] = _a0_map(
+                "thermal_confidence_map", cached_q[8])
+            quality["v521_hard_mask"] = _a0_map("hard_mask", hard_src)
+            quality["v521_soft_mask"] = _a0_map("soft_mask", soft_src)
+            quality["v521_align_exclude"] = _a0_map("align_exclude_mask", exclude_src)
             geom_src = np.asarray(a0["geometry_mask"], np.float32)
             geom_full_M = (_mat3(ir_input_M) @ source_to_orig)[:2]
             ir_geometry = cv2.warpAffine(
@@ -1264,6 +1331,14 @@ class MMDataset(Dataset):
         quality["availability"] = np.stack((spatial*keep["rgb"], ir_spatial*keep["ir"],
                                              valid_w*keep["dep"])).astype(np.float32)
         quality["scene_id"] = np.ones((1,*self.canvas),np.float32)
+        if a0 is not None and "v52_coarse_matrix" in a0:
+            if aug.mosaic_p or (aug.ir_affine_p and not aug.v521_explicit) or aug.misalign_px:
+                raise ValueError("V5.2 raw/coarse geometry requires no mosaic or sensor-only perturbation")
+            # Keep raw pixels intact. Transport the inverse coarse rotation
+            # through the actual crop/flip/letterbox, for feature resampling.
+            C = _mat3(np.asarray(a0["v52_coarse_matrix"], np.float32))
+            Q = _mat3(M) @ np.linalg.inv(C) @ np.linalg.inv(_mat3(M))
+            quality["v52_ir_sampling"] = Q[:2].astype(np.float32)
         return {
             "rgb": torch.from_numpy(rgb_w.transpose(2, 0, 1).copy()).float() / 255.0,
             "ir": torch.from_numpy(ir_w[None].copy()).float() / 255.0,
@@ -1402,6 +1477,17 @@ def collate(batch: List[Optional[dict]]) -> Optional[dict]:
         if any(key in b["quality"] for b in batch):
             shape = (channels,*batch[0]["rgb"].shape[-2:])
             out["quality"][key] = torch.stack([b["quality"].get(key,torch.ones(shape)) for b in batch])
+    if any("v52_ir_sampling" in b["quality"] for b in batch):
+        if not all("v52_ir_sampling" in b["quality"] for b in batch):
+            raise ValueError("Mixed V5.2/cache-free samples")
+        out["quality"]["v52_ir_sampling"] = torch.stack([b["quality"]["v52_ir_sampling"] for b in batch])
+    for key in ("v521_ghost_probability", "v521_ghost_confidence",
+                "v521_coarse_available", "v521_thermal_confidence",
+                "v521_hard_mask", "v521_soft_mask", "v521_align_exclude"):
+        if any(key in b["quality"] for b in batch):
+            template = next(b["quality"][key] for b in batch if key in b["quality"])
+            out["quality"][key] = torch.stack([
+                b["quality"].get(key, template.new_zeros(template.shape)) for b in batch])
     # 缺失模态整路置零（承重配方）。⚠️ 这里只清图像；质量描述子/先验在 __getitem__ 里就已按 keep 清除。
     for m in ("rgb", "ir"):
         out[m] = out[m] * out["keep"][m].view(-1, 1, 1, 1)
@@ -1438,7 +1524,8 @@ def _index_source_signature(root: Path, label_dir: Optional[Path]) -> str:
 
 def build_index(root: Path, label_dir: Optional[Path] = None, limit: int = 0,
                 hash_size: int = 32, cache_dir: Optional[Path] = None,
-                use_cache: bool = True) -> List[dict]:
+                use_cache: bool = True,
+                exclude_stems: Optional[Path] = None) -> List[dict]:
     """扫描三模态 + 标签，返回样本列表（含 dHash 供分组用）。
 
     ⚠️ dHash 要对每张 visible **全分辨率解码**，2000 张单线程要 5–10 分钟。
@@ -1447,6 +1534,7 @@ def build_index(root: Path, label_dir: Optional[Path] = None, limit: int = 0,
     """
     root = Path(root)
     label_dir = Path(label_dir) if label_dir else None
+    excluded = load_exclude_stems(exclude_stems)
     signature = _index_source_signature(root, label_dir) if use_cache else None
     cache_dir = Path(cache_dir) if cache_dir else (root.parent / "_mm_index_cache")
     cache = cache_dir / (f"index_{root.name}__{label_dir.name if label_dir else 'nolab'}"
@@ -1458,12 +1546,12 @@ def build_index(root: Path, label_dir: Optional[Path] = None, limit: int = 0,
                 raise ValueError("缓存版本/哈希位数不匹配")
             if obj.get("source_signature") != signature:
                 raise ValueError("图像/标签清单或文件元数据已变化")
-            idx = obj["samples"]
+            idx = [s for s in obj["samples"] if s["stem"] not in excluded]
             for s in idx:
                 s["boxes"] = (np.array(s["boxes"], np.float32).reshape(-1, 5) if s["boxes"]
                               else np.zeros((0, 5), np.float32))
                 s["_hash_int"] = int(s["_hash"])
-            print(f"[index] 命中缓存 {cache.name}（{len(idx)} 样本）")
+            print(f"[index] 命中缓存 {cache.name}（{len(idx)} 样本；排除 {len(excluded)}）")
             return idx
         except Exception as exc:                                     # noqa: BLE001
             print(f"[index] 缓存不可用，重建：{exc}")
@@ -1474,6 +1562,9 @@ def build_index(root: Path, label_dir: Optional[Path] = None, limit: int = 0,
             raise SystemExit(f"缺少模态目录: {d}")
         per_mod[m] = {p.stem: p.name for p in d.iterdir() if p.suffix.lower() in EXTS}
     stems = sorted(set.intersection(*[set(v) for v in per_mod.values()]))
+    if excluded:
+        stems = [st for st in stems if st not in excluded]
+        print(f"[index] 按 {Path(exclude_stems).name} 排除 {len(excluded)} 个 stem")
     missing = {m: len(set(per_mod[m]) - set(stems)) for m in MODS}
     if any(missing.values()):
         print(f"[index] 警告：三模态未完全配对，各模态独有文件数 {missing}")

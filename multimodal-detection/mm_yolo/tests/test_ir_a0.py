@@ -9,8 +9,9 @@ import numpy as np
 MM = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(MM))
 
-from ir_a0 import (A0_QUALITY_NAMES, border_masks, load_sample, quality_maps,
-                   save_sample, select_affine_candidate, source_to_sampling)
+from ir_a0 import (A0_QUALITY_NAMES, affine_model_contract, border_masks,
+                   load_sample, quality_maps, save_sample,
+                   select_affine_candidate, source_to_sampling)
 
 
 class IRA0Tests(unittest.TestCase):
@@ -74,6 +75,24 @@ class IRA0Tests(unittest.TestCase):
         chosen, source = select_affine_candidate(coarse, refined, prior, .8, True)
         self.assertEqual(source, "sequence_prior")
         self.assertTrue(np.allclose(chosen["params"], prior))
+
+    def test_affine_contract_matches_canvas_head_limits(self):
+        ok, value = affine_model_contract(
+            (1.0, 4.0, -3.0, 1.01), (1080, 1920), (736, 1280))
+        self.assertTrue(ok)
+        self.assertLessEqual(float(np.abs(value).max()), 1.05)
+        ok, value = affine_model_contract(
+            (1.0, 38.4, 0.0, 1.01), (1080, 1920), (736, 1280))
+        self.assertFalse(ok)
+        self.assertGreater(float(np.abs(value).max()), 1.05)
+
+        # V5.1.1 keeps a small margin above the observed three-degree search
+        # boundary so high-confidence rotations do not saturate the head.
+        ok, value = affine_model_contract(
+            (3.25, 0.0, 0.0, 1.0), (1080, 1920), (736, 1280),
+            angle_limit=4.0)
+        self.assertTrue(ok)
+        self.assertLessEqual(float(np.abs(value).max()), 1.05)
 
 
 if __name__ == "__main__":
