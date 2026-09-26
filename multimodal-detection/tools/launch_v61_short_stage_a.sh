@@ -3,12 +3,12 @@ set -euo pipefail
 
 CODE=/root/autodl-tmp/DDBBPPT_v61/multimodal-detection
 INIT=/root/autodl-tmp/runs/v61_t0_real_batch_20260926_v3/v61_base_init.pt
-CACHE=/root/autodl-tmp/cache/ir_a0_v61_a0_v6_256_s42_20260926_v1
+CACHE=/root/v61_runs/ir_a0_v61_a0_v11_256_s42_20260926_v1
 MODE=pair
 if (( $# > 0 )); then
   MODE=$1
 fi
-OUT=/root/autodl-tmp/runs/v61_short_validation_20260926_v3
+OUT=/root/v61_runs/v61_short_stage_a_a0_v11_256x2_20260926_v1
 mkdir -p /root/v61_runtime_tmp
 export TMPDIR=/root/v61_runtime_tmp
 export PYTHONDONTWRITEBYTECODE=1
