@@ -5,7 +5,21 @@ from typing import Sequence
 
 import numpy as np
 
+from config import COMPETITION_CLASS_NAMES
 from data import MMDataset, boxes_norm_to_canvas, canvas_to_orig_norm, collate
+
+
+DEFAULT_TILE_CLASSES = "ball,bicycle,sign"
+
+
+def parse_tile_classes(value: str) -> tuple[int, ...] | None:
+    """类别名转比赛类别 ID；all 保留旧版全类别、按分数合并的对照模式。"""
+    if value.strip().lower() == "all":
+        return None
+    names = [name.strip().lower() for name in value.split(",")]
+    if not names or any(not name or name not in COMPETITION_CLASS_NAMES for name in names):
+        raise ValueError(f"tile-classes 必须是逗号分隔的类别名或 all: {COMPETITION_CLASS_NAMES}")
+    return tuple(dict.fromkeys(COMPETITION_CLASS_NAMES.index(name) for name in names))
 
 
 def tile_windows(height: int, width: int, fraction: float = 0.6,
@@ -63,6 +77,46 @@ def merge_detections(dets: Sequence[np.ndarray], iou: float = 0.6,
     return candidates[kept]
 
 
+def merge_targeted_detections(full: np.ndarray, tiles: Sequence[np.ndarray],
+                              target_classes: Sequence[int], max_short_side: float = 32,
+                              iou: float = 0.6, max_det: int = 100) -> np.ndarray:
+    """保留全图结果，只用指定类别的小切片框补充未覆盖的目标。"""
+    if max_short_side <= 0 or not (0 < iou < 1) or max_det < 1:
+        raise ValueError("invalid targeted tile merge settings")
+    full = np.asarray(full, np.float32).reshape(-1, 6)
+    keep = [row for row in full[:max_det]]
+    if len(keep) == max_det:
+        return full[:max_det]
+    candidates = [np.asarray(d, np.float32).reshape(-1, 6) for d in tiles if len(d)]
+    if not candidates:
+        return full.copy()
+    candidates = np.concatenate(candidates)
+    short = np.minimum(candidates[:, 2] - candidates[:, 0],
+                       candidates[:, 3] - candidates[:, 1])
+    allowed = np.isin(candidates[:, 5], target_classes)
+    valid = np.isfinite(candidates).all(axis=1) & (short > 0) & (short < max_short_side)
+    candidates = candidates[allowed & valid]
+    for row in candidates[np.argsort(-candidates[:, 4], kind="stable")]:
+        if len(keep) >= max_det:
+            break
+        if keep:
+            existing = np.asarray(keep)
+            same = existing[:, 5] == row[5]
+            boxes = existing[same, :4]
+            if len(boxes):
+                lt = np.maximum(boxes[:, :2], row[:2])
+                rb = np.minimum(boxes[:, 2:4], row[2:4])
+                wh = np.maximum(rb - lt, 0)
+                inter = wh[:, 0] * wh[:, 1]
+                area_boxes = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+                area_row = (row[2] - row[0]) * (row[3] - row[1])
+                if np.any(inter / np.maximum(area_boxes + area_row - inter, 1e-9) > iou):
+                    continue
+        keep.append(row)
+    result = np.asarray(keep, np.float32).reshape(-1, 6)
+    return result[np.argsort(-result[:, 4], kind="stable")]
+
+
 def tile_to_full_canvas(dets: np.ndarray, tile_M: np.ndarray, full_M: np.ndarray,
                         orig_hw: Sequence[float], window: Sequence[int],
                         canvas) -> np.ndarray:
@@ -96,7 +150,9 @@ def decode_full_and_tiles(model, dataset: MMDataset, samples: Sequence[dict],
                           full_batch: dict, full_dets: Sequence[np.ndarray], device,
                           conf: float, iou: float, max_det: int, modalities: str,
                           off, imgsz, fraction: float = 0.6, overlap: float = 0.2,
-                          merge_iou: float = 0.6, tile_batch: int = 2) -> list[np.ndarray]:
+                          merge_iou: float = 0.6, tile_batch: int = 2,
+                          target_classes: Sequence[int] | None = (4, 5, 7),
+                          max_short_side: float = 32) -> list[np.ndarray]:
     """复用 MMDataset 为每片重新生成三模态输入、质量图和深度先验。"""
     if tile_batch < 1 or len(samples) != len(full_dets):
         raise ValueError("invalid tile batch or mismatched full-image predictions")
@@ -125,4 +181,7 @@ def decode_full_and_tiles(model, dataset: MMDataset, samples: Sequence[dict],
                 full_batch["orig_hw"][owner].numpy(),
                 tile_samples[index]["crop_xyxy"], imgsz)
             parts[owner].append(projected)
-    return [merge_detections(p, merge_iou, max_det) for p in parts]
+    if target_classes is None:
+        return [merge_detections(p, merge_iou, max_det) for p in parts]
+    return [merge_targeted_detections(p[0], p[1:], target_classes,
+                                      max_short_side, merge_iou, max_det) for p in parts]

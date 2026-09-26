@@ -13,6 +13,7 @@ if str(HERE) not in sys.path:
 
 import data  # noqa: E402
 from tiled_inference import (decode_full_and_tiles, merge_detections,
+                             merge_targeted_detections, parse_tile_classes,
                              tile_to_full_canvas, tile_windows)  # noqa: E402
 
 
@@ -67,6 +68,35 @@ def test_merge_is_class_aware_and_respects_limit():
     assert len(merged) == 3
     assert np.allclose(merged[:, 4], [.9, .7, .6])
     assert merged[:, 5].tolist() == [7, 8, 7]
+
+
+def test_targeted_tiles_only_fill_small_missing_targets():
+    full = np.array([[10, 10, 30, 30, .4, 7],
+                     [80, 80, 95, 95, .3, 8]], np.float32)
+    tiles = np.array([[11, 11, 31, 31, .99, 7],  # 不覆盖全图已有的球
+                      [40, 40, 50, 50, .8, 7],   # 补回小球
+                      [60, 60, 110, 110, .9, 5],  # 大自行车不补
+                      [0, 0, 8, 8, .95, 8],     # 非目标类不补
+                      [65, 20, 75, 30, .7, 4]], np.float32)
+    result = merge_targeted_detections(full, [tiles], (7, 5, 4), 32, .6, 100)
+    assert len(result) == 4
+    assert np.any(np.all(result[:, :4] == full[0, :4], axis=1))
+    assert not np.any(np.all(result[:, :4] == tiles[0, :4], axis=1))
+    assert set(result[:, 5]) == {7, 8, 4}
+    assert np.all(np.diff(result[:, 4]) <= 0)
+
+
+def test_targeted_merge_keeps_full_results_at_detection_limit():
+    full = np.array([[i * 10, 0, i * 10 + 8, 8, .01, 7]
+                     for i in range(100)], np.float32)
+    tiles = np.array([[1001, 0, 1010, 9, .99, 7]], np.float32)
+    result = merge_targeted_detections(full, [tiles], (7,), 32, .6, 100)
+    assert np.array_equal(result, full)
+
+
+def test_tile_class_selection_accepts_names_and_legacy_all():
+    assert parse_tile_classes("ball,bicycle,sign") == (7, 5, 4)
+    assert parse_tile_classes("all") is None
 
 
 def test_full_and_tiles_run_through_same_dataset(monkeypatch):

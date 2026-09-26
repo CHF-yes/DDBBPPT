@@ -50,17 +50,22 @@ python mm_yolo/submit.py --ckpt /path/to/best.pt \
 
 小目标切片试验使用同一权重的全图结果加同步的 RGB/IR/Depth 切片结果。每片重新计算
 质量图与深度先验，映射回原图后按类别去重，最后统一限制每图 100 框；默认不会启用。
+启用后默认只接收 `ball,bicycle,sign` 且映射回全图画布后短边小于 32px 的切片框。
+全图结果优先，切片只补充未重叠的目标。`--tile-classes all` 可复现旧版全类别、
+按置信度合并的方式；也可用 `--tile-classes ball,bicycle` 单独比较类别组合。
 首次对照保持与当前提交相同的置信度、权重和后处理参数：
 
 ```bash
 python mm_yolo/submit.py --ckpt /path/to/best.pt \
   --root /data/test_extracted --out /data/submission_tiled \
   --conf 0.25 --tiled --tile-fraction 0.6 --tile-overlap 0.2 \
-  --tile-merge-iou 0.6 --tile-batch 2 --zip
+  --tile-merge-iou 0.6 --tile-batch 2 \
+  --tile-classes ball,bicycle,sign --tile-max-short-side 32 --zip
 ```
 
 `eval.py` 也接受相同的切片参数，可与普通推理分别运行并比较逐类 AP。切片增加推理耗时，
-其分数收益需要实测；已加入全量训练的旧验证图不能再作为全量权重的独立验证集。
+其分数收益需要实测；V4.4 的 400 张留出图可用于此权重的 A/B，已加入全量训练的
+权重不能再把这 400 张当作独立验证集。
 
 ## 维护边界
 
