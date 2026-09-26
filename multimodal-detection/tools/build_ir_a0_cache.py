@@ -72,7 +72,11 @@ def _refine_task(payload):
         rgb, geometry_thermal, geometry, cfg, prior=refine_origin)
     chosen, chosen_source = select_affine_candidate(
         coarse, refined, prior, prior_conf, use_prior)
-    confidence = float(chosen["confidence"] * (.5 + .5 * meta["valid_ratio"]))
+    # V6.1 no longer exposes or uses an effective-area ratio: black-frame and
+    # residual-ghost pixels are already excluded by the geometry mask.  Keep
+    # the transform evidence confidence unchanged instead of reintroducing the
+    # removed valid-area heuristic here.
+    confidence = float(chosen["confidence"])
     contract_ok, contract = affine_model_contract(
         chosen["params"], thermal.shape, contract_canvas, contract_angle,
         contract_shift, contract_scale)
