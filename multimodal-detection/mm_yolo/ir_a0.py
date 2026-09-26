@@ -21,13 +21,12 @@ try:
 except ImportError:  # tools may import this file as a top-level module
     from io_utils import imread_unicode
 
-# Version 9 keeps foreground vetoes but lets one background/parallax tile be an
-# outlier when the remaining regions, foreground and directional projections
-# jointly support a transform.
+# Version 10 strengthens high-confidence RGB-ghost removal and allows a
+# directionally supported rigid correction to beat periodic-grid translations.
 # fit one rotated sensor rectangle against the image canvas, and estimate A0
 # only from the remaining thermal geometry.  The cache contract contains only
 # the four spatial maps used by the geometry path.
-A0_VERSION = 9
+A0_VERSION = 10
 A0_QUALITY_NAMES = (
     "ghost_probability", "black_invalid_mask", "geometry_mask",
     "thermal_confidence",
@@ -183,12 +182,20 @@ def deghost_for_a0(rgb: np.ndarray, thermal: np.ndarray, ir3: np.ndarray):
     presence = float(
         np.clip((identity_fit - .04) / .30, 0, 1) *
         np.clip((specificity - .01) / .14, 0, 1) * coverage)
-    prediction = np.einsum("...c,cd->...d", rgb_high, beta).astype(np.float32)
+    # Chroma is the safest signal for declaring a ghost, but subtracting only
+    # chroma leaves the same RGB projection visible in the median/intensity
+    # image.  Once the identity fit is unequivocal, remove the fitted full IR
+    # component while retaining chroma specificity as the activation gate.
+    removal_beta, removal_target = beta, fit_target
+    if presence >= .75 and specificity >= .20 and full_fit >= .45:
+        removal_beta, removal_target = beta_full, ir_high
+    prediction = np.einsum(
+        "...c,cd->...d", rgb_high, removal_beta).astype(np.float32)
     support_values = np.abs(ir_high[support > .5])
     cap = (max(4.0, float(np.percentile(support_values, 99)) * 1.5)
            if support_values.size else 4.0)
     prediction = np.clip(prediction, -cap, cap)
-    residual = fit_target - prediction
+    residual = removal_target - prediction
     pred_mag = np.sqrt(np.square(prediction).mean(2))
     residual_mag = np.sqrt(np.square(residual).mean(2))
     local_fit = pred_mag / (pred_mag + residual_mag + 1e-3)
@@ -197,7 +204,73 @@ def deghost_for_a0(rgb: np.ndarray, thermal: np.ndarray, ir3: np.ndarray):
     strength = float(np.clip((presence - .05) / .45, 0, 1))
     magnitude = np.clip(pred_mag / max(magnitude_scale, 1e-3), 0, 1)
     ghost_mask = np.clip(strength * magnitude * local_fit * 1.5, 0, 1).astype(np.float32)
-    clean = np.clip(irf - prediction * (strength * local_fit)[..., None], 0, 255)
+    if presence >= .75 and specificity >= .20:
+        high_weight = strength * np.clip(.85 + .25 * local_fit, 0, 1)
+    else:
+        high_weight = strength * local_fit
+    clean = irf - prediction * high_weight[..., None]
+
+    # A strong zero-displacement chromatic ghost can also contain a broader
+    # halo that is not represented by the first high-frequency regression.
+    # Fit one guarded medium-frequency layer only after the sharp ghost has
+    # already passed the shifted-control specificity test.
+    mid_fit = mid_control_fit = mid_specificity = 0.0
+    if presence >= .75 and specificity >= .20:
+        mid_sigma = max(sigma * 5.0, 4.0)
+        rgb_mid = (cv2.GaussianBlur(rgbf, (0, 0), sigma) -
+                   cv2.GaussianBlur(rgbf, (0, 0), mid_sigma))
+        ir_mid = (cv2.GaussianBlur(irf, (0, 0), sigma) -
+                  cv2.GaussianBlur(irf, (0, 0), mid_sigma))
+        mid_support = _ghost_fit_support(rgb_mid)
+        mid_chroma = ir_mid - ir_mid.mean(2, keepdims=True)
+        beta_mid_full, mid_full_fit = _fit_leakage_regression(
+            rgb_mid, ir_mid, mid_support)
+        beta_mid_chroma, mid_chroma_fit = _fit_leakage_regression(
+            rgb_mid, mid_chroma, mid_support)
+        if mid_full_fit >= .45:
+            beta_mid, mid_fit, mid_target = beta_mid_full, mid_full_fit, ir_mid
+        elif mid_full_fit >= mid_chroma_fit:
+            beta_mid, mid_fit, mid_target = beta_mid_full, mid_full_fit, ir_mid
+        else:
+            beta_mid, mid_fit, mid_target = beta_mid_chroma, mid_chroma_fit, mid_chroma
+        mid_controls = []
+        for dx, dy in ((offset, 0), (-offset, 0), (0, offset), (0, -offset)):
+            _, score = _fit_leakage_regression(
+                _shift_image(rgb_mid, dx, dy), mid_target, mid_support)
+            mid_controls.append(score)
+        mid_control_fit = max(mid_controls, default=0.0)
+        mid_specificity = max(0.0, mid_fit - mid_control_fit)
+        mid_presence = float(
+            presence * np.clip((mid_fit - .03) / .24, 0, 1) *
+            np.clip((mid_specificity - .01) / .12, 0, 1))
+        if mid_presence > 0:
+            mid_prediction = np.einsum(
+                "...c,cd->...d", rgb_mid, beta_mid).astype(np.float32)
+            mid_values = np.abs(mid_target[mid_support > .5])
+            mid_cap = (max(3.0, float(np.percentile(mid_values, 99)) * 1.25)
+                       if mid_values.size else 3.0)
+            mid_prediction = np.clip(mid_prediction, -mid_cap, mid_cap)
+            mid_residual = mid_target - mid_prediction
+            mid_pred_mag = np.sqrt(np.square(mid_prediction).mean(2))
+            mid_residual_mag = np.sqrt(np.square(mid_residual).mean(2))
+            mid_local_fit = mid_pred_mag / (
+                mid_pred_mag + mid_residual_mag + 1e-3)
+            mid_positive = mid_pred_mag[mid_pred_mag > 0]
+            mid_scale = (float(np.percentile(mid_positive, 90))
+                         if mid_positive.size else 1.0)
+            mid_weight = mid_presence * np.clip(.55 + .40 * mid_local_fit, 0, .95)
+            clean -= mid_prediction * mid_weight[..., None]
+            mid_mask = np.clip(
+                mid_presence * np.clip(mid_pred_mag / max(mid_scale, 1e-3), 0, 1) *
+                np.clip(.5 + mid_local_fit, 0, 1), 0, 1).astype(np.float32)
+            ghost_mask = np.maximum(ghost_mask, mid_mask)
+
+    clean = np.clip(clean, 0, 255)
+    clean_high = clean - cv2.GaussianBlur(clean, (0, 0), sigma)
+    clean_chroma = clean_high - clean_high.mean(2, keepdims=True)
+    _, residual_full_fit = _fit_leakage_regression(rgb_high, clean_high, support)
+    _, residual_chroma_fit = _fit_leakage_regression(rgb_high, clean_chroma, support)
+    residual_fit = max(residual_full_fit, residual_chroma_fit)
     clean_thermal = np.median(clean, axis=2).astype(np.float32)
     meta = {
         "alpha_global": float(np.linalg.norm(beta) / math.sqrt(beta.size)),
@@ -209,6 +282,10 @@ def deghost_for_a0(rgb: np.ndarray, thermal: np.ndarray, ir3: np.ndarray):
         "ghost_full_fit": float(full_fit),
         "ghost_control_fit": float(control_fit),
         "ghost_specificity": float(specificity),
+        "ghost_mid_fit": float(mid_fit),
+        "ghost_mid_control_fit": float(mid_control_fit),
+        "ghost_mid_specificity": float(mid_specificity),
+        "ghost_residual_fit": float(residual_fit),
         "ghost_seed_ratio": float(support.mean()),
         "ghost_mask_ratio": float((ghost_mask > .35).mean()),
         "deghost_mean_change": float(np.abs(clean_thermal - thermal).mean()),
@@ -937,18 +1014,40 @@ def estimate_affine(rgb: np.ndarray, thermal: np.ndarray, geometry: np.ndarray,
                 metrics["positive_cols"] >= 3 and
                 metrics["foreground_gain"] >= .02 and
                 metrics["projection_gain"] >= .02)
+            directional_rigid_consensus = (
+                mode in ("raw_rescue", "old_rigid") and
+                abs(da) >= 8.0 and
+                metrics["candidate_score"] >= .20 and
+                metrics["gain"] >= .08 and
+                metrics["tile_positive"] >= 5 and
+                metrics["tile_median"] >= .01 and
+                max(metrics["positive_rows"], metrics["positive_cols"]) >= 3 and
+                min(metrics["positive_rows"], metrics["positive_cols"]) >= 2 and
+                metrics["foreground_gain"] >= .05 and
+                metrics["projection_candidate"] >= .35 and
+                metrics["projection_gain"] >= .12 and
+                metrics["tile_worst"] >= -.08)
             projection_ok = (mode in ("raw_translation", "old_translation") or
                              (metrics["projection_candidate"] >= .05 and
                               metrics["projection_gain"] >= .002) or
-                             strong_rotation_consensus)
+                             strong_rotation_consensus or
+                             directional_rigid_consensus)
             worst_limit = worst
             if (strong_rotation_consensus and
                     mode in ("raw_rescue", "old_rigid")):
                 worst_limit = min(worst_limit, -.080)
+            if directional_rigid_consensus:
+                worst_limit = min(worst_limit, -.080)
             tile_consensus_ok = (metrics["tile_worst"] >= worst_limit or
                                  distributed_consensus)
+            # After aggressive deghosting only a small part of the frame may
+            # remain eligible.  A relative gain over a negative baseline is
+            # then misleading, so low-support candidates need a real absolute
+            # cross-modal match before any motion is accepted.
+            absolute_floor = .16 if metrics["support"] < .25 else .10
             passes = (
-                metrics["candidate_score"] >= max(.10, simple_score + .004) and
+                metrics["candidate_score"] >= max(absolute_floor,
+                                                   simple_score + .004) and
                 metrics["gain"] >= min_gain + high_baseline_extra + boundary_extra and
                 metrics["tile_positive"] >= tiles and
                 metrics["tile_median"] >= 0 and
@@ -972,16 +1071,38 @@ def estimate_affine(rgb: np.ndarray, thermal: np.ndarray, geometry: np.ndarray,
 
     if accepted:
         accepted.sort(key=lambda x: x[0], reverse=True)
-        top_score = float(accepted[0][2]["candidate_score"])
-        complexity = {
-            "raw_translation": 0, "old_translation": 0,
-            "raw_rescue": 1, "old_rigid": 1,
-            "raw_full": 2, "old_full": 2,
-        }
-        near_best = [x for x in accepted
-                     if top_score - float(x[2]["candidate_score"]) <= .030]
-        near_best.sort(key=lambda x: (complexity[x[4]], -x[0]))
-        _, best, best_metrics, _, selected_mode = near_best[0]
+        top = accepted[0]
+        directional_override = None
+        if top[4] in ("raw_translation", "old_translation"):
+            top_delta = top[1]["delta"]
+            top_large_shift = (
+                abs(float(top_delta[1])) >= .095 * w / work_scale or
+                abs(float(top_delta[2])) >= .095 * h / work_scale)
+            directional = [x for x in accepted
+                           if x[4] in ("raw_rescue", "old_rigid") and
+                           abs(float(x[1]["delta"][0])) >= 8.0 and
+                           x[2]["foreground_gain"] >= .05 and
+                           x[2]["projection_gain"] >= .12 and
+                           x[2]["tile_positive"] >= 5 and
+                           x[2]["tile_worst"] >= -.08]
+            if top_large_shift and directional:
+                directional.sort(key=lambda x: x[0], reverse=True)
+                if (float(top[2]["candidate_score"]) -
+                        float(directional[0][2]["candidate_score"]) <= .050):
+                    directional_override = directional[0]
+        if directional_override is not None:
+            _, best, best_metrics, _, selected_mode = directional_override
+        else:
+            top_score = float(accepted[0][2]["candidate_score"])
+            complexity = {
+                "raw_translation": 0, "old_translation": 0,
+                "raw_rescue": 1, "old_rigid": 1,
+                "raw_full": 2, "old_full": 2,
+            }
+            near_best = [x for x in accepted
+                         if top_score - float(x[2]["candidate_score"]) <= .030]
+            near_best.sort(key=lambda x: (complexity[x[4]], -x[0]))
+            _, best, best_metrics, _, selected_mode = near_best[0]
     else:
         best, selected_mode = simple, simple["mode"]
         best_metrics = {

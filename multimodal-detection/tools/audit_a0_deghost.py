@@ -110,7 +110,7 @@ def main():
             _panel(rgb[..., ::-1], "C1 RGB"),
             _panel(_gray(thermal), "C2 raw IR"),
             _panel(_gray(clean),
-                   f"C3 deghosted IR score={meta['ghost_score']:.2f}"),
+                   f"C3 deghosted IR ghost={meta['ghost_score']:.2f} residual={meta.get('ghost_residual_fit', 0):.2f}"),
             _panel(_gray(geometry_thermal),
                    f"C4 black-frame removed IR invalid={invalid.mean():.3f}"),
             _panel(_gray(aligned),
@@ -147,7 +147,7 @@ def main():
         })
         print(json.dumps(rows[-1], ensure_ascii=False), flush=True)
     (out / "audit.json").write_text(
-        json.dumps({"version": "v61-a0-consensus-v9", "samples": rows},
+        json.dumps({"version": "v61-a0-deghost-rotation-v10", "samples": rows},
                    ensure_ascii=False, indent=2), encoding="utf-8")
 
 
