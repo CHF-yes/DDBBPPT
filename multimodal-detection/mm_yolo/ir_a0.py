@@ -21,11 +21,13 @@ try:
 except ImportError:  # tools may import this file as a top-level module
     from io_utils import imread_unicode
 
-# Version 7 fixes the preprocessing order: remove zero-displacement RGB ghost,
+# Version 8 fixes the preprocessing order and allows a strongly supported
+# large-angle rigid candidate to survive directional-projection changes caused
+# by the rotation itself.
 # fit one rotated sensor rectangle against the image canvas, and estimate A0
 # only from the remaining thermal geometry.  The cache contract contains only
 # the four spatial maps used by the geometry path.
-A0_VERSION = 7
+A0_VERSION = 8
 A0_QUALITY_NAMES = (
     "ghost_probability", "black_invalid_mask", "geometry_mask",
     "thermal_confidence",
@@ -914,15 +916,30 @@ def estimate_affine(rgb: np.ndarray, thermal: np.ndarray, geometry: np.ndarray,
             foreground_ok = not (
                 metrics["foreground_support"] >= .01 and
                 metrics["foreground_gain"] < -.005)
+            strong_rotation_consensus = (
+                abs(da) >= 10.0 and
+                metrics["candidate_score"] >= .25 and
+                metrics["gain"] >= .10 and
+                metrics["tile_positive"] >= 6 and
+                metrics["tile_median"] >= .04 and
+                metrics["positive_rows"] >= 3 and
+                metrics["positive_cols"] >= 3 and
+                metrics["foreground_gain"] >= .02 and
+                metrics["projection_candidate"] >= .20)
             projection_ok = (mode in ("raw_translation", "old_translation") or
                              (metrics["projection_candidate"] >= .05 and
-                              metrics["projection_gain"] >= .002))
+                              metrics["projection_gain"] >= .002) or
+                             strong_rotation_consensus)
+            worst_limit = worst
+            if (strong_rotation_consensus and
+                    mode in ("raw_rescue", "old_rigid")):
+                worst_limit = min(worst_limit, -.080)
             passes = (
                 metrics["candidate_score"] >= max(.10, simple_score + .004) and
                 metrics["gain"] >= min_gain + high_baseline_extra + boundary_extra and
                 metrics["tile_positive"] >= tiles and
                 metrics["tile_median"] >= 0 and
-                metrics["tile_worst"] >= worst and
+                metrics["tile_worst"] >= worst_limit and
                 metrics["positive_rows"] >= required_spread and
                 metrics["positive_cols"] >= required_spread and
                 foreground_ok and projection_ok)
