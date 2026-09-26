@@ -1331,7 +1331,11 @@ class MMDataset(Dataset):
         quality["availability"] = np.stack((spatial*keep["rgb"], ir_spatial*keep["ir"],
                                              valid_w*keep["dep"])).astype(np.float32)
         quality["scene_id"] = np.ones((1,*self.canvas),np.float32)
-        if a0 is not None and "v52_coarse_matrix" in a0:
+        if aug.v521_explicit and want_ir:
+            # V5.2.1 consumes the cache sampling matrix directly.
+            # Weak candidates use identity, but the explicit key remains present.
+            quality["v52_ir_sampling"] = sampling_canvas[:2].astype(np.float32)
+        elif a0 is not None and "v52_coarse_matrix" in a0:
             if aug.mosaic_p or (aug.ir_affine_p and not aug.v521_explicit) or aug.misalign_px:
                 raise ValueError("V5.2 raw/coarse geometry requires no mosaic or sensor-only perturbation")
             # Keep raw pixels intact. Transport the inverse coarse rotation
