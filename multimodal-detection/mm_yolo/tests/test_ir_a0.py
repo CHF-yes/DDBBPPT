@@ -121,7 +121,20 @@ class IRA0Tests(unittest.TestCase):
             cached = load_sample(root, "x")
             self.assertEqual(tuple(cached["quality_maps"].shape), quality.shape)
             self.assertEqual(int(cached["affine_supervised"]), 1)
-            self.assertAlmostEqual(float(cached["quality_maps"][9].mean()), .8, places=2)
+            self.assertEqual(tuple(cached["ghost_probability"].shape), quality.shape[1:])
+            self.assertEqual(tuple(cached["thermal_confidence_map"].shape), quality.shape[1:])
+            self.assertAlmostEqual(float(cached["coarse_candidate_available"]), 1.0)
+
+    def test_rectangle_intersection_border_supports_both_image_sizes(self):
+        for h, w in ((120, 192), (240, 320)):
+            image = np.full((h, w), 3, np.float32)
+            rect = ((w * .51, h * .49), (w * .82, h * .76), 7.0)
+            polygon = cv2.boxPoints(rect).astype(np.int32)
+            cv2.fillConvexPoly(image, polygon, 104)
+            visible, geometry, invalid = border_masks(image)
+            self.assertGreater(float(invalid[0, 0]), .9)
+            self.assertGreater(float(visible[h // 2, w // 2]), .9)
+            self.assertGreater(float(geometry[h // 2, w // 2]), .9)
 
     def test_source_to_sampling_restores_rendered_points(self):
         shape = (80, 120)
@@ -157,7 +170,7 @@ class IRA0Tests(unittest.TestCase):
         cv2.circle(gray, (153, 91), 20, 175, 4)
         cv2.rectangle(gray, (69, 49), (101, 78), 205, -1)
         rgb = np.repeat(gray[..., None], 3, 2)
-        truth = (32.0, .15 * w, -.12 * h, 1.18)
+        truth = (22.0, .15 * w, -.12 * h, 1.18)
         source_to_rgb = cv2.getRotationMatrix2D(
             ((w - 1) / 2, (h - 1) / 2), truth[0], truth[3])
         source_to_rgb[:, 2] += truth[1:3]

@@ -1249,25 +1249,19 @@ class MMDataset(Dataset):
                                ir_chroma=ir_chroma_q if want_ir else None)
         if a0 is not None and want_ir:
             cached_q = np.asarray(a0["quality_maps"], np.float32)
+            if cached_q.shape[0] != len(A0_QUALITY_NAMES):
+                raise ValueError(
+                    f"A0 quality contract mismatch for {s['stem']}: "
+                    f"{cached_q.shape[0]} channels, expected {len(A0_QUALITY_NAMES)}")
             source_h, source_w = cached_q.shape[-2:]
             source_to_orig = np.array([[W / source_w, 0, 0], [0, H / source_h, 0], [0, 0, 1]],
                                       np.float32)
             canvas_to_quality = np.array([[ps[1] / Wc, 0, 0], [0, ps[0] / Hc, 0], [0, 0, 1]],
                                          np.float32)
             qM = (canvas_to_quality @ _mat3(ir_input_M) @ source_to_orig)[:2]
-            a0_quality = np.stack([
-                cv2.warpAffine(ch, qM, (ps[1], ps[0]), flags=cv2.INTER_LINEAR,
-                               borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-                for ch in cached_q], 0).astype(np.float32)
-            # The cache is authoritative for processing-chain channels.  The
-            # current augmented image still supplies intensity/contrast/edge.
-            base_ir = quality.get("ir")
-            if base_ir is not None:
-                a0_quality[:3] = base_ir[:3]
-            a0_quality[9].fill(ir_affine_confidence)
-            quality["ir"] = a0_quality
-            # 显式告诉模型粗处理链的组成。这里的 ghost 仍是投影概率代理，
-            # 不宣称已经恢复出纯 Thermal，也不执行固定 IR-alpha*RGB。
+
+            # V7 keeps processing-chain maps explicit instead of overloading
+            # the generic IR quality tensor with duplicated channels.
             def _a0_map(name, fallback):
                 src = np.asarray(a0[name], np.float32) if name in a0 else fallback
                 if src.ndim == 3:
@@ -1275,33 +1269,56 @@ class MMDataset(Dataset):
                 return cv2.warpAffine(
                     src, qM, (ps[1], ps[0]), flags=cv2.INTER_LINEAR,
                     borderMode=cv2.BORDER_CONSTANT, borderValue=0).astype(np.float32)[None]
-            visible_src = np.asarray(a0.get("visible_mask", np.ones_like(cached_q[7])), np.float32)
-            hard_src = np.clip(1 - visible_src, 0, 1)
-            soft_src = np.clip(.45 * cached_q[5] + .35 * cached_q[6] + .20 * cached_q[4], 0, 1)
-            exclude_src = hard_src.copy()
-            band_y = max(2, round(exclude_src.shape[0] * .04))
-            band_x = max(2, round(exclude_src.shape[1] * .04))
-            exclude_src[:band_y] = exclude_src[-band_y:] = 1
-            exclude_src[:, :band_x] = exclude_src[:, -band_x:] = 1
+
+            visible_src = np.asarray(
+                a0.get("visible_mask", 1 - cached_q[1]), np.float32)
+            hard_src = np.asarray(a0.get("hard_mask", cached_q[1]), np.float32)
+            geom_src = np.asarray(a0.get("geometry_mask", cached_q[2]), np.float32)
+            exclude_src = np.asarray(
+                a0.get("align_exclude_mask", np.maximum(hard_src, 1 - geom_src)),
+                np.float32)
             quality["v521_ghost_probability"] = _a0_map(
-                "ghost_probability", np.clip(cached_q[7], 0, 1))
+                "ghost_probability", np.clip(cached_q[0], 0, 1))
             ghost_conf = float(np.asarray(a0.get("ghost_transform_confidence", 0.)).reshape(()))
             coarse_available = float(np.asarray(
                 a0.get("coarse_candidate_available", a0.get("v52_coarse_usable", 0.))).reshape(()))
-            quality["v521_ghost_confidence"] = np.full(
-                (1, ps[0], ps[1]), ghost_conf, np.float32)
-            quality["v521_coarse_available"] = np.full(
-                (1, ps[0], ps[1]), coarse_available, np.float32)
+            quality["v521_ghost_confidence"] = np.asarray(
+                [[[ghost_conf]]], np.float32)
+            quality["v521_coarse_available"] = np.asarray(
+                [[[coarse_available]]], np.float32)
             quality["v521_thermal_confidence"] = _a0_map(
-                "thermal_confidence_map", cached_q[8])
+                "thermal_confidence_map", cached_q[3])
             quality["v521_hard_mask"] = _a0_map("hard_mask", hard_src)
-            quality["v521_soft_mask"] = _a0_map("soft_mask", soft_src)
             quality["v521_align_exclude"] = _a0_map("align_exclude_mask", exclude_src)
-            geom_src = np.asarray(a0["geometry_mask"], np.float32)
+            quality["v521_geometry_mask"] = _a0_map("geometry_mask", geom_src)
             geom_full_M = (_mat3(ir_input_M) @ source_to_orig)[:2]
             ir_geometry = cv2.warpAffine(
                 geom_src, geom_full_M, (Wc, Hc), flags=cv2.INTER_NEAREST,
                 borderMode=cv2.BORDER_CONSTANT, borderValue=0).astype(np.float32)
+
+            # Remove the cached high-frequency RGB projection from the model
+            # input without adding synthetic ghost.  The low-frequency thermal
+            # field is retained; low-confidence samples remain unchanged.
+            ghost_src = np.asarray(
+                a0.get("ghost_probability", cached_q[0]), np.float32)
+            ghost_full = cv2.warpAffine(
+                ghost_src, geom_full_M, (Wc, Hc), flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT, borderValue=0).astype(np.float32)
+            ghost_gate = np.clip(ghost_conf * ghost_full, 0, 1)
+            if np.any(ghost_gate > 1e-4):
+                sigma = max(1.5, min(Hc, Wc) / 320.0)
+                thermal_base = cv2.GaussianBlur(ir_w.astype(np.float32), (0, 0), sigma)
+                ir_w = np.clip(ir_w * (1 - ghost_gate) + thermal_base * ghost_gate,
+                               0, 255).astype(np.float32)
+
+            # Fill the rectangle exterior before the backbone sees it.  The
+            # validity mask still removes those pixels from geometry scoring,
+            # while the fill prevents a synthetic straight edge at the frame.
+            invalid_full = (ir_geometry < .5).astype(np.uint8)
+            if invalid_full.any() and (ir_geometry > .5).any():
+                ir_w = cv2.inpaint(
+                    np.clip(ir_w, 0, 255).astype(np.uint8), invalid_full * 255,
+                    3, cv2.INPAINT_TELEA).astype(np.float32)
             ir_spatial *= ir_geometry
 
         # ---- modality dropout（整路置零 + 记录 keep）----
@@ -1487,7 +1504,7 @@ def collate(batch: List[Optional[dict]]) -> Optional[dict]:
         out["quality"]["v52_ir_sampling"] = torch.stack([b["quality"]["v52_ir_sampling"] for b in batch])
     for key in ("v521_ghost_probability", "v521_ghost_confidence",
                 "v521_coarse_available", "v521_thermal_confidence",
-                "v521_hard_mask", "v521_soft_mask", "v521_align_exclude"):
+                "v521_hard_mask", "v521_geometry_mask", "v521_align_exclude"):
         if any(key in b["quality"] for b in batch):
             template = next(b["quality"][key] for b in batch if key in b["quality"])
             out["quality"][key] = torch.stack([

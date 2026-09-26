@@ -168,11 +168,10 @@ class ExplicitCoarseIRInput(nn.Module):
         # translation and clockwise/counter-clockwise rotation.  Estimate the
         # global transform from explicit paired geometry maps on a fixed grid;
         # reserve detector features for the local residual branch.
-        # Coarse-space geometry input: hard/soft/processing masks, the A0
-        # ghost layer used as a mask, coarse IR intensity/edge, RGB edge, and
-        # four explicit A0 transform parameters.  Every spatial channel below
-        # is transported by the same A0 sampling matrix before concatenation.
-        geometry_channels = 24
+        # Coarse-space geometry input uses only explicit V7 maps plus derived
+        # RGB/IR geometry.  Removed blur, double-edge and constant availability
+        # maps are not duplicated in the trainable adapter.
+        geometry_channels = 22
         self.global_features = nn.Sequential(
             nn.Conv2d(geometry_channels, 96, 5, stride=2, padding=2, bias=False),
             nn.GroupNorm(8, 96), nn.SiLU(),
@@ -260,29 +259,27 @@ class ExplicitCoarseIRInput(nn.Module):
     def forward(self, raw, quality, canvas, rgb=None, ir=None):
         if quality is None or 'v52_ir_sampling' not in quality:
             raise ValueError('V5.2.1 requires explicit A0 sampling at train and eval time')
-        if 'availability' not in quality or 'ir' not in quality:
-            raise ValueError('V5.2.1 requires availability and ten-channel IR quality maps')
+        if 'availability' not in quality:
+            raise ValueError('V5.2.1 requires modality availability')
         sampling = quality['v52_ir_sampling'].float()
         valid = quality['availability'][:, 1:2].float()
-        q = quality['ir'].float()
         p4 = raw['p4']
         shape = p4.shape[-2:]
         valid_p4 = F.interpolate(valid, shape, mode='nearest')
         coarse = resample(p4 * valid_p4.to(p4.dtype), sampling, canvas)
 
-        raw_invalid = self._map(quality, 'v521_hard_mask', q[:, 3:4], shape).clamp(0, 1)
-        raw_blur = self._map(quality, 'v521_soft_mask', q[:, 5:6], shape).clamp(0, 1)
-        raw_double = F.interpolate(q[:, 6:7], shape, mode='bilinear', align_corners=False).clamp(0, 1)
-        # This is the A0-produced ghost layer.  Do not regenerate a per-image
-        # percentile mask here; transport this map with A0 and use it directly.
+        zero = torch.zeros_like(valid_p4)
+        one = torch.ones_like(valid_p4)
+        raw_invalid = self._map(
+            quality, 'v521_hard_mask', zero, shape).clamp(0, 1)
         raw_ghost = self._map(
-            quality, 'v521_ghost_probability', q[:, 7:8], shape).clamp(0, 1)
+            quality, 'v521_ghost_probability', zero, shape).clamp(0, 1)
         raw_ghost_conf = self._map(
-            quality, 'v521_ghost_confidence', torch.zeros_like(q[:, 7:8]), shape).clamp(0, 1)
+            quality, 'v521_ghost_confidence', zero, shape).clamp(0, 1)
         raw_thermal = self._map(
-            quality, 'v521_thermal_confidence', q[:, 8:9], shape).clamp(0, 1)
-        raw_coarse_available = self._map(
-            quality, 'v521_coarse_available', q[:, 9:10], shape).clamp(0, 1)
+            quality, 'v521_thermal_confidence', one, shape).clamp(0, 1)
+        raw_geometry = self._map(
+            quality, 'v521_geometry_mask', 1 - raw_invalid, shape).clamp(0, 1)
         raw_exclude = self._map(
             quality, 'v521_align_exclude', raw_invalid, shape).clamp(0, 1)
 
@@ -303,14 +300,12 @@ class ExplicitCoarseIRInput(nn.Module):
         # the same coarse coordinate system before the geometry head sees them.
         coarse_valid = resample(valid_p4, sampling, canvas).clamp(0, 1)
         coarse_invalid = resample(raw_invalid * valid_p4, sampling, canvas).clamp(0, 1)
-        coarse_blur = resample(raw_blur * valid_p4, sampling, canvas).clamp(0, 1)
-        coarse_double = resample(raw_double * valid_p4, sampling, canvas).clamp(0, 1)
         coarse_ghost_raw = resample(raw_ghost * valid_p4, sampling, canvas).clamp(0, 1)
         coarse_ghost_calibrated = calibrate_a0_ghost(coarse_ghost_raw)
         coarse_ghost_conf = resample(raw_ghost_conf * valid_p4, sampling, canvas).clamp(0, 1)
         coarse_thermal = resample(raw_thermal * valid_p4, sampling, canvas).clamp(0, 1)
-        coarse_available = resample(
-            raw_coarse_available * valid_p4, sampling, canvas).clamp(0, 1)
+        coarse_geometry = resample(
+            raw_geometry * valid_p4, sampling, canvas).clamp(0, 1)
         coarse_exclude = resample(raw_exclude * valid_p4, sampling, canvas).clamp(0, 1)
         ghost_rgb_support = rgb_ghost_support(rgb_edge)
         coarse_ghost, coarse_ghost_target = self._refine_ghost(
@@ -319,7 +314,7 @@ class ExplicitCoarseIRInput(nn.Module):
             coarse_ghost.float(), coarse_ghost_target.float(), beta=.05)
         coarse_weight = ((1 - coarse_ghost) * coarse_thermal *
                          (1 - coarse_invalid) * (1 - coarse_exclude) *
-                         coarse_valid).clamp(0, 1)
+                         coarse_geometry * coarse_valid).clamp(0, 1)
         masked_ir_edge = ir_edge * coarse_weight
         edge_signed = rgb_edge - masked_ir_edge
         edge_difference = edge_signed.abs()
@@ -331,11 +326,10 @@ class ExplicitCoarseIRInput(nn.Module):
         coord_x = xx[None, None].expand(len(p4), 1, -1, -1)
         coord_y = yy[None, None].expand(len(p4), 1, -1, -1)
         a0_condition = self._sampling_condition(sampling, canvas, shape)
-        maps = torch.cat((coarse_invalid, coarse_blur, coarse_double,
-                          coarse_ghost_raw, coarse_ghost_calibrated,
+        maps = torch.cat((coarse_invalid, coarse_ghost_raw, coarse_ghost_calibrated,
                           ghost_rgb_support, coarse_ghost,
-                          coarse_ghost_conf, coarse_thermal, coarse_available,
-                          coarse_exclude, coarse_valid, coarse_gray, rgb_edge,
+                          coarse_ghost_conf, coarse_thermal, coarse_exclude,
+                          coarse_geometry, coarse_valid, coarse_gray, rgb_edge,
                           masked_ir_edge, edge_signed, edge_difference, edge_overlap,
                           coord_x, coord_y, a0_condition), 1).to(coarse.dtype)
 
@@ -352,10 +346,11 @@ class ExplicitCoarseIRInput(nn.Module):
         raw_ghost_calibrated = calibrate_a0_ghost(raw_ghost)
         raw_ghost_supported, _ = self._refine_ghost(
             raw_ghost_calibrated, ghost_rgb_support)
-        raw_weight = ((1 - raw_ghost_supported) * raw_thermal * (1 - raw_invalid) *
-                      (1 - raw_exclude) * valid_p4).clamp(0, 1)
+        raw_weight = ((1 - raw_ghost_supported) * raw_thermal * raw_geometry *
+                      (1 - raw_invalid) * (1 - raw_exclude) * valid_p4).clamp(0, 1)
         candidate_base_weight = resample(
-            raw_thermal * (1 - raw_invalid) * (1 - raw_exclude) * valid_p4,
+            raw_thermal * raw_geometry * (1 - raw_invalid) *
+            (1 - raw_exclude) * valid_p4,
             total_sampling, canvas).clamp(0, 1)
         candidate_ghost_raw = resample(
             raw_ghost * valid_p4, total_sampling, canvas).clamp(0, 1)
@@ -371,24 +366,21 @@ class ExplicitCoarseIRInput(nn.Module):
 
         global_p4 = resample(p4 * valid_p4.to(p4.dtype), total_sampling, canvas)
         candidate_invalid = resample(raw_invalid * valid_p4, total_sampling, canvas).clamp(0, 1)
-        candidate_blur = resample(raw_blur * valid_p4, total_sampling, canvas).clamp(0, 1)
-        candidate_double = resample(raw_double * valid_p4, total_sampling, canvas).clamp(0, 1)
         candidate_ghost_conf = resample(
             raw_ghost_conf * valid_p4, total_sampling, canvas).clamp(0, 1)
         candidate_thermal = resample(raw_thermal * valid_p4, total_sampling, canvas).clamp(0, 1)
-        candidate_available = resample(
-            raw_coarse_available * valid_p4, total_sampling, canvas).clamp(0, 1)
+        candidate_geometry = resample(
+            raw_geometry * valid_p4, total_sampling, canvas).clamp(0, 1)
         candidate_exclude = resample(raw_exclude * valid_p4, total_sampling, canvas).clamp(0, 1)
         candidate_valid = resample(valid_p4, total_sampling, canvas).clamp(0, 1)
         candidate_gray = resample(raw_ir_gray, total_sampling, canvas)
         candidate_masked_edge = candidate_ir_edge * candidate_weight
         candidate_signed = rgb_edge - candidate_masked_edge
         local_maps = torch.cat((
-            candidate_invalid, candidate_blur, candidate_double,
-            candidate_ghost_raw, candidate_ghost_calibrated,
+            candidate_invalid, candidate_ghost_raw, candidate_ghost_calibrated,
             ghost_rgb_support, candidate_ghost,
-            candidate_ghost_conf, candidate_thermal, candidate_available,
-            candidate_exclude, candidate_valid, candidate_gray, rgb_edge,
+            candidate_ghost_conf, candidate_thermal, candidate_exclude,
+            candidate_geometry, candidate_valid, candidate_gray, rgb_edge,
             candidate_masked_edge, candidate_signed, candidate_signed.abs(),
             rgb_edge * candidate_masked_edge, coord_x, coord_y, a0_condition),
             1).to(global_p4.dtype)
@@ -456,7 +448,7 @@ class ExplicitCoarseIRInput(nn.Module):
             'ghost_mean': float(coarse_ghost.detach().mean()),
             'ghost_calibration_loss': float(self.last_ghost_calibration_loss.detach()),
             'ghost_confidence': float(coarse_ghost_conf.detach().mean()),
-            'coarse_available': float(coarse_available.detach().mean()),
+            'geometry_support': float(coarse_geometry.detach().mean()),
             'thermal_weight_mean': float(coarse_weight.detach().mean()),
         }
         return result

@@ -21,24 +21,23 @@ try:
 except ImportError:  # tools may import this file as a top-level module
     from io_utils import imread_unicode
 
-# Version 4 moves RGB-ghost suppression ahead of final border detection and
-# affine estimation.  The suppression creates an analysis proxy only: source
-# IR pixels are never rewritten or cached as replacement imagery.
-A0_VERSION = 6
+# Version 7 fixes the preprocessing order: remove zero-displacement RGB ghost,
+# fit one rotated sensor rectangle against the image canvas, and estimate A0
+# only from the remaining thermal geometry.  The cache contract contains only
+# the four spatial maps used by the geometry path.
+A0_VERSION = 7
 A0_QUALITY_NAMES = (
-    "intensity", "local_contrast", "edge", "invalid_border", "saturation",
-    "blur", "double_edge", "rgb_leakage", "thermal_confidence",
-    "registration_confidence",
+    "ghost_probability", "black_invalid_mask", "geometry_mask",
+    "thermal_confidence",
 )
 
 
 @dataclass(frozen=True)
 class SearchCfg:
     work_width: int = 480
-    # Raw rescue is deliberately wider than the learned residual head.  The
-    # latter remains bounded to +/-15 degrees while A0 can recover a badly
-    # rotated raw frame before training starts.
-    angle_limit: float = 45.0
+    # Offline A0 may correct rotations up to the agreed +/-25 degree range.
+    # The learned residual head remains independently bounded to +/-15 degrees.
+    angle_limit: float = 25.0
     angle_step: float = 5.0
     refine_angle_step: float = 1.0
     fine_angle_step: float = 0.25
@@ -215,94 +214,19 @@ def deghost_for_a0(rgb: np.ndarray, thermal: np.ndarray, ir3: np.ndarray):
     return clean_thermal, clean.astype(np.float32), ghost_mask, support, meta
 
 
-def _border_masks_v5(thermal: np.ndarray):
-    """Detect the single straight-edged polygon enclosing useful IR content.
-
-    The black frame is the dark, low-information exterior *outside* that
-    polygon.  Ordinary dark objects inside the polygon remain valid.
-    """
-    x = thermal.astype(np.float32)
-    h, w = x.shape
-    smooth = cv2.GaussianBlur(x, (0, 0), max(1.2, min(h, w) / 420.0))
-    _, std = _local_stats(smooth, 11)
-    band_width = max(3, round(min(h, w) * .025))
-    border_band = np.zeros((h, w), np.uint8)
-    border_band[:band_width] = 1; border_band[-band_width:] = 1
-    border_band[:, :band_width] = 1; border_band[:, -band_width:] = 1
-    border_values = smooth[border_band > 0]
-    central = smooth[h // 4: max(h // 4 + 1, 3 * h // 4),
-                     w // 4: max(w // 4 + 1, 3 * w // 4)]
-    exterior_level = float(np.median(border_values))
-    interior_level = float(np.median(central)) if central.size else float(np.median(smooth))
-    contrast = interior_level - exterior_level
-    if contrast < 4.0:
-        valid = np.ones((h, w), np.float32)
-        return valid, valid.copy(), np.zeros((h, w), np.float32)
-
-    threshold = float(min(exterior_level + max(3.0, .35 * contrast),
-                          np.percentile(smooth, 42)))
-    dark = ((smooth <= threshold) &
-            ((std <= max(10.0, np.percentile(std, 65))) |
-             (smooth <= exterior_level + 2.0))).astype(np.uint8)
-    dark = cv2.morphologyEx(dark, cv2.MORPH_CLOSE,
-                            np.ones((7, 7), np.uint8))
-    n, labels, stats, _ = cv2.connectedComponentsWithStats(dark, 8)
-    exterior = np.zeros_like(dark)
-    for i in range(1, n):
-        xx, yy, ww, hh, area = stats[i]
-        if xx == 0 or yy == 0 or xx + ww >= w or yy + hh >= h:
-            exterior[labels == i] = 1
-    exterior = cv2.morphologyEx(exterior, cv2.MORPH_CLOSE,
-                                np.ones((11, 11), np.uint8))
-    if exterior.mean() < .008:
-        valid = np.ones((h, w), np.float32)
-        return valid, valid.copy(), np.zeros((h, w), np.float32)
-
-    content = (1 - exterior).astype(np.uint8)
-    contours, _ = cv2.findContours(content, cv2.RETR_EXTERNAL,
-                                   cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        valid = np.ones((h, w), np.float32)
-        return valid, valid.copy(), np.zeros((h, w), np.float32)
-    contour = max(contours, key=cv2.contourArea)
-    area_ratio = cv2.contourArea(contour) / max(float(h * w), 1.0)
-    if not .25 <= area_ratio <= .995:
-        valid = np.ones((h, w), np.float32)
-        return valid, valid.copy(), np.zeros((h, w), np.float32)
-    hull = cv2.convexHull(contour)
-    perimeter = cv2.arcLength(hull, True)
-    polygon = cv2.approxPolyDP(hull, max(1.5, .012 * perimeter), True)
-    if len(polygon) < 4 or len(polygon) > 12:
-        polygon = cv2.approxPolyDP(hull, max(2.0, .025 * perimeter), True)
-    if len(polygon) < 4:
-        valid = np.ones((h, w), np.float32)
-        return valid, valid.copy(), np.zeros((h, w), np.float32)
-
-    visible = np.zeros((h, w), np.uint8)
-    cv2.fillPoly(visible, [polygon], 1)
-    invalid = 1 - visible
-    # The straight frame line itself is not a scene edge.  Remove a guard band
-    # on its inner side before any Sobel or phase-correlation calculation.
-    guard = max(5, round(min(h, w) * .012))
-    geometry = cv2.erode(visible, np.ones((guard, guard), np.uint8), iterations=1)
-    return visible.astype(np.float32), geometry.astype(np.float32), invalid.astype(np.float32)
-
-
 def border_masks(thermal: np.ndarray):
-    """Detect a dark exterior only when a straight polygon is actually present.
+    """Fit the useful field as canvas intersected with one rotated rectangle.
 
-    A shallow dark region touching the image boundary is not a black frame.
-    Acceptance requires a convex 4--8 sided polygon, long straight segments,
-    low contour-to-line error, darker/less-textured exterior pixels and broad
-    corner support.  Failure of any geometric test returns a fully valid mask.
+    The deghosted image has a very dark boundary-connected exterior.  We fit a
+    rotated sensor rectangle to its complement; OpenCV rasterization naturally
+    intersects that rectangle with the image canvas.  No area, side-count,
+    side-length or exterior-fraction acceptance rules are used.
     """
     x = thermal.astype(np.float32)
     h, w = x.shape
     all_valid = np.ones((h, w), np.float32)
     all_invalid = np.zeros((h, w), np.float32)
     smooth = cv2.GaussianBlur(x, (0, 0), max(1.2, min(h, w) / 420.0))
-    _, std = _local_stats(smooth, 11)
-    dynamic = float(np.percentile(smooth, 95) - np.percentile(smooth, 5))
     band_width = max(3, round(min(h, w) * .025))
     band = np.zeros((h, w), np.uint8)
     band[:band_width] = 1; band[-band_width:] = 1
@@ -311,114 +235,45 @@ def border_masks(thermal: np.ndarray):
                      w // 4: max(w // 4 + 1, 3 * w // 4)]
     exterior_level = float(np.median(smooth[band > 0]))
     interior_level = float(np.median(central)) if central.size else float(np.median(smooth))
-    contrast = interior_level - exterior_level
-    if contrast < max(8.0, .08 * max(dynamic, 1.0)):
+    # A black frame is much darker than the thermal field.  This photometric
+    # condition replaces the old collection of geometric size heuristics.
+    if interior_level < 8.0 or exterior_level > max(8.0, .38 * interior_level):
         return all_valid, all_valid.copy(), all_invalid
 
-    threshold = float(min(exterior_level + max(3.0, .30 * contrast),
-                          np.percentile(smooth, 38)))
-    texture_limit = max(7.0, float(np.percentile(std[band > 0], 75)))
-    dark = ((smooth <= threshold) &
-            ((std <= texture_limit) | (smooth <= exterior_level + 1.5))).astype(np.uint8)
+    threshold = float(exterior_level + .35 * (interior_level - exterior_level))
+    dark = (smooth <= threshold).astype(np.uint8)
     dark = cv2.morphologyEx(dark, cv2.MORPH_CLOSE,
-                            np.ones((7, 7), np.uint8))
+                            np.ones((max(3, round(min(h, w) * .012)),) * 2,
+                                    np.uint8))
     n, labels, stats, _ = cv2.connectedComponentsWithStats(dark, 8)
     exterior = np.zeros_like(dark)
     for i in range(1, n):
-        xx, yy, ww, hh, area = stats[i]
+        xx, yy, ww, hh, _ = stats[i]
         if xx == 0 or yy == 0 or xx + ww >= w or yy + hh >= h:
             exterior[labels == i] = 1
     exterior = cv2.morphologyEx(exterior, cv2.MORPH_CLOSE,
                                 np.ones((9, 9), np.uint8))
-    if exterior.mean() < .012:
-        return all_valid, all_valid.copy(), all_invalid
 
     content = (1 - exterior).astype(np.uint8)
     contours, _ = cv2.findContours(content, cv2.RETR_EXTERNAL,
-                                   cv2.CHAIN_APPROX_NONE)
+                                   cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return all_valid, all_valid.copy(), all_invalid
     contour = max(contours, key=cv2.contourArea)
-    area_ratio = cv2.contourArea(contour) / max(float(h * w), 1.0)
-    if not .30 <= area_ratio <= .985:
-        return all_valid, all_valid.copy(), all_invalid
-    hull = cv2.convexHull(contour)
-    perimeter = cv2.arcLength(hull, True)
-    choices = []
-    for fraction in (.006, .009, .012, .016, .022, .030):
-        candidate = cv2.approxPolyDP(hull, max(1.5, fraction * perimeter), True)
-        if 4 <= len(candidate) <= 8 and cv2.isContourConvex(candidate):
-            choices.append(candidate)
-    if not choices:
-        return all_valid, all_valid.copy(), all_invalid
-    polygon = min(choices, key=len)
-    vertices = polygon.reshape(-1, 2).astype(np.float32)
-    edges = np.roll(vertices, -1, axis=0) - vertices
-    lengths = np.sqrt(np.square(edges).sum(1))
-    if int((lengths >= .12 * min(h, w)).sum()) < 4:
+    if len(contour) < 4:
         return all_valid, all_valid.copy(), all_invalid
 
-    # A real outer black frame exposes a polygon boundary on most sides.  Two
-    # dark side bands, a vignette, or a shallow dark region may produce a
-    # rectangular bright centre whose top and bottom merely coincide with the
-    # image boundary; that is not the enclosing polygon described by the IR
-    # sensor frame.  Require at least three fitted edges to be visibly inset.
-    midpoints = .5 * (vertices + np.roll(vertices, -1, axis=0))
-    inset_margin = max(2.0, .015 * min(h, w))
-    inset_edges = ((midpoints[:, 0] >= inset_margin) &
-                   (midpoints[:, 0] <= w - 1 - inset_margin) &
-                   (midpoints[:, 1] >= inset_margin) &
-                   (midpoints[:, 1] <= h - 1 - inset_margin))
-    if int(inset_edges.sum()) < 3:
-        return all_valid, all_valid.copy(), all_invalid
-
-    # Measure how well the observed inner boundary is explained by the fitted
-    # straight polygon instead of accepting a convex hull around irregular dark
-    # scenery.  A true frame keeps nearly all contour points close to a line.
-    points = contour.reshape(-1, 2).astype(np.float32)
-    stride = max(1, len(points) // 2500)
-    points = points[::stride]
-    distances = []
-    for a, b in zip(vertices, np.roll(vertices, -1, axis=0)):
-        ab = b - a
-        denom = max(float(ab @ ab), 1e-6)
-        t = np.clip(((points - a) @ ab) / denom, 0, 1)
-        projection = a + t[:, None] * ab
-        distances.append(np.sqrt(np.square(points - projection).sum(1)))
-    line_error = np.min(np.stack(distances, 1), axis=1)
-    diagonal = math.hypot(h, w)
-    if float(np.percentile(line_error, 90)) > max(3.5, .010 * diagonal):
-        return all_valid, all_valid.copy(), all_invalid
-
+    rectangle = cv2.boxPoints(cv2.minAreaRect(contour)).astype(np.int32)
     visible = np.zeros((h, w), np.uint8)
-    cv2.fillPoly(visible, [polygon], 1)
+    cv2.fillConvexPoly(visible, rectangle, 1)
     outside = visible == 0
     inside = visible > 0
-    if outside.sum() < .01 * h * w or inside.sum() < .25 * h * w:
+    if not inside.any():
         return all_valid, all_valid.copy(), all_invalid
-    outside_dark = float((smooth[outside] <= threshold + 2.0).mean())
-    inside_dark = float((smooth[inside] <= threshold + 2.0).mean())
-    outside_texture = float(np.median(std[outside]))
-    inside_texture = float(np.median(std[inside]))
-    corners = ((0, 0), (0, w - 1), (h - 1, 0), (h - 1, w - 1))
-    corner_support = sum(not bool(visible[y, x0]) for y, x0 in corners)
-    if (outside_dark < .72 or outside_dark - inside_dark < .22 or
-            outside_texture > inside_texture * .85 + 1.5 or corner_support < 2):
+    if outside.any() and float(np.median(smooth[outside])) > .45 * float(np.median(smooth[inside])):
         return all_valid, all_valid.copy(), all_invalid
 
     invalid = 1 - visible
-    # The sensor frame is an exterior ring around the useful polygon.  If the
-    # candidate only removes two opposing strips, it is more likely ordinary
-    # vignetting or dark scenery than a real enclosing black frame.
-    side_band = max(2, round(min(h, w) * .02))
-    side_support = (
-        float(invalid[:side_band].mean()),
-        float(invalid[-side_band:].mean()),
-        float(invalid[:, :side_band].mean()),
-        float(invalid[:, -side_band:].mean()),
-    )
-    if sum(value >= .05 for value in side_support) < 3:
-        return all_valid, all_valid.copy(), all_invalid
     guard = max(5, round(min(h, w) * .012))
     geometry = cv2.erode(visible, np.ones((guard, guard), np.uint8), iterations=1)
     return visible.astype(np.float32), geometry.astype(np.float32), invalid.astype(np.float32)
@@ -484,29 +339,19 @@ def quality_maps(rgb: np.ndarray, thermal: np.ndarray, ir3: np.ndarray,
     # Strong remaining RGB-explainable pixels must not vote on the transform.
     ghost_exclude = cv2.dilate((ghost > .45).astype(np.uint8),
                                np.ones((5, 5), np.uint8), iterations=1)
-    reduced_geometry = geometry * (1 - ghost_exclude.astype(np.float32))
-    if reduced_geometry.mean() >= max(.10, geometry.mean() * .55):
-        geometry = reduced_geometry
-    mean, std = _local_stats(clean_thermal)
-    edge = _normalized_edge(clean_thermal, geometry)
-    lap = np.abs(cv2.Laplacian(clean_thermal, cv2.CV_32F, ksize=3))
-    lap_scale = float(np.percentile(lap[geometry > .5], 95)) if np.any(geometry > .5) else 1.0
-    sharp = np.clip(lap / max(lap_scale, 1e-6), 0, 1)
-    blur = 1 - sharp
-    dense_edge = cv2.blur((edge > .25).astype(np.float32), (7, 7))
-    double_edge = np.clip(edge * dense_edge * 3, 0, 1)
-    saturation = ((mean < 2) | (mean > 253)).astype(np.float32)
-    leak = ghost
+    geometry = geometry * (1 - ghost_exclude.astype(np.float32))
+    _, std = _local_stats(clean_thermal)
     thermal_conf = (geometry * np.clip(std / 24.0, 0, 1) *
-                    (1 - .5 * double_edge) * (1 - .75 * ghost))
-    channels = [mean / 255.0, np.clip(std / 64.0, 0, 1), edge, invalid,
-                saturation, blur, double_edge, leak, thermal_conf,
-                np.zeros_like(thermal_conf)]
+                    (1 - .75 * ghost)).astype(np.float32)
+    channels = [ghost, invalid, geometry, thermal_conf]
     oh, ow = out_hw
     q = np.stack([cv2.resize(x.astype(np.float32), (ow, oh), interpolation=cv2.INTER_AREA)
                   for x in channels], 0)
     meta = {
-        **ghost_meta, "valid_ratio": float(visible.mean()),
+        **ghost_meta,
+        "black_border_area_px": float(invalid.sum()),
+        "source_height": float(thermal.shape[0]),
+        "source_width": float(thermal.shape[1]),
         "thermal_confidence": float(thermal_conf.sum() / max(geometry.sum(), 1)),
     }
     result = (q.astype(np.float32), visible, geometry, meta)
@@ -577,6 +422,38 @@ def _corr(a: np.ndarray, b: np.ndarray, mask: np.ndarray):
     return float((x * y).sum() / denom)
 
 
+def _profile_corr(a: np.ndarray, b: np.ndarray, support: np.ndarray):
+    keep = support > 1e-4
+    if keep.sum() < 8:
+        return -1.0
+    x, y = a[keep].astype(np.float32), b[keep].astype(np.float32)
+    x -= x.mean(); y -= y.mean()
+    denom = float(np.sqrt((x * x).sum() * (y * y).sum()) + 1e-8)
+    return float((x * y).sum() / denom)
+
+
+def _directional_projection_score(reference: np.ndarray, moving: np.ndarray,
+                                  mask: np.ndarray):
+    """Compare edge-energy projections at 0, 90, 45 and 135 degrees."""
+    h, w = reference.shape
+    yy, xx = np.indices((h, w))
+    weight = np.clip(mask.astype(np.float32), 0, 1)
+    directions = ((xx, w), (yy, h), (xx + yy, w + h - 1),
+                  (xx - yy + h - 1, w + h - 1))
+    scores = []
+    for index, bins in directions:
+        flat = index.reshape(-1)
+        support = np.bincount(flat, weights=weight.reshape(-1), minlength=bins)
+        ref = np.bincount(flat, weights=(reference * weight).reshape(-1), minlength=bins)
+        mov = np.bincount(flat, weights=(moving * weight).reshape(-1), minlength=bins)
+        ref = ref / np.maximum(support, 1e-4)
+        mov = mov / np.maximum(support, 1e-4)
+        score = _profile_corr(ref, mov, support)
+        if score > -1:
+            scores.append(score)
+    return float(np.mean(scores)) if scores else -1.0
+
+
 def _candidate_score(rgb_edge, ir_edge, ir_mask, matrix):
     h, w = rgb_edge.shape
     warped_edge = cv2.warpAffine(ir_edge, matrix, (w, h), flags=cv2.INTER_LINEAR,
@@ -600,6 +477,10 @@ def _common_support_metrics(rgb_edge, ir_edge, ir_mask, candidate, baseline):
     common = ((cand_mask > .5) & (base_mask > .5)).astype(np.float32)
     cand_score = _corr(rgb_edge, cand_edge, common)
     base_score = _corr(rgb_edge, base_edge, common)
+    projection_candidate = _directional_projection_score(
+        rgb_edge, cand_edge, common)
+    projection_baseline = _directional_projection_score(
+        rgb_edge, base_edge, common)
     gains, locations = [], []
     for row in range(3):
         y0, y1 = round(row * h / 3), round((row + 1) * h / 3)
@@ -647,6 +528,9 @@ def _common_support_metrics(rgb_edge, ir_edge, ir_mask, candidate, baseline):
         "foreground_baseline": float(foreground_baseline),
         "foreground_gain": float(foreground_gain),
         "foreground_support": float(foreground_support),
+        "projection_candidate": float(projection_candidate),
+        "projection_baseline": float(projection_baseline),
+        "projection_gain": float(projection_candidate - projection_baseline),
     }
 
 
@@ -1030,6 +914,9 @@ def estimate_affine(rgb: np.ndarray, thermal: np.ndarray, geometry: np.ndarray,
             foreground_ok = not (
                 metrics["foreground_support"] >= .01 and
                 metrics["foreground_gain"] < -.005)
+            projection_ok = (mode in ("raw_translation", "old_translation") or
+                             (metrics["projection_candidate"] >= .05 and
+                              metrics["projection_gain"] >= .002))
             passes = (
                 metrics["candidate_score"] >= max(.10, simple_score + .004) and
                 metrics["gain"] >= min_gain + high_baseline_extra + boundary_extra and
@@ -1037,7 +924,8 @@ def estimate_affine(rgb: np.ndarray, thermal: np.ndarray, geometry: np.ndarray,
                 metrics["tile_median"] >= 0 and
                 metrics["tile_worst"] >= worst and
                 metrics["positive_rows"] >= required_spread and
-                metrics["positive_cols"] >= required_spread and foreground_ok)
+                metrics["positive_cols"] >= required_spread and
+                foreground_ok and projection_ok)
             objective = metrics["candidate_score"] - penalty
             record = (objective, item, metrics, passes, mode)
             if best_mode is None or objective > best_mode[0]:
@@ -1065,6 +953,8 @@ def estimate_affine(rgb: np.ndarray, thermal: np.ndarray, geometry: np.ndarray,
             "foreground_candidate": simple["score"],
             "foreground_baseline": simple["score"], "foreground_gain": 0.0,
             "foreground_support": 0.0,
+            "projection_candidate": simple["score"],
+            "projection_baseline": simple["score"], "projection_gain": 0.0,
         }
 
     alternatives = ([x[2]["candidate_score"] for x in accepted if x[1] is not best]
@@ -1093,6 +983,7 @@ def estimate_affine(rgb: np.ndarray, thermal: np.ndarray, geometry: np.ndarray,
         "tile_positive": int(best_metrics["tile_positive"]),
         "tile_median_gain": float(best_metrics["tile_median"]),
         "tile_worst_gain": float(best_metrics["tile_worst"]),
+        "directional_projection_gain": float(best_metrics["projection_gain"]),
         "search_bounds": {
             "raw_angle": float(cfg.angle_limit),
             "residual_angle": float(cfg.residual_angle),
@@ -1207,8 +1098,10 @@ def save_sample(path: Path, *, stem: str, params: Sequence[float], confidence: f
     sampling = source_to_sampling(params, shape)
     model_params = sampling_params(sampling, shape)
     q = quality.copy()
-    q[9].fill(float(confidence))
     path.parent.mkdir(parents=True, exist_ok=True)
+    ghost_confidence = float(meta.get("ghost_score", 0.0))
+    coarse_available = float(confidence >= min_confidence)
+    align_exclude = np.maximum(q[1], 1 - q[2]).astype(np.float16)
     np.savez_compressed(
         path, version=np.int32(A0_VERSION), stem=np.asarray(stem),
         source_to_rgb_params=np.asarray(params, np.float32),
@@ -1222,6 +1115,12 @@ def save_sample(path: Path, *, stem: str, params: Sequence[float], confidence: f
         sequence=np.asarray(sequence), sequence_prior=np.asarray(sequence_prior, np.float32),
         sequence_confidence=np.float32(sequence_confidence),
         quality_maps=q.astype(np.float16),
+        ghost_probability=q[0].astype(np.float16),
+        ghost_transform_confidence=np.float32(ghost_confidence),
+        coarse_candidate_available=np.float32(coarse_available),
+        thermal_confidence_map=q[3].astype(np.float16),
+        hard_mask=q[1].astype(np.float16),
+        align_exclude_mask=align_exclude,
         visible_mask=cv2.resize(visible, (q.shape[2], q.shape[1]), interpolation=cv2.INTER_AREA).astype(np.float16),
         geometry_mask=cv2.resize(geometry, (q.shape[2], q.shape[1]), interpolation=cv2.INTER_AREA).astype(np.float16),
         orig_hw=np.asarray(shape, np.int32),
