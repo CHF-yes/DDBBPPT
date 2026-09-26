@@ -3,6 +3,7 @@
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 from torch import nn
@@ -15,14 +16,53 @@ for path in (MM, MM.parent / "vendor"):
 from config import FusionCfg  # noqa: E402
 from data import collate  # noqa: E402
 from fusion import FusionBlock, PersistentRegisterBus  # noqa: E402
-from train import (accumulation_loss, build_optimizer, ensure_finite_state, iter_prefetch,
-                   set_bn_eval, validate_checkpoint)  # noqa: E402
+from train import (accumulation_loss, adapt_depth_checkpoint_state, build_optimizer,
+                   ensure_finite_state, iter_prefetch, set_bn_eval,
+                   validate_checkpoint)  # noqa: E402
 
 
 class TrainingRegressions(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         torch.set_num_threads(2)
+
+    def test_v521_a0_v11_geometry_channel_migration(self):
+        geometry_map = (0, 3, 4, 5, 6, 7, 8, 10, 9, 11, 12, 13,
+                        14, 15, 16, 17, 18, 19, 20, 21, 22, 23)
+
+        class FakeModel:
+            cfg = SimpleNamespace(
+                fusion=SimpleNamespace(fusion_strategy="v521_stage_a_v1"))
+
+            @staticmethod
+            def state_dict():
+                return {
+                    "v52_ir_input.global_features.0.weight":
+                        torch.zeros(2, 22, 1, 1),
+                    "v52_ir_input.local_head.0.weight":
+                        torch.zeros(2, 278, 1, 1),
+                }
+
+        global_old = torch.arange(24, dtype=torch.float32).view(1, 24, 1, 1)
+        global_old = global_old.expand(2, -1, -1, -1).clone()
+        local_old = torch.zeros(2, 280, 1, 1)
+        local_old[:, :256] = torch.arange(256, dtype=torch.float32).view(1, 256, 1, 1)
+        local_old[:, 256:] = torch.arange(24, dtype=torch.float32).view(1, 24, 1, 1)
+        migrated, changed = adapt_depth_checkpoint_state({
+            "v52_ir_input.global_features.0.weight": global_old,
+            "v52_ir_input.local_head.0.weight": local_old,
+        }, FakeModel())
+        self.assertTrue(changed)
+        self.assertEqual(tuple(migrated[
+            "v52_ir_input.global_features.0.weight"].shape), (2, 22, 1, 1))
+        self.assertEqual(tuple(migrated[
+            "v52_ir_input.local_head.0.weight"].shape), (2, 278, 1, 1))
+        self.assertEqual(
+            migrated["v52_ir_input.global_features.0.weight"][0, :, 0, 0].tolist(),
+            [float(index) for index in geometry_map])
+        self.assertEqual(
+            migrated["v52_ir_input.local_head.0.weight"][0, 256:, 0, 0].tolist(),
+            [float(index) for index in geometry_map])
 
     def test_bn_default_only_pretrained(self):
         model = nn.Module()

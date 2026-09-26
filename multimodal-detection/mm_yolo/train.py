@@ -1169,6 +1169,38 @@ def adapt_depth_checkpoint_state(state: dict, model: MMYOLO) -> tuple:
                                 (legacy_fusion and is_v45)):
             out[name] = target.detach().clone()
             migrated = True
+
+    # A0 v11 removes the obsolete blur, double-edge and constant-availability
+    # geometry maps, and adds the explicit geometry mask.  Migrate the trained
+    # 24-channel adapter to the new 22-channel contract by semantic position;
+    # initialize the new geometry-mask channel from the former availability
+    # channel, which is the closest conservative support signal.
+    if getattr(model.cfg.fusion, "fusion_strategy", "") == "v521_stage_a_v1":
+        geometry_map = (0, 3, 4, 5, 6, 7, 8, 10, 9, 11, 12, 13,
+                        14, 15, 16, 17, 18, 19, 20, 21, 22, 23)
+        adapter_inputs = (
+            ("v52_ir_input.global_features.0.weight", 0),
+            ("v52_ir_input.local_head.0.weight", None),
+        )
+        for name, fixed_prefix in adapter_inputs:
+            source, target = out.get(name), target_state.get(name)
+            if source is None or target is None or tuple(source.shape) == tuple(target.shape):
+                continue
+            prefix = (int(fixed_prefix) if fixed_prefix is not None else
+                      int(target.shape[1]) - len(geometry_map))
+            compatible = (
+                source.ndim == 4 and target.ndim == 4 and
+                source.shape[0] == target.shape[0] and
+                source.shape[2:] == target.shape[2:] and
+                source.shape[1] == prefix + 24 and
+                target.shape[1] == prefix + len(geometry_map))
+            if not compatible:
+                raise ValueError(
+                    f"{name} 无法执行 A0 v11 24ch→22ch 迁移："
+                    f"{tuple(source.shape)} -> {tuple(target.shape)}")
+            keep = list(range(prefix)) + [prefix + index for index in geometry_map]
+            out[name] = source[:, keep].detach().clone()
+            migrated = True
     key = "dep_adapter.weight"
     if key not in state:
         return out, migrated
