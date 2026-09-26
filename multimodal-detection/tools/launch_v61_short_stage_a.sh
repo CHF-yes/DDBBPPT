@@ -8,7 +8,7 @@ MODE=pair
 if (( $# > 0 )); then
   MODE=$1
 fi
-OUT=/root/autodl-tmp/runs/v61_short_validation_20260926_v2
+OUT=/root/autodl-tmp/runs/v61_short_validation_20260926_v3
 mkdir -p /root/v61_runtime_tmp
 export TMPDIR=/root/v61_runtime_tmp
 export PYTHONDONTWRITEBYTECODE=1
