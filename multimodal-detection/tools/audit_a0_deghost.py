@@ -43,6 +43,14 @@ def _overlay(rgb: np.ndarray, thermal: np.ndarray, params):
                        _edge(aligned))) * 255).astype(np.uint8)
 
 
+def _aligned(thermal: np.ndarray, params):
+    h, w = thermal.shape
+    m = affine_matrix(float(params[0]), float(params[1]), float(params[2]),
+                      float(params[3]), (h, w))
+    return cv2.warpAffine(thermal, m, (w, h), flags=cv2.INTER_LINEAR,
+                          borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+
 def _gray(x: np.ndarray):
     y = np.clip(x, 0, 255).astype(np.uint8)
     return cv2.cvtColor(y, cv2.COLOR_GRAY2BGR)
@@ -97,23 +105,20 @@ def main():
                               prior=old_params)
         new_params = np.asarray(new["params"], np.float32)
         invalid = 1 - visible
+        aligned = _aligned(geometry_thermal, new_params)
         panels = [
             _panel(rgb[..., ::-1], "C1 RGB"),
             _panel(_gray(thermal), "C2 raw IR"),
-            _panel(_mask(fit_support),
-                   f"C3 ghost fit support {fit_support.mean():.3f}"),
-            _panel(_mask(ghost), f"C4 ghost score {meta['ghost_score']:.3f}"),
-            _panel(_gray(clean), f"C5 deghost proxy d={meta['deghost_mean_change']:.2f}"),
-            _panel(_mask(invalid), f"C6 polygon exterior {invalid.mean():.3f}"),
-            _panel(_mask(geometry), f"C7 scoring interior {geometry.mean():.3f}"),
-            _panel(_overlay(rgb, thermal, (0, 0, 0, 1)), "C8 raw overlay"),
-            _panel(_overlay(rgb, thermal, old_params),
-                   f"C9 old a={old_params[0]:+.2f} x={old_params[1]:+.1f} y={old_params[2]:+.1f}"),
-            _panel(_overlay(rgb, thermal, new_params),
-                   f"C10 {new['selected_mode']} a={new_params[0]:+.2f} x={new_params[1]:+.1f} y={new_params[2]:+.1f}"),
+            _panel(_gray(clean),
+                   f"C3 deghosted IR score={meta['ghost_score']:.2f}"),
+            _panel(_gray(geometry_thermal),
+                   f"C4 black-frame removed IR invalid={invalid.mean():.3f}"),
+            _panel(_gray(aligned),
+                   f"C5 affine IR {new['selected_mode']} a={new_params[0]:+.2f} s={new_params[3]:.3f}"),
+            _panel(_overlay(rgb, geometry_thermal, new_params),
+                   "C6 RGB/IR edge overlap"),
         ]
-        top = np.hstack(panels[:5]); bottom = np.hstack(panels[5:])
-        sheet = np.vstack((top, bottom))
+        sheet = np.hstack(panels)
         cv2.imwrite(str(out / f"{stem}.jpg"), sheet,
                     [cv2.IMWRITE_JPEG_QUALITY, 94])
         rows.append({
@@ -142,7 +147,7 @@ def main():
         })
         print(json.dumps(rows[-1], ensure_ascii=False), flush=True)
     (out / "audit.json").write_text(
-        json.dumps({"version": "v61-a0-polygon-v6", "samples": rows},
+        json.dumps({"version": "v61-a0-consensus-v9", "samples": rows},
                    ensure_ascii=False, indent=2), encoding="utf-8")
 
 
