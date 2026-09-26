@@ -203,7 +203,11 @@ def deghost_for_a0(rgb: np.ndarray, thermal: np.ndarray, ir3: np.ndarray):
     magnitude_scale = float(np.percentile(positive, 90)) if positive.size else 1.0
     strength = float(np.clip((presence - .05) / .45, 0, 1))
     magnitude = np.clip(pred_mag / max(magnitude_scale, 1e-3), 0, 1)
-    ghost_mask = np.clip(strength * magnitude * local_fit * 1.5, 0, 1).astype(np.float32)
+    # Keep the original detection footprint for diagnostics only.  Geometry
+    # must later be gated by what remains after cleaning, not by pixels that
+    # have already been successfully repaired.
+    ghost_detected = np.clip(
+        strength * magnitude * local_fit * 1.5, 0, 1).astype(np.float32)
     if presence >= .75 and specificity >= .20:
         high_weight = strength * np.clip(.85 + .25 * local_fit, 0, 1)
     else:
@@ -263,15 +267,56 @@ def deghost_for_a0(rgb: np.ndarray, thermal: np.ndarray, ir3: np.ndarray):
             mid_mask = np.clip(
                 mid_presence * np.clip(mid_pred_mag / max(mid_scale, 1e-3), 0, 1) *
                 np.clip(.5 + mid_local_fit, 0, 1), 0, 1).astype(np.float32)
-            ghost_mask = np.maximum(ghost_mask, mid_mask)
+            ghost_detected = np.maximum(ghost_detected, mid_mask)
 
     clean = np.clip(clean, 0, 255)
     clean_high = clean - cv2.GaussianBlur(clean, (0, 0), sigma)
     clean_chroma = clean_high - clean_high.mean(2, keepdims=True)
-    _, residual_full_fit = _fit_leakage_regression(rgb_high, clean_high, support)
-    _, residual_chroma_fit = _fit_leakage_regression(rgb_high, clean_chroma, support)
-    residual_fit = max(residual_full_fit, residual_chroma_fit)
+    residual_beta_full, residual_full_fit = _fit_leakage_regression(
+        rgb_high, clean_high, support)
+    residual_beta_chroma, residual_chroma_fit = _fit_leakage_regression(
+        rgb_high, clean_chroma, support)
+    if residual_full_fit >= residual_chroma_fit:
+        residual_beta = residual_beta_full
+        residual_fit = residual_full_fit
+        residual_target = clean_high
+    else:
+        residual_beta = residual_beta_chroma
+        residual_fit = residual_chroma_fit
+        residual_target = clean_chroma
+
+    residual_controls = []
+    for dx, dy in ((offset, 0), (-offset, 0), (0, offset), (0, -offset)):
+        _, score = _fit_leakage_regression(
+            _shift_image(rgb_high, dx, dy), residual_target, support)
+        residual_controls.append(score)
+    residual_control_fit = max(residual_controls, default=0.0)
+    residual_specificity = max(0.0, residual_fit - residual_control_fit)
+    residual_presence = float(
+        np.clip((residual_fit - .04) / .30, 0, 1) *
+        np.clip((residual_specificity - .01) / .14, 0, 1) * coverage)
+    # Below this level the remaining zero-displacement RGB explanation is too
+    # weak to justify excluding already-cleaned pixels from affine scoring.
+    if residual_fit < .08:
+        residual_presence = 0.0
+    residual_prediction = np.einsum(
+        "...c,cd->...d", rgb_high, residual_beta).astype(np.float32)
+    residual_pred_mag = np.sqrt(np.square(residual_prediction).mean(2))
+    residual_error = residual_target - residual_prediction
+    residual_error_mag = np.sqrt(np.square(residual_error).mean(2))
+    residual_local_fit = residual_pred_mag / (
+        residual_pred_mag + residual_error_mag + 1e-3)
+    residual_positive = residual_pred_mag[residual_pred_mag > 0]
+    residual_scale = (float(np.percentile(residual_positive, 90))
+                      if residual_positive.size else 1.0)
+    residual_strength = float(np.clip((residual_presence - .05) / .45, 0, 1))
+    ghost_residual = np.clip(
+        residual_strength *
+        np.clip(residual_pred_mag / max(residual_scale, 1e-3), 0, 1) *
+        residual_local_fit * 1.5, 0, 1).astype(np.float32)
     clean_thermal = np.median(clean, axis=2).astype(np.float32)
+    detected_ratio = float((ghost_detected > .35).mean())
+    residual_ratio = float((ghost_residual > .35).mean())
     meta = {
         "alpha_global": float(np.linalg.norm(beta) / math.sqrt(beta.size)),
         "leakage_confidence": presence,
@@ -286,11 +331,17 @@ def deghost_for_a0(rgb: np.ndarray, thermal: np.ndarray, ir3: np.ndarray):
         "ghost_mid_control_fit": float(mid_control_fit),
         "ghost_mid_specificity": float(mid_specificity),
         "ghost_residual_fit": float(residual_fit),
+        "ghost_residual_control_fit": float(residual_control_fit),
+        "ghost_residual_specificity": float(residual_specificity),
+        "ghost_residual_score": float(residual_presence),
         "ghost_seed_ratio": float(support.mean()),
-        "ghost_mask_ratio": float((ghost_mask > .35).mean()),
+        "ghost_detected_mask_ratio": detected_ratio,
+        "ghost_residual_mask_ratio": residual_ratio,
+        # Compatibility key now describes the mask actually used downstream.
+        "ghost_mask_ratio": residual_ratio,
         "deghost_mean_change": float(np.abs(clean_thermal - thermal).mean()),
     }
-    return clean_thermal, clean.astype(np.float32), ghost_mask, support, meta
+    return clean_thermal, clean.astype(np.float32), ghost_residual, support, meta
 
 
 def border_masks(thermal: np.ndarray):
@@ -413,16 +464,18 @@ def leakage_maps(rgb: np.ndarray, ir3: np.ndarray, valid: np.ndarray):
 def quality_maps(rgb: np.ndarray, thermal: np.ndarray, ir3: np.ndarray,
                  out_hw: tuple[int, int] = (96, 160),
                  return_preprocessed: bool = False):
-    clean_thermal, clean_ir3, ghost, _, ghost_meta = deghost_for_a0(rgb, thermal, ir3)
+    clean_thermal, clean_ir3, ghost_residual, _, ghost_meta = deghost_for_a0(
+        rgb, thermal, ir3)
     visible, geometry, invalid = border_masks(clean_thermal)
-    # Strong remaining RGB-explainable pixels must not vote on the transform.
-    ghost_exclude = cv2.dilate((ghost > .45).astype(np.uint8),
+    # Only remaining RGB-explainable pixels are excluded.  The original
+    # detection footprint is diagnostic and must not suppress repaired edges.
+    ghost_exclude = cv2.dilate((ghost_residual > .45).astype(np.uint8),
                                np.ones((5, 5), np.uint8), iterations=1)
     geometry = geometry * (1 - ghost_exclude.astype(np.float32))
     _, std = _local_stats(clean_thermal)
     thermal_conf = (geometry * np.clip(std / 24.0, 0, 1) *
-                    (1 - .75 * ghost)).astype(np.float32)
-    channels = [ghost, invalid, geometry, thermal_conf]
+                    (1 - .75 * ghost_residual)).astype(np.float32)
+    channels = [ghost_residual, invalid, geometry, thermal_conf]
     oh, ow = out_hw
     q = np.stack([cv2.resize(x.astype(np.float32), (ow, oh), interpolation=cv2.INTER_AREA)
                   for x in channels], 0)
@@ -431,6 +484,7 @@ def quality_maps(rgb: np.ndarray, thermal: np.ndarray, ir3: np.ndarray,
         "black_border_area_px": float(invalid.sum()),
         "source_height": float(thermal.shape[0]),
         "source_width": float(thermal.shape[1]),
+        "a0_preprocess_version": 11.0,
         "thermal_confidence": float(thermal_conf.sum() / max(geometry.sum(), 1)),
     }
     result = (q.astype(np.float32), visible, geometry, meta)
@@ -910,15 +964,20 @@ def estimate_affine(rgb: np.ndarray, thermal: np.ndarray, geometry: np.ndarray,
                 item = phase_item(float(angle), float(scale), 0., 0., old, mode)
                 candidates.append(item); coarse.append(item)
 
-    # Raw rescue searches gross rotations to +/-45 degrees.
+    # Raw rigid rescue gets its own coarse pool so scale candidates cannot use
+    # every refinement slot and hide a valid rotation-only solution.
     angles = list(np.arange(-cfg.angle_limit, cfg.angle_limit + 1e-6,
                             cfg.angle_step)) + [0.0, float(old[0])]
+    raw_rigid_coarse = []
     for angle in sorted(set(round(float(x), 4) for x in angles)):
+        if abs(angle) >= cfg.fine_angle_step:
+            item = phase_item(angle, 1.0, 0.0, 0.0, raw, "raw_rescue")
+            candidates.append(item); coarse.append(item)
+            raw_rigid_coarse.append(item)
         for scale in coarse_scales:
-            if abs(angle) < cfg.fine_angle_step and abs(scale - 1.0) < .015:
+            if abs(scale - 1.0) < .015:
                 continue
-            mode = "raw_rescue" if abs(scale - 1.0) < .015 else "raw_full"
-            item = phase_item(angle, float(scale), 0.0, 0.0, raw, mode)
+            item = phase_item(angle, float(scale), 0.0, 0.0, raw, "raw_full")
             candidates.append(item); coarse.append(item)
 
     refined = []
@@ -960,6 +1019,52 @@ def estimate_affine(rgb: np.ndarray, thermal: np.ndarray, geometry: np.ndarray,
                 candidates.append(phase_item(float(angle), float(scale),
                                              0., 0., base, mode))
 
+    # Independently refine the best raw rigid seeds at 0.5 then 0.25 degrees.
+    # This specifically preserves the stable 15--17 degree basin that can be
+    # missed when full-similarity candidates dominate the shared ranking.
+    rigid_refined = []
+    for seed in sorted(raw_rigid_coarse,
+                       key=lambda x: x["rank"], reverse=True)[:3]:
+        centre_angle = float(seed["delta"][0])
+        for angle in np.arange(max(-cfg.angle_limit, centre_angle - cfg.angle_step),
+                               min(cfg.angle_limit, centre_angle + cfg.angle_step) + 1e-7,
+                               .5):
+            item = phase_item(float(angle), 1.0, 0., 0., raw, "raw_rescue")
+            candidates.append(item); rigid_refined.append(item)
+
+    rigid_fine = []
+    for seed in sorted(rigid_refined,
+                       key=lambda x: x["rank"], reverse=True)[:3]:
+        centre_angle = float(seed["delta"][0])
+        for angle in np.arange(max(-cfg.angle_limit, centre_angle - .5),
+                               min(cfg.angle_limit, centre_angle + .5) + 1e-7,
+                               .25):
+            item = phase_item(float(angle), 1.0, 0., 0., raw, "raw_rescue")
+            candidates.append(item); rigid_fine.append(item)
+
+    # With angle fixed, compare zero translation and the phase estimate using
+    # a small local grid.  Periodic fences can otherwise produce a plausible
+    # angle paired with the wrong phase-correlation peak.
+    for seed in sorted(rigid_fine,
+                       key=lambda x: x["rank"], reverse=True)[:3]:
+        angle = float(seed["delta"][0])
+        phase_tx, phase_ty = (float(seed["delta"][1]),
+                              float(seed["delta"][2]))
+        # Use a few work-image pixels rather than a fraction of the full
+        # canvas.  On 1920-wide inputs the old 1.25% step was 24 source pixels
+        # and skipped the stable translation basin near the phase estimate.
+        local_step = 2.5 / work_scale
+        for centre_tx, centre_ty in ((0., 0.), (phase_tx, phase_ty)):
+            for dx in (-local_step, 0., local_step):
+                for dy in (-local_step, 0., local_step):
+                    delta = np.asarray((angle,
+                                        centre_tx + dx,
+                                        centre_ty + dy,
+                                        1.), np.float32)
+                    params, total = compose(raw, delta)
+                    candidates.append(evaluate(
+                        params, raw, "raw_rescue", 0., total, delta))
+
     policies = {
         "raw_translation": (.020, 2, -.070, 1, .004),
         "old_translation": (.016, 2, -.060, 1, .004),
@@ -970,7 +1075,8 @@ def estimate_affine(rgb: np.ndarray, thermal: np.ndarray, geometry: np.ndarray,
     }
     grouped = {name: [] for name in policies}
     for item in sorted(candidates, key=lambda x: x["rank"], reverse=True):
-        if len(grouped[item["mode"]]) < 16:
+        mode_cap = 32 if item["mode"] == "raw_rescue" else 16
+        if len(grouped[item["mode"]]) < mode_cap:
             grouped[item["mode"]].append(item)
 
     accepted, diagnostics = [], {}

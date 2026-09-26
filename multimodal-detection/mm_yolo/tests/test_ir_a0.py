@@ -32,11 +32,17 @@ class IRA0Tests(unittest.TestCase):
             np.asarray([[.18, .03, .02], [.02, .16, .03], [.03, .02, .17]], np.float32))
         ir3 = np.clip(np.repeat(truth[..., None], 3, 2) + ghost, 0, 255)
         observed = np.median(ir3, axis=2).astype(np.float32)
-        clean, _, mask, support, meta = deghost_for_a0(rgb, observed, ir3)
+        clean, _, residual_mask, support, meta = deghost_for_a0(
+            rgb, observed, ir3)
         fitted = support > .5
         self.assertGreater(meta["ghost_identity_fit"], meta["ghost_control_fit"])
         self.assertGreater(meta["ghost_score"], .05)
-        self.assertGreater(float(mask.max()), 0)
+        self.assertGreater(meta["ghost_detected_mask_ratio"], 0)
+        self.assertLessEqual(meta["ghost_residual_mask_ratio"],
+                             meta["ghost_detected_mask_ratio"])
+        self.assertEqual(meta["ghost_mask_ratio"],
+                         meta["ghost_residual_mask_ratio"])
+        self.assertGreaterEqual(float(residual_mask.min()), 0)
         self.assertLess(float(np.abs(clean[fitted] - truth[fitted]).mean()),
                         float(np.abs(observed[fitted] - truth[fitted]).mean()))
 
