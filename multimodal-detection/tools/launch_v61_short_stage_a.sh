@@ -2,19 +2,19 @@
 set -euo pipefail
 
 CODE=/root/autodl-tmp/DDBBPPT_v61/multimodal-detection
-INIT=/root/autodl-tmp/runs/v61_t0_real_batch_20260926_v1/v61_base_init.pt
-CACHE=/root/autodl-tmp/cache/ir_a0_v521_explicit_v2
+INIT=/root/autodl-tmp/runs/v61_t0_real_batch_20260926_v3/v61_base_init.pt
+CACHE=/root/autodl-tmp/cache/ir_a0_v61_a0_v6_256_s42_20260926_v1
 MODE=pair
 if (( $# > 0 )); then
   MODE=$1
 fi
-OUT=/root/autodl-tmp/runs/v61_short_validation_20260926_v1
+OUT=/root/autodl-tmp/runs/v61_short_validation_20260926_v2
 mkdir -p /root/v61_runtime_tmp
 export TMPDIR=/root/v61_runtime_tmp
 export PYTHONDONTWRITEBYTECODE=1
 
 mkdir -p "$OUT"
-echo '4ee9ad69f8dcbc3296b63411ad5c8fef5af06f76e9c867d9a25f84bb72067467  /root/autodl-tmp/runs/v61_t0_real_batch_20260926_v1/v61_base_init.pt' | sha256sum -c -
+echo '4ee9ad69f8dcbc3296b63411ad5c8fef5af06f76e9c867d9a25f84bb72067467  /root/autodl-tmp/runs/v61_t0_real_batch_20260926_v3/v61_base_init.pt' | sha256sum -c -
 git -C /root/autodl-tmp/DDBBPPT_v61 rev-parse HEAD > "$OUT/code_commit_$MODE.txt"
 
 run_stage_a() {
