@@ -121,6 +121,8 @@ def main():
             "old_params": [float(x) for x in old_params],
             "old_confidence": old_conf,
             "new_params": [float(x) for x in new_params],
+            "residual_params": [float(x) for x in new["residual_params"]],
+            "search_bounds": new["search_bounds"],
             "new_score": float(new["score"]),
             "new_identity_score": float(new["identity_score"]),
             "new_old_a0_score": float(new["old_a0_score"]),
@@ -140,7 +142,7 @@ def main():
         })
         print(json.dumps(rows[-1], ensure_ascii=False), flush=True)
     (out / "audit.json").write_text(
-        json.dumps({"version": "v61-a0-polygon-v5", "samples": rows},
+        json.dumps({"version": "v61-a0-polygon-v6", "samples": rows},
                    ensure_ascii=False, indent=2), encoding="utf-8")
 
 

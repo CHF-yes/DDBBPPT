@@ -216,7 +216,7 @@ def main():
                     [cv2.IMWRITE_JPEG_QUALITY, 92])
     confidences = np.asarray([r["confidence"] for r in rows])
     summary = {
-        "version": 5, "n_samples": len(rows), "min_confidence": a.min_confidence,
+        "version": 6, "n_samples": len(rows), "min_confidence": a.min_confidence,
         "supervised": int(sum(r["supervised"] for r in rows)),
         "model_contract": {
             "canvas": list(contract_canvas), "angle": a.contract_angle,

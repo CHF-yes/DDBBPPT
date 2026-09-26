@@ -9,10 +9,10 @@ import numpy as np
 MM = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(MM))
 
-from ir_a0 import (A0_QUALITY_NAMES, SearchCfg, affine_model_contract,
-                   border_masks, deghost_for_a0, estimate_affine, load_sample,
-                   quality_maps, save_sample, select_affine_candidate,
-                   source_to_sampling)
+from ir_a0 import (A0_QUALITY_NAMES, SearchCfg, affine_matrix, affine_model_contract,
+                   border_masks, compose_source_affine, deghost_for_a0,
+                   estimate_affine, load_sample, quality_maps, save_sample,
+                   select_affine_candidate, source_to_sampling)
 
 
 class IRA0Tests(unittest.TestCase):
@@ -63,6 +63,30 @@ class IRA0Tests(unittest.TestCase):
         self.assertLess(float(geometry[:8, :8].mean()), .1)
         self.assertGreater(float(visible[50:65, 85:100].mean()), .9)
 
+    def test_irregular_shallow_dark_scenery_is_not_a_black_frame(self):
+        image = np.full((120, 192), 55, np.float32)
+        irregular = np.asarray([
+            [10, 24], [62, 10], [88, 31], [128, 12], [181, 28],
+            [166, 58], [184, 98], [124, 111], [91, 88], [47, 108],
+            [9, 84], [31, 55],
+        ], np.int32)
+        cv2.fillPoly(image, [irregular], 95)
+        image[45:70, 78:111] = 72
+        visible, geometry, invalid = border_masks(image)
+        self.assertLess(float(invalid.mean()), .01)
+        self.assertGreater(float(visible.mean()), .99)
+        self.assertGreater(float(geometry.mean()), .99)
+
+    def test_dark_side_bands_are_not_an_enclosing_polygon_frame(self):
+        image = np.full((120, 192), 96, np.float32)
+        image[:, :22] = 48
+        image[:, -25:] = 51
+        image[28:91, 72:126] = 128
+        visible, geometry, invalid = border_masks(image)
+        self.assertLess(float(invalid.mean()), .01)
+        self.assertGreater(float(visible.mean()), .99)
+        self.assertGreater(float(geometry.mean()), .99)
+
     def test_wide_rotation_search_exceeds_old_three_degree_limit(self):
         h, w = 160, 240
         gray = np.zeros((h, w), np.uint8)
@@ -110,6 +134,66 @@ class IRA0Tests(unittest.TestCase):
         destination = source_to_rgb @ points
         restored = sampling @ np.vstack((destination, np.ones(destination.shape[1])))
         self.assertTrue(np.allclose(restored, points[:2], atol=1e-4))
+
+    def test_composed_sampling_matches_base_then_delta_inverse_lookup(self):
+        shape = (160, 240)
+        base = (11.0, 18.0, -9.0, 1.08)
+        delta = (-7.5, -13.0, 15.0, 0.93)
+        total_params, total_source = compose_source_affine(base, delta, shape)
+        base_sampling = np.vstack((source_to_sampling(base, shape), [0, 0, 1]))
+        delta_sampling = np.vstack((source_to_sampling(delta, shape), [0, 0, 1]))
+        total_sampling = np.vstack((source_to_sampling(total_params, shape), [0, 0, 1]))
+        direct_sampling = np.linalg.inv(
+            np.vstack((total_source, [0, 0, 1]))).astype(np.float32)
+        self.assertTrue(np.allclose(total_sampling, base_sampling @ delta_sampling,
+                                    atol=2e-4))
+        self.assertTrue(np.allclose(total_sampling, direct_sampling, atol=2e-4))
+
+    def test_large_rotation_shift_and_scale_are_inside_a0_search(self):
+        h, w = 160, 240
+        gray = np.zeros((h, w), np.uint8)
+        cv2.rectangle(gray, (28, 22), (204, 133), 110, 3)
+        cv2.line(gray, (35, 124), (192, 35), 235, 5)
+        cv2.circle(gray, (153, 91), 20, 175, 4)
+        cv2.rectangle(gray, (69, 49), (101, 78), 205, -1)
+        rgb = np.repeat(gray[..., None], 3, 2)
+        truth = (32.0, .15 * w, -.12 * h, 1.18)
+        source_to_rgb = cv2.getRotationMatrix2D(
+            ((w - 1) / 2, (h - 1) / 2), truth[0], truth[3])
+        source_to_rgb[:, 2] += truth[1:3]
+        thermal = cv2.warpAffine(
+            gray, cv2.invertAffineTransform(source_to_rgb), (w, h),
+            borderMode=cv2.BORDER_CONSTANT, borderValue=0).astype(np.float32)
+        result = estimate_affine(
+            rgb, thermal, np.ones((h, w), np.float32),
+            SearchCfg(work_width=w, angle_step=5.0))
+        found = result["params"]
+        self.assertLess(abs(float(found[0]) - truth[0]), 2.0)
+        self.assertLess(abs(float(found[1]) - truth[1]), 8.0)
+        self.assertLess(abs(float(found[2]) - truth[2]), 8.0)
+        self.assertLess(abs(float(found[3]) - truth[3]), .08)
+
+    def test_small_shift_prefers_translation_without_rotation_or_scale(self):
+        h, w = 160, 240
+        gray = np.zeros((h, w), np.uint8)
+        cv2.rectangle(gray, (25, 20), (210, 135), 90, 3)
+        cv2.line(gray, (31, 126), (194, 37), 230, 5)
+        cv2.circle(gray, (146, 84), 19, 170, 4)
+        cv2.rectangle(gray, (70, 48), (103, 76), 205, -1)
+        rgb = np.repeat(gray[..., None], 3, 2)
+        truth = (0.0, -.05 * w, -.075 * h, 1.0)
+        source_to_rgb = affine_matrix(*truth, (h, w))
+        thermal = cv2.warpAffine(
+            gray, cv2.invertAffineTransform(source_to_rgb), (w, h),
+            borderMode=cv2.BORDER_CONSTANT, borderValue=0).astype(np.float32)
+        result = estimate_affine(
+            rgb, thermal, np.ones((h, w), np.float32), SearchCfg(work_width=w))
+        found = result["params"]
+        self.assertEqual(result["selected_mode"], "raw_translation")
+        self.assertAlmostEqual(float(found[0]), 0.0, places=4)
+        self.assertAlmostEqual(float(found[3]), 1.0, places=4)
+        self.assertLess(abs(float(found[1]) - truth[1]), 4.0)
+        self.assertLess(abs(float(found[2]) - truth[2]), 4.0)
 
     def test_plain_sample_never_inherits_unrelated_sequence_prior(self):
         coarse = {"params": np.asarray((1., 2., 3., 1.01), np.float32),
