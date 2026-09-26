@@ -48,6 +48,20 @@ python mm_yolo/submit.py --ckpt /path/to/best.pt \
 提交器以 visible 图像清单为准，为每张测试图生成同名 TXT，严格检查类别、归一化坐标、
 置信度顺序和每图最多 100 框。推理使用 checkpoint 内保存的结构、模态及画布配置。
 
+小目标切片试验使用同一权重的全图结果加同步的 RGB/IR/Depth 切片结果。每片重新计算
+质量图与深度先验，映射回原图后按类别去重，最后统一限制每图 100 框；默认不会启用。
+首次对照保持与当前提交相同的置信度、权重和后处理参数：
+
+```bash
+python mm_yolo/submit.py --ckpt /path/to/best.pt \
+  --root /data/test_extracted --out /data/submission_tiled \
+  --conf 0.25 --tiled --tile-fraction 0.6 --tile-overlap 0.2 \
+  --tile-merge-iou 0.6 --tile-batch 2 --zip
+```
+
+`eval.py` 也接受相同的切片参数，可与普通推理分别运行并比较逐类 AP。切片增加推理耗时，
+其分数收益需要实测；已加入全量训练的旧验证图不能再作为全量权重的独立验证集。
+
 ## 维护边界
 
 - 正确性回归位于 `tests/`；它们不是实验队列。

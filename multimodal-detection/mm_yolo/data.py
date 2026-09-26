@@ -1001,7 +1001,8 @@ class MMDataset(Dataset):
             metric_available = False
             if want_dep:
                 missing.add("dep")
-        H, W = rgb.shape[:2]
+        full_H, full_W = rgb.shape[:2]
+        H, W = full_H, full_W
         if ir.shape[:2] != (H, W):
             ir = cv2.resize(ir, (W, H), interpolation=cv2.INTER_AREA)
         metric_map = np.full(dep.shape[:2], 1 if metric_available else 0, dtype=np.uint8)
@@ -1010,6 +1011,21 @@ class MMDataset(Dataset):
             valid = cv2.resize(valid.astype(np.uint8), (W, H),
                                interpolation=cv2.INTER_NEAREST).astype(bool)
             metric_map = cv2.resize(metric_map, (W, H), interpolation=cv2.INTER_NEAREST)
+
+        # 推理切片在原 RGB 坐标中定义；三模态同步裁剪，并重新计算质量图/深度先验。
+        crop = s.get("crop_xyxy")
+        if crop is not None:
+            if self.train:
+                raise ValueError("crop_xyxy is only supported for inference")
+            x0, y0, x1, y1 = (int(v) for v in crop)
+            if not (0 <= x0 < x1 <= full_W and 0 <= y0 < y1 <= full_H):
+                raise ValueError(f"invalid crop_xyxy {crop} for {full_W}x{full_H}")
+            rgb = rgb[y0:y1, x0:x1]
+            ir = ir[y0:y1, x0:x1]
+            dep = dep[y0:y1, x0:x1]
+            valid = valid[y0:y1, x0:x1]
+            metric_map = metric_map[y0:y1, x0:x1]
+            H, W = y1 - y0, x1 - x0
 
         # ---- 几何：三模态同一套仿射（错位与 letterbox **合成一次**）----
         if self.train:
@@ -1027,6 +1043,8 @@ class MMDataset(Dataset):
         if self.train and aug.rotate_deg > 0:
             angle = rng.uniform(-aug.rotate_deg, aug.rotate_deg)
             M = (centered_affine_M(self.canvas, angle, 1.0, 0.0, 0.0) @ _mat3(M))[:2]
+        M_full = M if crop is None else (np.asarray(M, np.float32) @
+            np.array([[1, 0, -x0], [0, 1, -y0], [0, 0, 1]], np.float32))
         jx = jy = 0.0
         if self.train and aug.misalign_px > 0:
             jx = rng.uniform(-1, 1) * aug.misalign_px
@@ -1090,7 +1108,7 @@ class MMDataset(Dataset):
 
         # ---- 标签：原图归一化框 → 画布（letterbox 后），**裁剪到画布并过滤**----
         Hc, Wc = self.canvas
-        out_boxes = canvas_boxes_from_norm(s.get("boxes"), M, (H, W), self.canvas,
+        out_boxes = canvas_boxes_from_norm(s.get("boxes"), M_full, (full_H, full_W), self.canvas,
                                            min_size=aug.box_min_size,
                                            require_center=aug.box_require_center)
         if (self.train and allow_special and aug.target_occlusion_p > 0 and
@@ -1145,7 +1163,7 @@ class MMDataset(Dataset):
             "quality": {k: torch.from_numpy(v) for k, v in quality.items()},
             "prior": torch.from_numpy(prior),
             "boxes": torch.from_numpy(out_boxes),          # 画布归一化 [cls,cx,cy,w,h]
-            "M": torch.from_numpy(M.copy()),               # letterbox 仿射（2×3）
+            "M": torch.from_numpy(M_full.copy()),          # 原图到画布仿射（2×3）
             # jx/jy are CANVAS pixels: shift_M is left-multiplied after M.
             # The model converts them to feature pixels using each actual map size.
             "alignment_shift": torch.tensor([jx, jy], dtype=torch.float32),
@@ -1153,7 +1171,7 @@ class MMDataset(Dataset):
                 float(self.train and aug.misalign_px > 0), dtype=torch.float32),
             "ir_affine_target": torch.from_numpy(ir_affine_target),
             "ir_affine_supervised": torch.tensor(ir_affine_supervised, dtype=torch.float32),
-            "orig_hw": torch.tensor([H, W], dtype=torch.float32),
+            "orig_hw": torch.tensor([full_H, full_W], dtype=torch.float32),
             "stem": s["stem"],
             "keep": keep,
             "enabled": list(self.enabled),

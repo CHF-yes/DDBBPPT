@@ -161,6 +161,15 @@ def main():
     ap.add_argument("--conf", type=float, default=0.001)
     ap.add_argument("--iou", type=float, default=0.7)
     ap.add_argument("--max-det", type=int, default=100)
+    ap.add_argument("--tiled", action="store_true",
+                    help="同一模型做全图+三模态同步切片推理")
+    ap.add_argument("--tile-fraction", type=float, default=0.6,
+                    help="切片宽高占原图宽高的比例；默认 0.6（通常 2x2）")
+    ap.add_argument("--tile-overlap", type=float, default=0.2,
+                    help="切片之间按切片尺寸计算的重叠比例")
+    ap.add_argument("--tile-merge-iou", type=float, default=0.6,
+                    help="全图与切片结果的逐类去重 IoU")
+    ap.add_argument("--tile-batch", type=int, default=2)
     ap.add_argument("--mask", default="", help="屏蔽模态，如 'ir' 或 'dep'（诊断用）")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--clean", action="store_true", default=True,
@@ -168,6 +177,11 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--zip", action="store_true")
     args = ap.parse_args()
+    if args.tiled:
+        from tiled_inference import tile_windows
+        tile_windows(100, 100, args.tile_fraction, args.tile_overlap)
+        if not (0 < args.tile_merge_iou < 1) or args.tile_batch < 1:
+            ap.error("tile-merge-iou 必须在 (0,1)，tile-batch 必须 >= 1")
 
     device_arg = ("cuda:0" if torch.cuda.is_available() else "cpu") \
         if args.device == "auto" else ("cuda:0" if args.device == "cuda" else args.device)
@@ -207,10 +221,18 @@ def main():
     total = wrote = skipped = 0
     for i in range(0, len(samples), args.batch):
         chunk = [ds[j] for j in range(i, min(i + args.batch, len(samples)))]
+        if args.tiled and any(item is None for item in chunk):
+            raise RuntimeError("切片推理遇到无法读取的测试图；拒绝生成不完整结果")
         batch = collate(chunk)
         if batch is None:
             continue
         dec = _decode(model, batch, dev, args.conf, args.iou, args.max_det, modalities, off, imgsz)
+        if args.tiled:
+            from tiled_inference import decode_full_and_tiles
+            dec = decode_full_and_tiles(model, ds, samples[i:i + len(chunk)], batch, dec,
+                                        dev, args.conf, args.iou, args.max_det, modalities,
+                                        off, imgsz, args.tile_fraction, args.tile_overlap,
+                                        args.tile_merge_iou, args.tile_batch)
         for k, (det, s) in enumerate(zip(dec, chunk)):
             total += write_txt(out_dir / f"{s['stem']}.txt", det, batch["M"][k].numpy(),
                                batch["orig_hw"][k].numpy(), imgsz, args.max_det)

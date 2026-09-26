@@ -214,7 +214,10 @@ def evaluate_model(model: MMYOLO, root: Path, samples: List[dict], imgsz=960,
                    device="cuda:0", conf: float = 0.001, iou: float = 0.7, max_det: int = 100,
                    modalities: str = "all", batch_size: int = 4, workers: int = 4,
                    profile: bool = False, slices: bool = True,
-                   ablate_absolute: bool = False, by_depth_format: bool = False) -> dict:
+                   ablate_absolute: bool = False, by_depth_format: bool = False,
+                   tiled: bool = False, tile_fraction: float = 0.6,
+                   tile_overlap: float = 0.2, tile_merge_iou: float = 0.6,
+                   tile_batch: int = 2) -> dict:
     """在给定样本上按赛题口径评测；可选模态屏蔽剖面与条件切片。
 
     ⚠️ 坐标必须走**同一套 letterbox 映射**：GT 取 dataset 内部已变换到画布的框
@@ -279,6 +282,12 @@ def evaluate_model(model: MMYOLO, root: Path, samples: List[dict], imgsz=960,
                 batch["depth"] = batch["depth"].clone()
                 batch["depth"][:, 1] = 0.0
             dec = _decode(model, batch, device, conf, iou, max_det, modalities, off, imgsz)
+            if tiled:
+                from tiled_inference import decode_full_and_tiles
+                dec = decode_full_and_tiles(model, ds, samples[i:i + len(chunk)], batch,
+                                            dec, device, conf, iou, max_det, modalities,
+                                            off, imgsz, tile_fraction, tile_overlap,
+                                            tile_merge_iou, tile_batch)
             for d, item in zip(dec, chunk):
                 out.append({"boxes": d[:, :4], "conf": d[:, 4], "cls": d[:, 5].astype(int)})
                 gts.append(_gt_canvas(item))
@@ -370,6 +379,11 @@ def main():
                     help="按 Depth 文件 PNG/JPG 分别报分；小子集仅供方向判断")
     ap.add_argument("--no-slices", action="store_true", help="不算条件切片")
     ap.add_argument("--conf", type=float, default=0.001)
+    ap.add_argument("--tiled", action="store_true", help="全图+三模态同步切片推理")
+    ap.add_argument("--tile-fraction", type=float, default=0.6)
+    ap.add_argument("--tile-overlap", type=float, default=0.2)
+    ap.add_argument("--tile-merge-iou", type=float, default=0.6)
+    ap.add_argument("--tile-batch", type=int, default=2)
     ap.add_argument("--batch", type=int, default=4)
     ap.add_argument("--modalities", default="",
                     choices=["", "all", "rgb", "rgb_ir", "rgb_dep", "ir", "dep"],
@@ -412,7 +426,15 @@ def main():
                          modalities=modalities, profile=args.profile,
                          slices=not args.no_slices, conf=args.conf, batch_size=args.batch,
                          ablate_absolute=args.ablate_absolute,
-                         by_depth_format=args.by_depth_format)
+                         by_depth_format=args.by_depth_format, tiled=args.tiled,
+                         tile_fraction=args.tile_fraction, tile_overlap=args.tile_overlap,
+                         tile_merge_iou=args.tile_merge_iou, tile_batch=args.tile_batch)
+    res["tiled"] = args.tiled
+    if args.tiled:
+        res["tile_config"] = {"fraction": args.tile_fraction,
+                              "overlap": args.tile_overlap,
+                              "merge_iou": args.tile_merge_iou,
+                              "batch": args.tile_batch}
     res["ckpt"] = str(args.ckpt)
     res["epoch"] = int(ck.get("epoch", 0))
     print(json.dumps(res, ensure_ascii=False, indent=1))
