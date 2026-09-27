@@ -519,13 +519,15 @@ def set_independent_aux_mode(model: MMYOLO,
 
 
 def set_residual_fusion_mode(model: MMYOLO, downstream_frozen: bool,
-                             train_v52_ir_input: bool = False) -> None:
+                             train_v52_ir_input: bool = False,
+                             train_rgb_encoder: bool = False) -> None:
     """Stage B: open zero-initialized IR/Depth residuals around a fixed RGB path.
 
     During the initial fusion-only period even the independently trained
     auxiliary encoders remain fixed.  Afterwards they and the high-resolution
     downstream detector are released at their role-specific low learning rates.
-    The RGB encoder/query/embedding and RGB residual switch remain immutable.
+    The RGB query/embedding and RGB residual switch remain immutable. The RGB
+    encoder is trainable only when train_rgb_encoder is explicitly enabled.
     """
     for p in model.parameters():
         p.requires_grad_(False)
@@ -534,6 +536,9 @@ def set_residual_fusion_mode(model: MMYOLO, downstream_frozen: bool,
         if module is not None:
             for p in module.parameters():
                 p.requires_grad_(True)
+
+    if train_rgb_encoder:
+        enable(model.backbone.model[:11])
 
     incremental = getattr(model.cfg.fusion, "fusion_strategy", "") == "v44_incremental_router_v1"
     trusted = getattr(model.cfg.fusion, "fusion_strategy", "") == "v47_trusted_evidence_v1"
@@ -552,13 +557,16 @@ def set_residual_fusion_mode(model: MMYOLO, downstream_frozen: bool,
             # graph with no trainable path while the RGB anchor is frozen.
             enable(getattr(model, "semantic_adapters", None))
             enable(getattr(model, "semantic_detect", None))
-        if not downstream_frozen:
-            if v511:
-                enable(getattr(model, "v511_ir_encoder", None))
-                enable(getattr(model, "v511_ir_embeddings", None))
-            else:
-                enable(getattr(model, "aux_encoders", None))
-                enable(getattr(model, "metric_encoder", None))
+            if not downstream_frozen:
+                if v511:
+                    enable(getattr(model, "v511_ir_encoder", None))
+                    enable(getattr(model, "v511_ir_embeddings", None))
+                elif getattr(model.cfg.fusion, "fusion_strategy", "") != "v521_stage_a_v1":
+                    # V6.1 Stage B receives the Stage-A independent encoders as
+                    # fixed teachers.  Updating them through fused detection
+                    # silently degrades the standalone IR/Depth paths.
+                    enable(getattr(model, "aux_encoders", None))
+                    enable(getattr(model, "metric_encoder", None))
             if hasattr(model, "embeddings") and not v511:
                 for blocks in model.embeddings.values():
                     for block in blocks[1:]:
@@ -625,7 +633,7 @@ def set_residual_fusion_mode(model: MMYOLO, downstream_frozen: bool,
                 for block in blocks[1:]:
                     enable(block)
 
-    if not downstream_frozen:
+    if not downstream_frozen and getattr(model.cfg.fusion, "fusion_strategy", "") != "v521_stage_a_v1":
         enable(getattr(model, "aux_encoders", None))
         enable(getattr(model, "metric_encoder", None))
         enable(getattr(model, "matchers", None))
@@ -879,6 +887,24 @@ def subset_detection_batch(preds: dict, targets: dict, active: torch.Tensor) -> 
     return sub_preds, sub_targets
 
 
+def fp32_detection_loss(criterion, preds: dict, targets: dict):
+    """Evaluate YOLO detection loss in FP32 while preserving model gradients.
+
+    The auxiliary detector forward may use BF16, but box assignment and CIoU
+    contain divisions involving small box dimensions.  A fully finite BF16
+    prediction can therefore still produce an infinite box loss.  Casting the
+    prediction tensors is differentiable, so backward still reaches the
+    original branch without repeating its forward pass or BN updates.
+    """
+    float_preds = {
+        "boxes": preds["boxes"].float(),
+        "scores": preds["scores"].float(),
+        "feats": [value.float() for value in preds["feats"]],
+    }
+    with torch.autocast(device_type=preds["boxes"].device.type, enabled=False):
+        return criterion(float_preds, targets)
+
+
 def ensure_finite_state(model: nn.Module, label: str = "model") -> None:
     """拒绝保存被 NaN/Inf 污染的参数或 BN buffer。
 
@@ -1091,7 +1117,8 @@ def adapt_depth_checkpoint_state(state: dict, model: MMYOLO) -> tuple:
     out = dict(state)
     migrated = False
     target_state = model.state_dict()
-    if getattr(model.cfg.fusion, "fusion_strategy", "") == "v511_conditional_ir_v1":
+    fusion_cfg = getattr(getattr(model, "cfg", None), "fusion", None)
+    if getattr(fusion_cfg, "fusion_strategy", "") == "v511_conditional_ir_v1":
         # V4.4 carried an auxiliary Depth detector used only for training.  The
         # V5.1.1 contract deliberately trains standalone RGB/IR recognition and
         # uses Depth only as geometry support, so this obsolete head is the one
@@ -1175,7 +1202,7 @@ def adapt_depth_checkpoint_state(state: dict, model: MMYOLO) -> tuple:
     # 24-channel adapter to the new 22-channel contract by semantic position;
     # initialize the new geometry-mask channel from the former availability
     # channel, which is the closest conservative support signal.
-    if getattr(model.cfg.fusion, "fusion_strategy", "") == "v521_stage_a_v1":
+    if getattr(fusion_cfg, "fusion_strategy", "") == "v521_stage_a_v1":
         geometry_map = (0, 3, 4, 5, 6, 7, 8, 10, 9, 11, 12, 13,
                         14, 15, 16, 17, 18, 19, 20, 21, 22, 23)
         adapter_inputs = (
@@ -1351,6 +1378,8 @@ def main():
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--backbone-lr-mult", type=float, default=0.1)
+    ap.add_argument("--rgb-stage-b-lr-mult", type=float, default=0.0,
+                    help="Stage B 中解冻 RGB 编码器并指定其相对基础 lr；0 表示保持冻结")
     ap.add_argument("--fusion-lr-mult", type=float, default=1.0,
                     help="anchored_joint 中辅助融合/记忆相对基础 lr")
     ap.add_argument("--p2-lr-mult", type=float, default=1.0,
@@ -1380,6 +1409,8 @@ def main():
                     help="Stage B 冻结期结束后以低学习率解冻 V5.2/V5.2.1 IR 几何 Adapter")
     ap.add_argument("--freeze-v52-ir-input-stage-a", action="store_true",
                     help="Stage A 对照组：运行 Adapter 前向但冻结其参数")
+    ap.add_argument("--disable-ir-geometry-adapter", action="store_true",
+                    help="V6.1：关闭学习式 IR 几何残差，但保留确定性 A0 粗变换、有效区与质量信息")
     ap.add_argument("--aux-branch-mode", default="alternate",
                     choices=["alternate", "both"],
                     help="Stage A 辅助分支调度；both 在同一批顺序反传 IR/Depth，完整覆盖每轮")
@@ -1575,13 +1606,32 @@ def main():
                 args.ir_affine_loss_weight or args.mosaic or args.misalign_px):
             raise ValueError("V5.2 is Stage A only: required rotation cache, no old affine loss/mosaic")
     if args.fusion_strategy == "v521_stage_a_v1":
-        if (args.train_stage != "aux_independent" or args.ir_coarse_align or
-                not args.require_ir_a0 or not args.ir_a0_cache or
-                args.ir_affine_p <= 0 or args.ir_affine_loss_weight <= 0 or
-                args.mosaic or args.misalign_px):
+        if (args.train_stage not in ("aux_independent", "residual_fusion") or
+                args.ir_coarse_align or not args.require_ir_a0 or
+                not args.ir_a0_cache or args.mosaic or args.misalign_px):
             raise ValueError(
-                "V5.2.1 requires A0 cache plus synthetic large-affine supervision; "
-                "old coarse align, mosaic and sensor jitter stay disabled")
+                "V5.2.1 requires the A0 cache and disables old coarse align, "
+                "mosaic and sensor jitter in both Stage A and Stage B")
+        if args.disable_ir_geometry_adapter:
+            if args.train_v52_ir_input_stage_b:
+                raise ValueError(
+                    "disabled IR geometry adapter cannot be trainable in Stage B")
+            if (args.ir_affine_p or args.ir_affine_loss_weight or
+                    args.ir_affine_loss_end_weight not in (None, 0)):
+                raise ValueError(
+                    "adapter bypass keeps A0 fixed and requires affine augmentation/loss off")
+        elif args.train_stage == "aux_independent":
+            if args.ir_affine_p <= 0 or args.ir_affine_loss_weight <= 0:
+                raise ValueError(
+                    "V5.2.1 Stage A requires synthetic large-affine supervision")
+        elif args.train_v52_ir_input_stage_b:
+            if args.ir_affine_p <= 0 or args.ir_affine_loss_weight <= 0:
+                raise ValueError(
+                    "trainable V5.2.1 Stage-B adapter requires affine supervision")
+        elif (args.ir_affine_p or args.ir_affine_loss_weight or
+                args.ir_affine_loss_end_weight not in (None, 0)):
+            raise ValueError(
+                "frozen V5.2.1 Stage-B adapter requires affine augmentation/loss off")
     if args.fusion_strategy == "evidence_router_v3" and not args.ir_coarse_align:
         raise ValueError("evidence_router_v3 必须启用 --ir-coarse-align")
     if args.fusion_strategy == "v44_incremental_router_v1" and args.ir_coarse_align:
@@ -1726,8 +1776,10 @@ def main():
                  ir_affine_p=args.ir_affine_p, ir_affine_deg=args.ir_affine_deg,
                  ir_affine_shift=args.ir_affine_shift, ir_affine_scale=args.ir_affine_scale,
                  v521_explicit=args.fusion_strategy == "v521_stage_a_v1",
-                 v521_angle_deg=15.0, v521_shift_frac=.20,
-                 v521_scale_min=.80, v521_scale_max=1.25,
+                 # A0 handles large motion and sample-level fallback.  The
+                 # learned adapter is intentionally limited to small residuals.
+                 v521_angle_deg=5.0, v521_shift_frac=.04,
+                 v521_scale_min=.94, v521_scale_max=1.06,
                  legacy_lowlight=args.depth_channels == 2,
                  ir_read_mode=args.ir_read_mode,
                  ir_a0_cache=args.ir_a0_cache,
@@ -1848,6 +1900,11 @@ def main():
                                "p3p4": (True, True, False), "p4": (False, True, False)}[args.depth_scales]
     model = MMYOLO(cfg).to(dev)
     enable_trainable_defaults(model)
+    model.disable_ir_geometry_adapter = bool(args.disable_ir_geometry_adapter)
+    if (model.disable_ir_geometry_adapter and
+            getattr(model, "v52_ir_input", None) is not None):
+        model.v52_ir_input.requires_grad_(False)
+        log("[train] V6.1 learned IR geometry=OFF；deterministic A0 sampling + quality evidence=ON")
     model.modality_off = {"rgb", "ir", "dep"} - set(enabled)
     model.infer_modalities = tuple(enabled)
     model.infer_canvas = tuple(canvas)
@@ -1861,7 +1918,8 @@ def main():
     scaled_wd = args.weight_decay * effective_batch / args.nominal_batch
     role_mults = None
     if args.train_stage in ("anchored_joint", "residual_fusion", "aux_independent"):
-        role_mults = {"anchor": 0.0,
+        role_mults = {"anchor": (args.rgb_stage_b_lr_mult
+                                  if args.train_stage == "residual_fusion" else 0.0),
                       "aux_encoder": args.backbone_lr_mult,
                       "fusion": args.fusion_lr_mult,
                       "p2": args.p2_lr_mult,
@@ -2096,12 +2154,15 @@ def main():
         if args.train_stage == "aux_independent":
             set_independent_aux_mode(
                 model,
-                train_v52_ir_input=not args.freeze_v52_ir_input_stage_a)
+                train_v52_ir_input=(not args.freeze_v52_ir_input_stage_a and
+                                    not args.disable_ir_geometry_adapter))
             frozen = True
         elif args.train_stage == "residual_fusion":
             set_residual_fusion_mode(
                 model, downstream_frozen=frozen,
-                train_v52_ir_input=args.train_v52_ir_input_stage_b)
+                train_v52_ir_input=(args.train_v52_ir_input_stage_b and
+                                    not args.disable_ir_geometry_adapter),
+                train_rgb_encoder=(args.rgb_stage_b_lr_mult > 0))
         elif args.train_stage == "aux_adapt":
             set_aux_adaptation_mode(model)
             frozen = True
@@ -2269,7 +2330,10 @@ def main():
                     # time, so every epoch covers both sensors without retaining
                     # two high-resolution detector graphs at once.
                     names = tuple(name for name in ("rgb", "ir", "dep")
-                                  if name in model.independent_aux)
+                                  if (name in model.independent_aux and
+                                      float(aux_w.get(name, 0.0)) > 0))
+                    if not names:
+                        raise RuntimeError("Stage A has no positively weighted independent branch")
                     if args.aux_branch_mode != "both":
                         names = (names[(ep + bi) % len(names)],)
                     item_sum = {}
@@ -2281,10 +2345,19 @@ def main():
                             raise RuntimeError(f"Stage A batch has no valid {name} samples")
                         branch_preds, branch_targets = subset_detection_batch(
                             branch_aux, tgt, active)
-                        loss_vec, branch_items = crit(branch_preds, branch_targets)
+                        # Keep the high-resolution branch forward under BF16, but compute
+                        # assignment/CIoU/DFL in FP32.  Epoch-9 diagnostics showed finite
+                        # inputs, targets, logits and model state while BF16 box_loss alone
+                        # overflowed to Inf.
+                        loss_vec, branch_items = fp32_detection_loss(
+                            crit, branch_preds, branch_targets)
                         branch_loss = aux_w[name] * accumulation_loss(loss_vec, nominal_samples)
-                        if name == "ir" and getattr(model, "v52_ir_input", None) is not None:
-                            branch_loss = branch_loss + .01 * model.v52_ir_input.last_penalty * (rgb.shape[0]/nominal_samples)
+                        if (name == "ir" and
+                                getattr(model, "v52_ir_input", None) is not None and
+                                not args.disable_ir_geometry_adapter):
+                            penalty = model.v52_ir_input.last_penalty
+                            if penalty is not None:
+                                branch_loss = branch_loss + .01 * penalty * (rgb.shape[0]/nominal_samples)
                             if args.fusion_strategy == "v521_stage_a_v1":
                                 affine_loss = model.v52_ir_input.supervision_loss(
                                     batch["ir_affine_target"].to(dev, non_blocking=non_blocking),
@@ -2294,7 +2367,86 @@ def main():
                                                              (rgb.shape[0] / nominal_samples))
                                 semantic["ir_affine"] = affine_loss
                         if not torch.isfinite(branch_loss.detach()):
-                            raise FloatingPointError(f"non-finite {name} auxiliary loss at ep={ep+1} batch={bi}")
+                            # Fail closed, but persist enough information to distinguish a bad
+                            # input/target from a corrupted prediction or model state.  The old
+                            # exception only named the branch and made deterministic failures
+                            # impossible to diagnose without another instrumented run.
+                            def _finite_stats(value):
+                                value = value.detach().float()
+                                finite = torch.isfinite(value)
+                                good = value[finite]
+                                total = int(value.numel())
+                                count = int(finite.sum().item())
+                                return {
+                                    "shape": list(value.shape),
+                                    "finite": count,
+                                    "numel": total,
+                                    "finite_fraction": count / max(1, total),
+                                    "min": float(good.min().item()) if good.numel() else None,
+                                    "max": float(good.max().item()) if good.numel() else None,
+                                    "max_abs": float(good.abs().max().item()) if good.numel() else None,
+                                }
+
+                            active_ids = active.detach().nonzero(as_tuple=True)[0].cpu().tolist()
+                            diagnostic = {
+                                "epoch": ep + 1,
+                                "batch": bi,
+                                "branch": name,
+                                "stems": [batch["stems"][i] for i in active_ids],
+                                "loss_vec": _finite_stats(loss_vec),
+                                "loss_vec_values": loss_vec.detach().float().cpu().tolist(),
+                                "branch_items": {
+                                    str(key): (_finite_stats(value) if torch.is_tensor(value)
+                                               else str(value))
+                                    for key, value in branch_items.items()
+                                },
+                                "targets": {
+                                    key: (_finite_stats(value) if torch.is_tensor(value)
+                                          else value)
+                                    for key, value in branch_targets.items()
+                                },
+                                "predictions": {
+                                    "boxes": _finite_stats(branch_preds["boxes"]),
+                                    "scores": _finite_stats(branch_preds["scores"]),
+                                    "feats": [_finite_stats(value)
+                                              for value in branch_preds["feats"]],
+                                },
+                                "samples": [],
+                                "nonfinite_model_state": [],
+                            }
+                            for local_i, original_i in enumerate(active_ids):
+                                sample = {
+                                    "stem": batch["stems"][original_i],
+                                    "boxes": _finite_stats(branch_preds["boxes"][local_i]),
+                                    "scores": _finite_stats(branch_preds["scores"][local_i]),
+                                    "feats": [_finite_stats(value[local_i])
+                                              for value in branch_preds["feats"]],
+                                }
+                                target_mask = branch_targets["batch_idx"].long() == local_i
+                                sample["target_cls"] = _finite_stats(branch_targets["cls"][target_mask])
+                                sample["target_boxes"] = _finite_stats(branch_targets["bboxes"][target_mask])
+                                if name == "dep" and dep is not None:
+                                    sample["depth"] = _finite_stats(dep[original_i])
+                                    if dep.shape[1] >= 3:
+                                        sample["depth_valid_pixels"] = int(
+                                            (dep[original_i, 2] > 0).sum().item())
+                                diagnostic["samples"].append(sample)
+                            for state_name, value in model.state_dict().items():
+                                if (torch.is_tensor(value) and
+                                        (value.is_floating_point() or value.is_complex()) and
+                                        not torch.isfinite(value).all()):
+                                    diagnostic["nonfinite_model_state"].append(state_name)
+                                    if len(diagnostic["nonfinite_model_state"]) >= 24:
+                                        break
+                            diagnostic_path = out_dir / f"nonfinite_ep{ep+1}_batch{bi}_{name}.json"
+                            diagnostic_path.write_text(
+                                json.dumps(diagnostic, ensure_ascii=False, indent=2,
+                                           allow_nan=True), encoding="utf-8")
+                            log(f"[train] [!] non-finite {name} auxiliary loss; "
+                                f"diagnostic={diagnostic_path} stems={diagnostic['stems']}")
+                            raise FloatingPointError(
+                                f"non-finite {name} auxiliary loss at ep={ep+1} batch={bi}; "
+                                f"diagnostic={diagnostic_path}")
                         # Backpropagate and release this branch before building
                         # the next graph.  The branches have disjoint parameters,
                         # so one optimizer step still updates both consistently.
@@ -2396,7 +2548,8 @@ def main():
                 preserve_aux, preserve_active = model.independent_branch_prediction(
                     preserve_name, rgb=rgb, ir=ir, depth=dep,
                     keep=keep, quality=qual)
-                if preserve_active.any():
+                if preserve_active.any() and any(
+                        p.requires_grad for p in model.parameters()):
                     preserve_preds, preserve_targets = subset_detection_batch(
                         preserve_aux, tgt, preserve_active)
                     preserve_vec, _ = crit(preserve_preds, preserve_targets)
@@ -2405,7 +2558,11 @@ def main():
                     if not torch.isfinite(preserve_loss.detach()):
                         raise FloatingPointError(
                             f"non-finite {preserve_name} preservation loss at ep={ep+1} batch={bi}")
-                    scaler.scale(preserve_loss).backward()
+                    # The teacher path is intentionally frozen in V6.1.  Skip
+                    # a constant preserve term instead of calling backward on
+                    # a graph with no trainable leaf.
+                    if preserve_loss.requires_grad:
+                        scaler.scale(preserve_loss).backward()
                     agg["independent_preserve"] += (
                         float(preserve_vec.detach().sum()) /
                         max(1, int(preserve_active.sum())))
@@ -2500,10 +2657,20 @@ def main():
                 res = _evaluate_for_stage(ema.ema)
                 (out_dir / "val_latest.json").write_text(json.dumps(res, ensure_ascii=False, indent=2,
                     default=lambda x: x.tolist() if hasattr(x, "tolist") else str(x)), encoding="utf-8")
-                if args.fusion_strategy in ("v52_stage_a_v1", "v521_stage_a_v1"):
+                # Only Stage A returns per-branch validation metrics.  Stage B
+                # uses the fused detector and therefore has no ``branches`` key,
+                # even when it reuses the V5.2/V5.2.1 fusion strategy.
+                if (args.train_stage == "aux_independent" and
+                        "branches" in res and
+                        args.fusion_strategy in ("v52_stage_a_v1",
+                                                 "v521_stage_a_v1")):
                     tag = "V5.2.1" if args.fusion_strategy == "v521_stage_a_v1" else "V5.2"
                     log(f"[{tag}] branch AP50-95=" + str({k:round(v['map50_95'],5) for k,v in res['branches'].items()}))
-                    log(f"[{tag}] IR geometry=" + str(model.v52_ir_input.last_stats))
+                    if args.disable_ir_geometry_adapter:
+                        log(f"[{tag}] learned geometry=OFF；A0 quality input=" +
+                            str(model.v52_ir_input.last_stats))
+                    else:
+                        log(f"[{tag}] IR geometry=" + str(model.v52_ir_input.last_stats))
                     with (out_dir / "branch_metrics.jsonl").open("a") as stream:
                         stream.write(json.dumps({'epoch':ep+1, 'branches':{k:v['map50_95'] for k,v in res['branches'].items()}})+'\n')
                     for branch, metric in res['branches'].items():

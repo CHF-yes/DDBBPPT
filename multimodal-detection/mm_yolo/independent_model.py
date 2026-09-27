@@ -243,7 +243,9 @@ class IndependentMMYOLO(nn.Module):
                 any(float(v) > 0 for v in cfg.fusion.branch_aux_weights) or
                 cfg.fusion.fusion_strategy in ("v47_trusted_evidence_v1",
                                                "v5_ir_quality_evidence",
-                                               "v511_conditional_ir_v1")):
+                                               "v511_conditional_ir_v1",
+                                               "v52_stage_a_v1",
+                                               "v521_stage_a_v1")):
             # One shared training-only detector sees the common representation
             # from each modality. Sharing the head makes semantic compatibility
             # operational rather than merely encouraging similar magnitudes.
@@ -258,7 +260,9 @@ class IndependentMMYOLO(nn.Module):
                 any(float(v) > 0 for v in cfg.fusion.branch_aux_weights) or
                 cfg.fusion.fusion_strategy in ("v47_trusted_evidence_v1",
                                                "v5_ir_quality_evidence",
-                                               "v511_conditional_ir_v1")):
+                                               "v511_conditional_ir_v1",
+                                               "v52_stage_a_v1",
+                                               "v521_stage_a_v1")):
             if cfg.fusion.fusion_strategy == "v511_conditional_ir_v1":
                 aux_names = ("rgb", "ir")
             elif cfg.fusion.fusion_strategy in ("v5_ir_quality_evidence", "v52_stage_a_v1",
@@ -277,10 +281,15 @@ class IndependentMMYOLO(nn.Module):
         elif cfg.fusion.fusion_strategy == "v521_stage_a_v1":
             from v521_stage_a import ExplicitCoarseIRInput
             self.v52_ir_input = ExplicitCoarseIRInput(
-                self.channels["p4"], max_angle=15., max_shift=.20,
-                max_scale=1.25, local_shift=.06)
+                self.channels["p4"], max_angle=5., max_shift=.04,
+                max_scale=1.06, local_shift=.015)
         else:
             self.v52_ir_input = None
+        # V6.1 can bypass the learned geometry adapter while retaining the
+        # checkpoint-compatible module and the external A0 coarse preprocessing.
+        # Keeping the module registered lets existing Stage-A/Stage-B weights
+        # load strictly during the removal audit.
+        self.disable_ir_geometry_adapter = False
         self.neck_memory = NeckMemoryRead(p2_ch, md, cfg.fusion.heads)
         self.localization = nn.ModuleList([Conv(self.channels[s], c, 1) for s,c in zip(SCALES,self.neck_channels)])
         self.occlusion_context = nn.ModuleList()
@@ -408,9 +417,12 @@ class IndependentMMYOLO(nn.Module):
             raw = self._encode(
                 ir, "v511_ir" if self.v511_ir_encoder is not None else "ir", present)
             if self.v52_ir_input is not None:
-                if self.cfg.fusion.fusion_strategy == "v521_stage_a_v1":
+                if (getattr(self, "disable_ir_geometry_adapter", False) and
+                        self.cfg.fusion.fusion_strategy == "v521_stage_a_v1"):
+                    raw = self.v52_ir_input.quality_only(raw, quality, ir.shape[-2:])
+                elif self.cfg.fusion.fusion_strategy == "v521_stage_a_v1":
                     raw = self.v52_ir_input(raw, quality, ir.shape[-2:], rgb=rgb, ir=ir)
-                else:
+                elif not getattr(self, "disable_ir_geometry_adapter", False):
                     raw = self.v52_ir_input(raw, quality, ir.shape[-2:])
         return self.independent_aux[name](raw), present
 
@@ -490,14 +502,17 @@ class IndependentMMYOLO(nn.Module):
         depth = rgb.new_zeros(b,4,h,w) if depth is None else depth
         raw = [self._encode(rgb,"rgb",present[:,0]), self._encode(ir,"ir",present[:,1]),
                self._encode(depth[:,:1],"dep",present[:,2])]
-        # Stage B consumes the same A0 plus learned residual IR representation
-        # trained by the standalone Stage-A IR detector. RGB contributes only
-        # detached low-level geometry inside the adapter, never semantic input.
+        # V6.1 disables only learned residual geometry. The deterministic A0
+        # transform and its quality/validity evidence remain active.
         if self.v52_ir_input is not None:
-            if self.cfg.fusion.fusion_strategy == "v521_stage_a_v1":
+            if (getattr(self, "disable_ir_geometry_adapter", False) and
+                    self.cfg.fusion.fusion_strategy == "v521_stage_a_v1"):
+                raw[1] = self.v52_ir_input.quality_only(
+                    raw[1], quality, ir.shape[-2:])
+            elif self.cfg.fusion.fusion_strategy == "v521_stage_a_v1":
                 raw[1] = self.v52_ir_input(
                     raw[1], quality, ir.shape[-2:], rgb=rgb, ir=ir)
-            else:
+            elif not getattr(self, "disable_ir_geometry_adapter", False):
                 raw[1] = self.v52_ir_input(raw[1], quality, ir.shape[-2:])
         raw[2], absolute, metric_valid = self._add_depth_metric(raw[2], depth, present[:,2])
         thermal_raw = (self._encode(ir, "v511_ir", present[:, 1])
@@ -518,7 +533,14 @@ class IndependentMMYOLO(nn.Module):
                 spatial = F.interpolate(quality["availability"].float(),shape,mode="nearest")
                 masks[s] = [masks[s][i]*spatial[:,i:i+1] for i in range(3)]
             masks[s][2] = masks[s][2] * F.interpolate(valid_d, shape, mode="nearest")
-            reliabilities[s] = [masks[s][0], masks[s][1], F.interpolate(reliability_d,shape,mode="area") * masks[s][2]]
+            ir_reliability = masks[s][1]
+            if quality and "v521_alignment_weight" in quality:
+                sample_alignment = F.interpolate(
+                    quality["v521_alignment_weight"].float(), shape,
+                    mode="bilinear", align_corners=False).clamp(0, 1)
+                ir_reliability = ir_reliability * sample_alignment
+            reliabilities[s] = [masks[s][0], ir_reliability,
+                                F.interpolate(reliability_d,shape,mode="area") * masks[s][2]]
             commons[s], privates[s] = [], []
             for m in range(3):
                 c,u,loss = self.embeddings[s][m](raw[m][s],masks[s][m])
