@@ -31,7 +31,8 @@ def config():
     cfg.depth_resampling = "nearest_valid_v2"
     cfg.fusion.fusion_strategy = "v521_stage_a_v1"
     cfg.fusion.branch_aux_weight = 0.0
-    cfg.fusion.branch_aux_weights = (1.0, 1.0, 0.6)
+    # V6.2 Stage A trains only IR/Depth; RGB is a detached geometry teacher.
+    cfg.fusion.branch_aux_weights = (0.0, 1.0, 1.0)
     cfg.fusion.alignment_mode = "identity_residual_v2"
     cfg.fusion.depth_reliability = "valid_support_v2"
     cfg.fusion.p2_match_refine = True
@@ -90,7 +91,7 @@ def detection_loss(model, prediction, targets):
 def main():
     torch.set_num_threads(2)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    results = {"version": "V6.1", "baseline": "V4.4", "device": str(device)}
+    results = {"version": "V6.2", "baseline": "V4.4", "device": str(device)}
 
     stage_a = MMYOLO(config()).to(device).train()
     enable_trainable_defaults(stage_a)

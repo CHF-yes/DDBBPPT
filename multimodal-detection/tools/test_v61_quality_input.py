@@ -54,6 +54,9 @@ def main():
         assert torch.isfinite(out1[key]).all()
         assert torch.allclose(out1[key], out2[key], atol=0, rtol=0)
         assert out1[key][1].abs().mean() < out1[key][0].abs().mean() * .45
+    # The second sample is explicitly fallback_raw: its output remains close
+    # to the unwarped thermal feature instead of trusting the A0 sample.
+    assert out1['p4'][1].abs().mean() <= raw['p4'][1].abs().mean() * 1.05
     assert module.last_stats['mode'] == 'a0_quality_only'
     assert module.last_stats['learned_geometry'] is False
     loss = sum(value.float().mean() for value in out1.values())
@@ -85,6 +88,8 @@ def main():
                    for parameter in geometry_parameters)
     assert all(value.grad is not None and torch.isfinite(value.grad).all()
                for value in raw2.values())
+    assert module.last_stats['soft_gate_mean'] >= 0
+    assert 'hard_accept_fraction' in module.last_stats
 
     module.zero_grad(set_to_none=True)
     raw3 = {key: value.detach().clone().requires_grad_(True)

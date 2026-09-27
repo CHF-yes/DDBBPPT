@@ -216,6 +216,8 @@ class ExplicitCoarseIRInput(nn.Module):
         self.last_acceptance = None
         self.last_acceptance_target = None
         self.last_acceptance_metrics = None
+        self.last_soft_acceptance = None
+        self.last_soft_acceptance_target = None
         self.last_coarse_ghost_raw = None
         self.last_coarse_ghost_calibrated = None
         self.last_rgb_ghost_support = None
@@ -298,8 +300,8 @@ class ExplicitCoarseIRInput(nn.Module):
             def coarse_map(value):
                 return resample(value * valid_scale, sampling, canvas).clamp(0, 1)
 
-            coarse_feature = resample(
-                feature * valid_scale.to(feature.dtype), sampling, canvas)
+            raw_feature = feature * valid_scale.to(feature.dtype)
+            coarse_feature = resample(raw_feature, sampling, canvas)
             coarse_valid = coarse_map(valid_scale)
             coarse_invalid = coarse_map(invalid)
             coarse_ghost = calibrate_a0_ghost(coarse_map(ghost)) * coarse_map(ghost_conf)
@@ -318,8 +320,14 @@ class ExplicitCoarseIRInput(nn.Module):
             # Content quality controls modality strength, while a weak A0 only
             # changes the selected base grid to identity.  Do not discard usable
             # raw thermal content merely because cross-modal alignment is weak.
+            # A0 is a base candidate, not a truth label. Samples rejected by
+            # the offline quality check retain the raw thermal grid while the
+            # same quality/availability evidence remains available downstream.
+            # The blend is sample-level, so it cannot create a second warp.
+            selected_feature = (coarse_feature * (1 - fallback_raw) +
+                                raw_feature * fallback_raw)
             gain = (content_weight * (.75 + .25 * trust)).to(feature.dtype)
-            result[scale_name] = coarse_feature * gain
+            result[scale_name] = selected_feature * gain
             trust_means.append(trust.detach().float().mean())
             ghost_means.append(coarse_ghost.detach().float().mean())
             valid_means.append(coarse_valid.detach().float().mean())
@@ -330,6 +338,8 @@ class ExplicitCoarseIRInput(nn.Module):
         self.last_global_physical = None
         self.last_local_delta = None
         self.last_acceptance = None
+        self.last_soft_acceptance = None
+        self.last_soft_acceptance_target = None
         self.last_stats = {
             'mode': 'a0_quality_only',
             'learned_geometry': False,
@@ -464,6 +474,48 @@ class ExplicitCoarseIRInput(nn.Module):
         alignment_ok = alignment_weight.flatten(1).mean(1) >= .25
         hard_accept = geometry_ok & alignment_ok & (global_conf[:, 0] >= .5)
 
+        # Keep the strict multi-region decision for audit and supervision, but
+        # do not turn it into an all-or-nothing training path. In practice a
+        # useful residual often improves two or three regions while the old
+        # gate demanded four, making the adapter acceptance rate exactly zero.
+        # This gate is continuous, detached before sampling, and has a hard
+        # safety floor for clear regressions.
+        eps = acceptance['coarse_score'].new_tensor(.05)
+        global_gain = ((acceptance['coarse_score'] -
+                        acceptance['candidate_score']) /
+                       (acceptance['coarse_score'].abs() + eps)).clamp(-1, 1)
+        raw_gain = ((acceptance['raw_score'] - acceptance['candidate_score']) /
+                    (acceptance['raw_score'].abs() + eps)).clamp(-1, 1)
+        holdout_gain = ((acceptance['holdout_base_score'] -
+                         acceptance['holdout_candidate_score']) /
+                        (acceptance['holdout_base_score'].abs() + eps)).clamp(-1, 1)
+        valid_regions_f = acceptance['valid_regions'].float().clamp_min(1)
+        regional_support = (acceptance['improved_regions'].float() /
+                            valid_regions_f).clamp(0, 1)
+        regional_regression = (acceptance['worsened_regions'].float() /
+                               valid_regions_f).clamp(0, 1)
+        evidence = (
+            .35 * (global_gain + 1) * .5 +
+            .20 * (raw_gain + 1) * .5 +
+            .20 * (holdout_gain + 1) * .5 +
+            .25 * regional_support)
+        evidence = (evidence * (1 - regional_regression)).clamp(0, 1)
+        alignment_factor = alignment_weight.flatten(1).mean(1).clamp(0, 1)
+        fallback_factor = fallback_raw.flatten(1).mean(1).clamp(0, 1)
+        # The 0.20 floor prevents an untrained confidence logit from making
+        # every sample permanently unusable; evidence and safety still decide
+        # how much of the residual is applied.
+        soft_accept = alignment_factor * (1 - fallback_factor)
+        soft_accept = soft_accept * (.20 + .80 * global_conf[:, 0]) * evidence
+        severe_regression = (
+            (acceptance['candidate_score'] > acceptance['coarse_score'] * 1.12 + .02) |
+            (acceptance['worsened_regions'].float() >
+             torch.maximum(torch.ones_like(valid_regions_f),
+                           .25 * valid_regions_f)))
+        soft_accept = torch.where(severe_regression,
+                                  torch.zeros_like(soft_accept),
+                                  soft_accept).clamp(0, 1)
+
         global_p4 = resample(p4 * valid_p4.to(p4.dtype), total_sampling, canvas)
         candidate_invalid = resample(raw_invalid * valid_p4, total_sampling, canvas).clamp(0, 1)
         candidate_ghost_conf = resample(
@@ -504,8 +556,8 @@ class ExplicitCoarseIRInput(nn.Module):
         # Detection gradients must not teach the geometry head a semantic
         # shortcut.  The adapter is trained by its explicit geometry loss; the
         # detector consumes only evidence-validated, detached corrections.
-        global_gate = hard_accept.to(global_conf.dtype)[:, None]
-        local_gate = (local_conf >= .5).to(local_conf.dtype)
+        global_gate = soft_accept.to(global_conf.dtype)[:, None]
+        local_gate = local_conf
         used_normalized = normalized * global_gate
         used_residual, _ = residual_sampling(
             used_normalized, canvas, self.max_angle, self.max_shift, self.max_log_scale)
@@ -530,6 +582,8 @@ class ExplicitCoarseIRInput(nn.Module):
         self.last_local_delta = delta
         self.last_acceptance = hard_accept
         self.last_acceptance_target = geometry_ok.to(global_conf.dtype)
+        self.last_soft_acceptance = soft_accept.detach()
+        self.last_soft_acceptance_target = soft_accept.detach()
         self.last_acceptance_metrics = acceptance
         self.last_coarse_ghost_raw = coarse_ghost_raw.detach()
         self.last_coarse_ghost_calibrated = coarse_ghost_calibrated.detach()
@@ -545,7 +599,9 @@ class ExplicitCoarseIRInput(nn.Module):
             'local_flow_rms_px': float(delta.detach().square().mean().sqrt()),
             'local_confidence': float(local_conf.detach().mean()),
             'pixel_blend_enabled': False,
-            'accepted_fraction': float(hard_accept.float().mean()),
+            'accepted_fraction': float((soft_accept > 1e-4).float().mean()),
+            'hard_accept_fraction': float(hard_accept.float().mean()),
+            'soft_gate_mean': float(soft_accept.detach().mean()),
             'geometry_improves_fraction': float(geometry_ok.float().mean()),
             'improved_regions_mean': float(acceptance['improved_regions'].float().mean()),
             'worsened_regions_mean': float(acceptance['worsened_regions'].float().mean()),
@@ -577,8 +633,12 @@ class ExplicitCoarseIRInput(nn.Module):
         observed_improvement = (torch.zeros_like(supervised)
                                 if self.last_acceptance_target is None else
                                 self.last_acceptance_target.float().reshape(-1))
+        soft_observed = (torch.zeros_like(supervised)
+                         if self.last_soft_acceptance_target is None else
+                         self.last_soft_acceptance_target.float().reshape(-1))
         confidence_target = torch.where(
-            supervised > 0, supervised * label_quality, observed_improvement)
+            supervised > 0, supervised * label_quality,
+            torch.maximum(observed_improvement, soft_observed))
         error = F.smooth_l1_loss(self.last_global_normalized.float(), target,
                                  reduction='none', beta=.10).mean(1)
         weight = supervised * confidence_target.clamp_min(.05)
