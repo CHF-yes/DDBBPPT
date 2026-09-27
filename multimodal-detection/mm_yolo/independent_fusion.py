@@ -245,15 +245,23 @@ class ComplementaryFusion(nn.Module):
         # but also has an almost-zero gradient.  RGB remains the immutable
         # anchor (slot 0); only IR/Depth switches are released by the trainer.
         self.residual_scale = nn.Parameter(torch.zeros(3))
+        # Zero means exact compatibility with the pretrained V6.2/V4.4 fusion.
+        # Stage B may learn how strongly alignment confidence should influence
+        # the IR route without imposing a hard coefficient jump at load time.
+        self.ir_alignment_mix = nn.Parameter(torch.tensor(0.0))
         self.last_stats, self.last_health = {}, {}
 
-    def forward(self, raw, common, private, valid, match, reliable, memory, quality=None):
+    def forward(self, raw, common, private, valid, match, reliable, memory, quality=None,
+                ir_alignment=None):
         rgb = raw[0] * valid[0]
         fallback = sum(x*m for x, m in zip(raw[1:], valid[1:])) / (valid[1]+valid[2]).clamp_min(1)
         state = rgb + (1-valid[0]) * fallback
         context = self.context(F.layer_norm(memory[:, 3].mean(1).float(), (memory.shape[-1],)))[:, :, None, None]
         context = .25 * context / torch.sqrt(1 + context.float().square().mean(1, keepdim=True))
         stats = {}
+        ir_alignment_mix = self.ir_alignment_mix.clamp(0, 1)
+        ir_shared_support = None
+        ir_private_support = None
         for _ in range(self.rounds):
             q = self.query(state) + context.to(state.dtype)
             update = torch.zeros_like(state)
@@ -261,18 +269,46 @@ class ComplementaryFusion(nn.Module):
                 # Identity lives in the content/gate path, never in matching descriptors.
                 u = private[m] + self.identity[m][None, :, None, None] * valid[m]
                 qual = q.new_zeros(q.shape[0],3,*q.shape[-2:]) if quality is None or quality[m] is None else quality[m]
-                g = self.gates[m](torch.cat((q, common[m], u, valid[m], match[m], reliable[m],qual), 1)).float().sigmoid()
+                gate_match = match[m]
+                alignment = None
+                if m == 1 and ir_alignment is not None:
+                    alignment = ir_alignment.float().clamp(0, 1)
+                    if alignment.shape[-2:] != q.shape[-2:]:
+                        alignment = F.interpolate(
+                            alignment, q.shape[-2:], mode="bilinear",
+                            align_corners=False)
+                    # Alignment is a sample-level route trust: raw fallback
+                    # is low, A0 is medium, and accepted Adapter output is high.
+                    # It informs localization without suppressing private heat cues.
+                    aligned_match = (gate_match.float().clamp(0, 1) *
+                                     (.25 + .75 * alignment)).sqrt()
+                    gate_match = (gate_match.float() + ir_alignment_mix *
+                                  (aligned_match - gate_match.float())).to(gate_match.dtype)
+                g = self.gates[m](torch.cat((q, common[m], u, valid[m], gate_match, reliable[m],qual), 1)).float().sigmoid()
                 # Match confidence already chose how far to move the feature
                 # towards its residual warp.  It must not gate evidence a second
                 # time: the nominal sensor grids are valid fallbacks.
-                gc = g[:, :1] * reliable[m] * valid[m]
-                gu = g[:, 1:] * reliable[m] * valid[m]
+                base_gc = g[:, :1] * reliable[m] * valid[m]
+                base_gu = g[:, 1:] * reliable[m] * valid[m]
+                if m == 1 and alignment is not None:
+                    aligned_g = .50 + .50 * g
+                    aligned_gc = (aligned_g[:, :1] * alignment.to(g.dtype) *
+                                  (.75 + .25 * reliable[m]) * valid[m])
+                    aligned_gu = aligned_g[:, 1:] * valid[m]
+                    gc = base_gc + ir_alignment_mix * (aligned_gc - base_gc)
+                    gu = base_gu + ir_alignment_mix * (aligned_gu - base_gu)
+                    ir_shared_support = gc.detach().float().mean()
+                    ir_private_support = gu.detach().float().mean()
+                else:
+                    gc, gu = base_gc, base_gu
                 residual = self.outputs[m](torch.cat((common[m]*gc, u*gu), 1).to(state.dtype))
                 # Keep a random branch from overwhelming the pretrained spatial signal.
                 bound = state.detach().float().square().mean(1, keepdim=True).sqrt().clamp_min(.1)
                 residual = residual / torch.sqrt(1 + residual.float().square().mean(1, keepdim=True)/bound.square()).to(residual.dtype)
-                coefficient = (self.residual_scale[m] * 0 if m == 0 else
-                               .25 * self.residual_scale[m].tanh())
+                if m == 0:
+                    coefficient = self.residual_scale[m] * 0
+                else:
+                    coefficient = .25 * self.residual_scale[m].tanh()
                 update = update + coefficient * residual
                 stats[str(m)] = torch.stack((match[m].detach().mean(), ((gc+gu)/2).detach().mean()))
             state = state + update / self.rounds
@@ -280,7 +316,21 @@ class ComplementaryFusion(nn.Module):
         self.last_health = {"context_rms": context.detach().square().mean().sqrt()}
         for m in range(3):
             self.last_health[f"{m}_reliable"] = reliable[m].detach().float().mean()
-            self.last_health[f"{m}_residual_scale"] = (.25 * self.residual_scale[m].detach().tanh())
+            if m == 0:
+                effective = self.residual_scale[m].detach() * 0
+            else:
+                effective = .25 * self.residual_scale[m].detach().tanh()
+            self.last_health[f"{m}_residual_scale"] = effective
+            if m == 1:
+                self.last_health["ir_effective_coefficient"] = effective
+        if ir_alignment is not None:
+            self.last_health["ir_alignment_confidence"] = (
+                ir_alignment.detach().float().mean())
+            self.last_health["ir_alignment_mix"] = ir_alignment_mix.detach()
+        if ir_shared_support is not None:
+            self.last_health["ir_shared_support"] = ir_shared_support
+        if ir_private_support is not None:
+            self.last_health["ir_private_support"] = ir_private_support
         return state
 
 

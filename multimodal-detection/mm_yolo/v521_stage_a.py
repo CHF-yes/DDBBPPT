@@ -225,6 +225,7 @@ class ExplicitCoarseIRInput(nn.Module):
         self.last_coarse_thermal_weight = None
         self.last_ghost_calibration_loss = None
         self.last_a0_condition = None
+        self.last_fusion_confidence = {}
         self.last_stats = {}
 
     @staticmethod
@@ -273,6 +274,7 @@ class ExplicitCoarseIRInput(nn.Module):
         sampling = quality['v52_ir_sampling'].float()
         valid = quality['availability'][:, 1:2].float()
         result = {}
+        self.last_fusion_confidence = {}
         trust_means, ghost_means, valid_means = [], [], []
         for scale_name, feature in raw.items():
             shape = feature.shape[-2:]
@@ -328,6 +330,17 @@ class ExplicitCoarseIRInput(nn.Module):
                                 raw_feature * fallback_raw)
             gain = (content_weight * (.75 + .25 * trust)).to(feature.dtype)
             result[scale_name] = selected_feature * gain
+            # This is confidence that the selected IR feature is on the RGB
+            # grid.  Raw fallback remains valid thermal content, but is not an
+            # aligned localization observation.
+            trust_mean = trust.detach().float().flatten(1).mean(1)
+            fallback_mean = fallback_raw.detach().float().flatten(1).mean(1)
+            sample_confidence = torch.where(
+                fallback_mean >= .5,
+                torch.full_like(trust_mean, .15),
+                (.55 + .35 * trust_mean).clamp(.55, .90))
+            self.last_fusion_confidence[scale_name] = sample_confidence[
+                :, None, None, None].expand(-1, 1, *shape).to(feature.dtype)
             trust_means.append(trust.detach().float().mean())
             ghost_means.append(coarse_ghost.detach().float().mean())
             valid_means.append(coarse_valid.detach().float().mean())
@@ -562,10 +575,26 @@ class ExplicitCoarseIRInput(nn.Module):
         used_residual, _ = residual_sampling(
             used_normalized, canvas, self.max_angle, self.max_shift, self.max_log_scale)
         used_sampling = torch.bmm(s3, used_residual)[:, :2].detach()
+        # A sample-level raw fallback must really use the raw grid.  Previously
+        # it only reduced Adapter acceptance while the A0 sampling matrix was
+        # still applied to the feature pyramid.
+        identity_sampling = used_sampling.new_zeros(used_sampling.shape)
+        identity_sampling[:, 0, 0] = 1
+        identity_sampling[:, 1, 1] = 1
+        raw_fallback = (fallback_factor >= .5)[:, None, None]
+        used_sampling = torch.where(raw_fallback, identity_sampling, used_sampling)
         used_delta = (delta * local_gate *
                       global_gate[:, :, None, None]).detach()
 
+        source_alignment_confidence = (
+            valid_p4 * raw_thermal * raw_geometry *
+            (1 - raw_invalid) * (1 - raw_exclude) *
+            (1 - raw_ghost_supported) * alignment_weight *
+            (1 - fallback_raw)).clamp(0, 1)
         result = {}
+        self.last_fusion_confidence = {}
+        valid_confidence_means = []
+        fusion_confidence_means = []
         for scale_name, feature in raw.items():
             v = F.interpolate(valid, feature.shape[-2:], mode='nearest').to(feature.dtype)
             safe_raw = feature * v
@@ -575,6 +604,34 @@ class ExplicitCoarseIRInput(nn.Module):
             result[scale_name] = resample(
                 safe_raw, used_sampling, canvas,
                 used_delta.to(feature.dtype)) * sample_gain
+            confidence_source = F.interpolate(
+                source_alignment_confidence, feature.shape[-2:],
+                mode='bilinear', align_corners=False)
+            aligned_confidence = resample(
+                confidence_source, used_sampling, canvas).clamp(0, 1)
+            valid_source = F.interpolate(
+                valid_p4, feature.shape[-2:], mode='nearest')
+            aligned_valid = resample(
+                valid_source, used_sampling, canvas).clamp(0, 1)
+            valid_mean = (aligned_confidence.flatten(1).sum(1) /
+                          aligned_valid.flatten(1).sum(1).clamp_min(1e-6))
+            # Convert geometry evidence into sample-level route trust.
+            # Raw fallback retains thermal semantics but weak localization;
+            # A0 is medium confidence and accepted residual raises confidence.
+            raw_flag = raw_fallback.reshape(-1, 1, 1, 1).to(valid_mean.dtype)
+            adapter_strength = soft_accept.detach().reshape(
+                -1, 1, 1, 1).to(valid_mean.dtype)
+            aligned_tier = (
+                .55 + .20 * adapter_strength +
+                .20 * valid_mean[:, None, None, None]).clamp(.55, .95)
+            sample_confidence = torch.where(
+                raw_flag >= .5,
+                torch.full_like(aligned_tier, .15),
+                aligned_tier)
+            self.last_fusion_confidence[scale_name] = sample_confidence.expand(
+                -1, 1, *feature.shape[-2:]).detach().to(feature.dtype)
+            valid_confidence_means.append(valid_mean.detach().mean())
+            fusion_confidence_means.append(sample_confidence.detach().mean())
 
         self.last_global_normalized = normalized
         self.last_global_logit = global_raw[:, 4]
@@ -616,6 +673,10 @@ class ExplicitCoarseIRInput(nn.Module):
             'content_weight_mean': float(content_weight.detach().mean()),
             'alignment_weight_mean': float(alignment_weight.detach().mean()),
             'fallback_raw_fraction': float(fallback_raw.detach().mean()),
+            'fusion_alignment_valid_mean': float(
+                torch.stack(valid_confidence_means).mean()),
+            'fusion_confidence_mean': float(
+                torch.stack(fusion_confidence_means).mean()),
         }
         return result
 

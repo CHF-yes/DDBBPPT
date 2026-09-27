@@ -3,6 +3,7 @@
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -14,6 +15,7 @@ for item in (MM, MM.parent / "vendor"):
         sys.path.insert(0, str(item))
 
 import eval as eval_module  # noqa: E402
+import submit as submit_module  # noqa: E402
 
 
 class _FakeModel(nn.Module):
@@ -50,6 +52,43 @@ class EvalRegressions(unittest.TestCase):
         self.assertEqual(mocked.call_count, 3)
         self.assertEqual(len(decoded), 3)
         self.assertTrue(all(item.shape == (1, 6) for item in decoded))
+
+    def test_submit_enables_explicit_a0_for_v521_checkpoint(self):
+        cfg = SimpleNamespace(
+            fusion=SimpleNamespace(fusion_strategy="v521_stage_a_v1"),
+            encoder=SimpleNamespace(depth_input_channels=4),
+            depth_resampling="nearest_valid_v2",
+            ir_read_mode="median_channel",
+        )
+        model = SimpleNamespace(cfg=cfg, eval=lambda: None)
+        checkpoint = {"meta": {"ir_a0": {"required": True}}}
+        captured = {}
+
+        class StopAfterDatasetConfig(RuntimeError):
+            pass
+
+        def capture_dataset(*_args, **kwargs):
+            captured["aug"] = kwargs["aug"]
+            raise StopAfterDatasetConfig
+
+        argv = [
+            "submit.py", "--ckpt", "fake.pt", "--root", "fake-root",
+            "--ir-a0-cache", "fake-cache", "--out", "fake-out",
+        ]
+        with patch.object(sys, "argv", argv), \
+             patch.object(submit_module, "load_mm_checkpoint",
+                          return_value=(model, checkpoint)), \
+             patch.object(submit_module, "resolve_infer_modalities", return_value="all"), \
+             patch.object(submit_module, "resolve_infer_canvas", return_value=(32, 32)), \
+             patch.object(submit_module, "scan_test",
+                          return_value=([{"stem": "sample"}], {"infrared": 0, "depth": 0})), \
+             patch.object(submit_module, "MMDataset", side_effect=capture_dataset), \
+             self.assertRaises(StopAfterDatasetConfig):
+            submit_module.main()
+
+        self.assertTrue(captured["aug"].require_ir_a0)
+        self.assertTrue(captured["aug"].v521_explicit)
+        self.assertEqual(captured["aug"].ir_a0_cache, "fake-cache")
 
 
 if __name__ == "__main__":

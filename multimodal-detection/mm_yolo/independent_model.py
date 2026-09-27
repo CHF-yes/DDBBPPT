@@ -502,9 +502,13 @@ class IndependentMMYOLO(nn.Module):
         depth = rgb.new_zeros(b,4,h,w) if depth is None else depth
         raw = [self._encode(rgb,"rgb",present[:,0]), self._encode(ir,"ir",present[:,1]),
                self._encode(depth[:,:1],"dep",present[:,2])]
+        ir_alignment_confidence = None
         # V6.1 disables only learned residual geometry. The deterministic A0
         # transform and its quality/validity evidence remain active.
-        if self.v52_ir_input is not None:
+        # RGB-only and RGB+Depth ablations intentionally omit IR. Do not invoke
+        # the V5.2.1 explicit-A0 adapter when no IR sample is present.
+        ir_input_present = bool(present[:, 1].any().item())
+        if self.v52_ir_input is not None and ir_input_present:
             if (getattr(self, "disable_ir_geometry_adapter", False) and
                     self.cfg.fusion.fusion_strategy == "v521_stage_a_v1"):
                 raw[1] = self.v52_ir_input.quality_only(
@@ -514,6 +518,8 @@ class IndependentMMYOLO(nn.Module):
                     raw[1], quality, ir.shape[-2:], rgb=rgb, ir=ir)
             elif not getattr(self, "disable_ir_geometry_adapter", False):
                 raw[1] = self.v52_ir_input(raw[1], quality, ir.shape[-2:])
+            ir_alignment_confidence = getattr(
+                self.v52_ir_input, "last_fusion_confidence", None)
         raw[2], absolute, metric_valid = self._add_depth_metric(raw[2], depth, present[:,2])
         thermal_raw = (self._encode(ir, "v511_ir", present[:, 1])
                        if self.v511_ir_encoder is not None else raw[1])
@@ -825,8 +831,12 @@ class IndependentMMYOLO(nn.Module):
                 # Do not leak the seven geometry-only channels into that route.
                 fusion_quality = (base_qual if self.cfg.fusion.fusion_strategy in
                                   ("v52_stage_a_v1", "v521_stage_a_v1") else qual)
+                aligned_confidence = (
+                    None if not ir_alignment_confidence else
+                    ir_alignment_confidence.get(s))
                 fused[s] = fusion_block(
-                    values, c, u, mask, confidence[s], rel, state, fusion_quality)
+                    values, c, u, mask, confidence[s], rel, state, fusion_quality,
+                    ir_alignment=aligned_confidence)
             fusion_block.last_health["ir_flow_rms"] = flows[s][0].detach().float().square().mean().sqrt()
             fusion_block.last_health["dep_flow_rms"] = flows[s][1].detach().float().square().mean().sqrt()
             # values are already identity/residual aligned in V4.2, so match must

@@ -613,6 +613,17 @@ def set_residual_fusion_mode(model: MMYOLO, downstream_frozen: bool,
             for module in list(block.gates[1:]) + list(block.outputs[1:]):
                 enable(module)
             block.residual_scale.requires_grad_(True)
+            alignment_mix = getattr(block, "ir_alignment_mix", None)
+            if alignment_mix is not None:
+                alignment_mix.requires_grad_(True)
+    # V6 stable adaptation: learn only auxiliary evidence projections and
+    # alignment-aware fusion while preserving all sensor encoders and the
+    # RGB/detector coordinate system.
+    if (getattr(model.cfg.fusion, "fusion_strategy", "") ==
+            "v521_stage_a_v1" and hasattr(model, "embeddings")):
+        for blocks in model.embeddings.values():
+            for block in blocks[1:]:
+                enable(block)
     if not incremental or not downstream_frozen:
         enable(getattr(model, "register_bus", None))
         enable(getattr(model, "neck_memory", None))
@@ -633,14 +644,18 @@ def set_residual_fusion_mode(model: MMYOLO, downstream_frozen: bool,
                 for block in blocks[1:]:
                     enable(block)
 
-    if not downstream_frozen and getattr(model.cfg.fusion, "fusion_strategy", "") != "v521_stage_a_v1":
-        enable(getattr(model, "aux_encoders", None))
-        enable(getattr(model, "metric_encoder", None))
-        enable(getattr(model, "matchers", None))
-        if hasattr(model, "embeddings"):
-            for blocks in model.embeddings.values():
-                for block in blocks[1:]:
-                    enable(block)
+    if not downstream_frozen:
+        # V5.2.1 B2 keeps the independently trained sensor encoders frozen,
+        # but cautiously releases the downstream detector/localization path.
+        # Other strategies retain their previous full auxiliary release.
+        if getattr(model.cfg.fusion, "fusion_strategy", "") != "v521_stage_a_v1":
+            enable(getattr(model, "aux_encoders", None))
+            enable(getattr(model, "metric_encoder", None))
+            enable(getattr(model, "matchers", None))
+            if hasattr(model, "embeddings"):
+                for blocks in model.embeddings.values():
+                    for block in blocks[1:]:
+                        enable(block)
         for name in ("p2_lateral", "p2_neck", "p2_down", "p3_refine", "localization"):
             enable(getattr(model, name, None))
         for name in ("neck_gain", "localization_scale"):
@@ -655,7 +670,8 @@ def set_residual_fusion_mode(model: MMYOLO, downstream_frozen: bool,
             dfl.requires_grad_(False)
 
 
-def set_anchored_joint_mode(model: MMYOLO, detector_frozen: bool) -> None:
+def set_anchored_joint_mode(model: MMYOLO, detector_frozen: bool,
+                            train_rgb_encoder: bool = False) -> None:
     """V4.2c: retain a fixed RGB semantic coordinate system.
 
     Stage A learned IR/Depth against a frozen RGB detector.  Unfreezing every
@@ -671,6 +687,12 @@ def set_anchored_joint_mode(model: MMYOLO, detector_frozen: bool) -> None:
         if module is not None:
             for p in module.parameters():
                 p.requires_grad_(True)
+
+    # Allow a tiny RGB-encoder update in the V6 recovery experiment.  RGB
+    # embeddings and fusion references remain fixed, preserving the shared
+    # coordinate system while IR/Depth learn stronger contributions.
+    if train_rgb_encoder:
+        enable(model.backbone.model[:11])
 
     for name in ("aux_encoders", "metric_encoder", "matchers",
                  "register_bus", "neck_memory"):
@@ -1606,7 +1628,7 @@ def main():
                 args.ir_affine_loss_weight or args.mosaic or args.misalign_px):
             raise ValueError("V5.2 is Stage A only: required rotation cache, no old affine loss/mosaic")
     if args.fusion_strategy == "v521_stage_a_v1":
-        if (args.train_stage not in ("aux_independent", "residual_fusion") or
+        if (args.train_stage not in ("aux_independent", "residual_fusion", "anchored_joint") or
                 args.ir_coarse_align or not args.require_ir_a0 or
                 not args.ir_a0_cache or args.mosaic or args.misalign_px):
             raise ValueError(
@@ -1919,7 +1941,7 @@ def main():
     role_mults = None
     if args.train_stage in ("anchored_joint", "residual_fusion", "aux_independent"):
         role_mults = {"anchor": (args.rgb_stage_b_lr_mult
-                                  if args.train_stage == "residual_fusion" else 0.0),
+                                  if args.train_stage in ("residual_fusion", "anchored_joint") else 0.0),
                       "aux_encoder": args.backbone_lr_mult,
                       "fusion": args.fusion_lr_mult,
                       "p2": args.p2_lr_mult,
@@ -1949,6 +1971,13 @@ def main():
         migrated = False
         if not args.resume:
             weights, migrated = adapt_depth_checkpoint_state(weights, model)
+        # New confidence-calibration scalars must start at exact zero when an
+        # older V6.2 checkpoint is loaded.  Fill only these explicitly named
+        # keys, then retain strict loading for every established parameter.
+        current_state = model.state_dict()
+        for key, value in current_state.items():
+            if key.endswith(".ir_alignment_mix") and key not in weights:
+                weights[key] = value
         model.load_state_dict(weights, strict=True)
         if args.reset_fusion_gates:
             reset_keys = reset_fusion_gate_outputs(model)
@@ -2167,7 +2196,9 @@ def main():
             set_aux_adaptation_mode(model)
             frozen = True
         elif args.train_stage == "anchored_joint":
-            set_anchored_joint_mode(model, detector_frozen=frozen)
+            set_anchored_joint_mode(
+                model, detector_frozen=frozen,
+                train_rgb_encoder=(args.rgb_stage_b_lr_mult > 0))
         else:
             set_encoder_frozen(model, frozen)
         lr = lr_at(ep, args.epochs, args.lr, warmup=args.warmup, lrf=args.lrf)

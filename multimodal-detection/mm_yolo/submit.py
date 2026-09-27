@@ -196,6 +196,8 @@ def main():
                               ir_read_mode=getattr(model.cfg, "ir_read_mode", "legacy_first_channel"),
                               ir_a0_cache=args.ir_a0_cache,
                               require_ir_a0=a0_required,
+                              v521_explicit=(getattr(model.cfg.fusion, "fusion_strategy", "") ==
+                                             "v521_stage_a_v1"),
                               legacy_lowlight=int(model.cfg.encoder.depth_input_channels) == 2),
                    enabled={"rgb": ("rgb",), "ir": ("ir",), "dep": ("dep",),
                             "rgb_ir": ("rgb", "ir"),
