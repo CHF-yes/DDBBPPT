@@ -101,12 +101,24 @@ def main():
     assert bool(active.all())
     stage_a_loss = detection_loss(stage_a, prediction, targets)
     stage_a_loss.backward()
-    stage_a_grad = grad_norm(stage_a.v52_ir_input)
+    # The detector consumes an evidence-validated, detached sampling grid.
+    # Therefore semantic detection must not train the geometry head; the
+    # explicit affine target below is its only Stage-A training route.
+    stage_a_detection_grad = grad_norm(stage_a.v52_ir_input)
     rgb_geometry_grad = 0.0 if rgb.grad is None else float(rgb.grad.detach().abs().sum())
-    assert stage_a_grad > 0, "Stage-A detection loss did not reach the IR adapter"
+    assert stage_a_detection_grad == 0.0, "Stage-A detection loss entered the IR adapter"
+    stage_a.zero_grad(set_to_none=True)
+    stage_a_target = torch.zeros_like(stage_a.v52_ir_input.last_global_normalized)
+    stage_a_geometry_loss = stage_a.v52_ir_input.supervision_loss(
+        stage_a_target, torch.ones(1, device=device))
+    stage_a_geometry_loss.backward()
+    stage_a_grad = grad_norm(stage_a.v52_ir_input)
+    assert stage_a_grad > 0, "Stage-A explicit geometry supervision missed the adapter"
     assert rgb_geometry_grad == 0.0, "RGB semantic gradient entered Stage-A IR detection"
     results["stage_a"] = {
         "loss": float(stage_a_loss.detach()),
+        "detection_adapter_grad_norm": stage_a_detection_grad,
+        "geometry_loss": float(stage_a_geometry_loss.detach()),
         "adapter_grad_norm": stage_a_grad,
         "rgb_input_grad_l1": rgb_geometry_grad,
         "adapter_trainable": any(p.requires_grad for p in stage_a.v52_ir_input.parameters()),
@@ -158,8 +170,15 @@ def main():
     stage_b_loss = detection_loss(stage_b, prediction, targets)
     optimizer.zero_grad(set_to_none=True)
     stage_b_loss.backward()
+    stage_b_detection_grad = grad_norm(stage_b.v52_ir_input)
+    assert stage_b_detection_grad == 0.0, "Stage-B detection loss entered the IR adapter"
+    optimizer.zero_grad(set_to_none=True)
+    stage_b_target = torch.zeros_like(stage_b.v52_ir_input.last_global_normalized)
+    stage_b_geometry_loss = stage_b.v52_ir_input.supervision_loss(
+        stage_b_target, torch.ones(1, device=device))
+    stage_b_geometry_loss.backward()
     stage_b_grad = grad_norm(stage_b.v52_ir_input)
-    assert stage_b_grad > 0, "Stage-B fused detection loss did not reach the IR adapter"
+    assert stage_b_grad > 0, "Stage-B explicit geometry supervision missed the IR adapter"
     optimizer.step()
     stage_b_update = update_norm(stage_b.v52_ir_input, before)
     assert stage_b_update > 0, "Stage-B optimizer did not update the IR adapter"
@@ -170,6 +189,8 @@ def main():
     assert bool(active.all()) and preserve is not None
     results["stage_b_trainable"] = {
         "loss": float(stage_b_loss.detach()),
+        "detection_adapter_grad_norm": stage_b_detection_grad,
+        "geometry_loss": float(stage_b_geometry_loss.detach()),
         "adapter_grad_norm": stage_b_grad,
         "adapter_update_norm": stage_b_update,
         "lr_role": "geometry",

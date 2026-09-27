@@ -173,6 +173,25 @@ def _fill_invalid(rel: np.ndarray, valid: np.ndarray) -> np.ndarray:
     return filled
 
 
+def _fill_ir_exterior(ir: np.ndarray, invalid: np.ndarray) -> np.ndarray:
+    """Fill invalid IR exterior and feather the sensor-frame seam.
+
+    The validity mask remains authoritative downstream.  This fill exists only
+    to prevent the backbone from converting a hard black polygon boundary into
+    a strong synthetic object edge before feature masking is applied.
+    """
+    bad = (invalid > 0).astype(np.uint8)
+    good = 1 - bad
+    if not bad.any() or not good.any():
+        return ir.astype(np.float32, copy=False)
+    source = np.clip(ir, 0, 255).astype(np.uint8)
+    filled = cv2.inpaint(source, bad * 255, 3, cv2.INPAINT_TELEA).astype(np.float32)
+    feather_px = max(4, round(min(ir.shape[:2]) * .010))
+    distance = cv2.distanceTransform(good, cv2.DIST_L2, 3)
+    alpha = np.clip(distance / max(float(feather_px), 1.0), 0, 1)
+    return (ir.astype(np.float32) * alpha + filled * (1 - alpha)).astype(np.float32)
+
+
 def depth_prior(dep: np.ndarray, valid: np.ndarray, out_size: Tuple[int, int]) -> np.ndarray:
     """depth 先验 (4,h,w)：[逆相对深度, 有效性, 法线 nx, 法线 ny]。
 
@@ -1089,6 +1108,10 @@ class MMDataset(Dataset):
             metric_map = cv2.resize(metric_map, (W, H), interpolation=cv2.INTER_NEAREST)
 
         a0 = None
+        a0_selected = False
+        ir_content_weight = 1.0
+        ir_alignment_weight = 1.0
+        ir_fallback_raw = 0.0
         if want_ir and self.ir_a0_cache is not None:
             a0 = load_ir_a0_sample(self.ir_a0_cache, s["stem"])
             if a0 is None:
@@ -1132,6 +1155,7 @@ class MMDataset(Dataset):
         ir_affine_target = np.zeros(4, np.float32)
         ir_affine_supervised = 0.0
         ir_affine_confidence = 0.0
+        residual_target_sampling = np.eye(3, dtype=np.float32)
         # Cached A0 transforms use output-reference -> IR-source sampling in
         # original coordinates.  S_canvas = M S_orig M^-1 keeps the label
         # correct under letterbox, synchronized crop, rotation and flip.
@@ -1142,14 +1166,41 @@ class MMDataset(Dataset):
                 raise ValueError(f"A0 cache/image size mismatch for {s['stem']}: {stored_hw} vs {(H,W)}")
             S_orig = _mat3(np.asarray(a0["sampling_matrix"], np.float32))
             M3 = _mat3(M)
-            ir_affine_confidence = float(np.asarray(a0["affine_confidence"]).reshape(()))
-            ir_affine_supervised = float(np.asarray(a0["affine_supervised"]).reshape(()))
-            # A weak A0 candidate remains useful as a quality descriptor, but
-            # it is not a geometric label.  In particular, do not compose an
-            # uncertain pseudo-transform into an otherwise exact synthetic
-            # affine target below.
-            if ir_affine_supervised:
+            cached_confidence = float(np.asarray(a0["affine_confidence"]).reshape(()))
+            cached_approved = bool(np.asarray(a0["affine_supervised"]).reshape(()))
+            params = np.asarray(a0.get("source_to_rgb_params", (0., 0., 0., 1.)),
+                                np.float32).reshape(-1)
+            angle = abs(float(params[0])) if len(params) else 0.0
+            tx = abs(float(params[1])) if len(params) > 1 else 0.0
+            ty = abs(float(params[2])) if len(params) > 2 else 0.0
+            scale_a0 = max(1e-6, abs(float(params[3]))) if len(params) > 3 else 1.0
+            large_transform = (angle >= 12.0 or tx >= .10 * W or ty >= .10 * H or
+                               abs(np.log(scale_a0)) >= np.log(1.12))
+            required_confidence = .68 if large_transform else .45
+            ghost_ratio = float(np.asarray(
+                a0.get("ghost_residual_mask_ratio", a0.get("ghost_mask_ratio", 0.))).reshape(()))
+            thermal_quality = float(np.asarray(a0.get("thermal_confidence", 1.)).reshape(()))
+            thermal_score = float(np.clip((thermal_quality - .03) / .32, 0, 1))
+            ghost_score = float(1 - np.clip(ghost_ratio / .20, 0, 1))
+            ir_content_weight = float(np.clip(
+                .35 + .65 * (.65 * thermal_score + .35 * ghost_score), .25, 1.0))
+            a0_selected = bool(cached_approved and
+                               cached_confidence >= required_confidence and
+                               ir_content_weight >= .30)
+            if a0_selected:
                 sampling_canvas = M3 @ S_orig @ np.linalg.inv(M3)
+                ir_alignment_weight = float(np.clip(
+                    ir_content_weight * (.45 + .55 * cached_confidence), .10, 1.0))
+            else:
+                # Keep the cleaned raw IR rather than trusting a large or weak
+                # coarse transform.  RGB/Depth and the IR content remain usable.
+                ir_fallback_raw = 1.0
+                ir_alignment_weight = float(np.clip(.15 * ir_content_weight, .05, .25))
+            # Cached A0 approval chooses the base path; it is not a residual
+            # target for the learned small-angle adapter.  Only exact synthetic
+            # perturbations below supervise that residual head.
+            ir_affine_supervised = 0.0
+            ir_affine_confidence = 0.0
         if (self.train and allow_special and want_ir and aug.ir_affine_p > 0 and
                 rng.random() < aug.ir_affine_p):
             if aug.v521_explicit:
@@ -1170,11 +1221,20 @@ class MMDataset(Dataset):
             # OpenCV rendered source->destination A.  To sample the distorted
             # input for a reference output coordinate, compose A after the A0
             # source-sampling transform.
-            sampling_canvas = _mat3(A) @ sampling_canvas
+            base_sampling = sampling_canvas.copy()
+            sampling_canvas = _mat3(A) @ base_sampling
+            # The model composes base_sampling @ residual.  Conjugating the
+            # known source-space perturbation produces the exact residual label
+            # instead of incorrectly supervising the adapter with the full A0.
+            residual_target_sampling = (
+                np.linalg.inv(base_sampling) @ _mat3(A) @ base_sampling)
             ir_affine_supervised = 1.0
             ir_affine_confidence = 1.0
+            ir_alignment_weight = max(ir_alignment_weight, .75)
         if a0 is not None or ir_affine_supervised:
-            physical = sampling_params(sampling_canvas[:2], self.canvas)
+            target_sampling = (residual_target_sampling if ir_affine_supervised
+                               else np.eye(3, dtype=np.float32))
+            physical = sampling_params(target_sampling[:2], self.canvas)
             if aug.v521_explicit:
                 ir_affine_target[:] = (
                     physical[0] / max(1e-6, aug.v521_angle_deg),
@@ -1280,12 +1340,19 @@ class MMDataset(Dataset):
             quality["v521_ghost_probability"] = _a0_map(
                 "ghost_probability", np.clip(cached_q[0], 0, 1))
             ghost_conf = float(np.asarray(a0.get("ghost_transform_confidence", 0.)).reshape(()))
-            coarse_available = float(np.asarray(
+            cached_coarse_available = float(np.asarray(
                 a0.get("coarse_candidate_available", a0.get("v52_coarse_usable", 0.))).reshape(()))
+            coarse_available = float(a0_selected and cached_coarse_available > 0)
             quality["v521_ghost_confidence"] = np.asarray(
                 [[[ghost_conf]]], np.float32)
             quality["v521_coarse_available"] = np.asarray(
                 [[[coarse_available]]], np.float32)
+            quality["v521_content_weight"] = np.asarray(
+                [[[ir_content_weight]]], np.float32)
+            quality["v521_alignment_weight"] = np.asarray(
+                [[[ir_alignment_weight]]], np.float32)
+            quality["v521_fallback_raw"] = np.asarray(
+                [[[ir_fallback_raw]]], np.float32)
             quality["v521_thermal_confidence"] = _a0_map(
                 "thermal_confidence_map", cached_q[3])
             quality["v521_hard_mask"] = _a0_map("hard_mask", hard_src)
@@ -1315,10 +1382,7 @@ class MMDataset(Dataset):
             # validity mask still removes those pixels from geometry scoring,
             # while the fill prevents a synthetic straight edge at the frame.
             invalid_full = (ir_geometry < .5).astype(np.uint8)
-            if invalid_full.any() and (ir_geometry > .5).any():
-                ir_w = cv2.inpaint(
-                    np.clip(ir_w, 0, 255).astype(np.uint8), invalid_full * 255,
-                    3, cv2.INPAINT_TELEA).astype(np.float32)
+            ir_w = _fill_ir_exterior(ir_w, invalid_full)
             ir_spatial *= ir_geometry
 
         # ---- modality dropout（整路置零 + 记录 keep）----
@@ -1503,7 +1567,9 @@ def collate(batch: List[Optional[dict]]) -> Optional[dict]:
             raise ValueError("Mixed V5.2/cache-free samples")
         out["quality"]["v52_ir_sampling"] = torch.stack([b["quality"]["v52_ir_sampling"] for b in batch])
     for key in ("v521_ghost_probability", "v521_ghost_confidence",
-                "v521_coarse_available", "v521_thermal_confidence",
+                "v521_coarse_available", "v521_content_weight",
+                "v521_alignment_weight", "v521_fallback_raw",
+                "v521_thermal_confidence",
                 "v521_hard_mask", "v521_geometry_mask", "v521_align_exclude"):
         if any(key in b["quality"] for b in batch):
             template = next(b["quality"][key] for b in batch if key in b["quality"])

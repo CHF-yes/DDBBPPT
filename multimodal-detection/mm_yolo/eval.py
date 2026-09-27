@@ -370,6 +370,11 @@ def main():
                     help="只读 A/B 覆盖；空值使用 checkpoint 记录的 IR 预处理")
     ap.add_argument("--ir-a0-cache", default="",
                     help="V5.1.1 A0 cache root")
+    ap.add_argument("--disable-ir-geometry-adapter", action="store_true",
+                    help="保留 A0 粗处理，但旁路模型内部 IR 几何 Adapter")
+    ap.add_argument("--auxiliary-eval-branch", default="",
+                    choices=["", "rgb", "ir", "dep"],
+                    help="直接评测 Stage A 独立分支；空值评测融合主路径")
     ap.add_argument("--device", default="auto", help="auto/cpu/cuda/cuda:0")
     ap.add_argument("--root", required=True)
     ap.add_argument("--labels", default="")
@@ -399,6 +404,18 @@ def main():
     if args.ir_read_mode:
         overrides["ir_read_mode"] = args.ir_read_mode
     model, ck = load_mm_checkpoint(args.ckpt, device=dev, **overrides)
+    model.disable_ir_geometry_adapter = bool(args.disable_ir_geometry_adapter)
+    if model.disable_ir_geometry_adapter:
+        if getattr(model, "v52_ir_input", None) is None:
+            raise ValueError("checkpoint does not contain an IR geometry adapter to bypass")
+        model.v52_ir_input.requires_grad_(False)
+        print("[eval] IR geometry Adapter bypass=ON；A0 粗处理保持启用")
+    if args.auxiliary_eval_branch:
+        if args.auxiliary_eval_branch not in getattr(model, "independent_aux", {}):
+            raise ValueError(
+                f"checkpoint has no independent branch: {args.auxiliary_eval_branch}")
+        model.auxiliary_eval_branch = args.auxiliary_eval_branch
+        print(f"[eval] 独立分支={args.auxiliary_eval_branch}")
     model.eval()
     a0_required = bool((ck.get("meta") or {}).get("ir_a0", {}).get("required", False))
     if a0_required and not args.ir_a0_cache:
@@ -436,6 +453,9 @@ def main():
                          require_ir_a0=a0_required)
     res["ckpt"] = str(args.ckpt)
     res["epoch"] = int(ck.get("epoch", 0))
+    res["ir_geometry_adapter"] = (
+        "bypassed_a0_retained" if args.disable_ir_geometry_adapter else "enabled")
+    res["auxiliary_eval_branch"] = args.auxiliary_eval_branch or "fused"
     print(json.dumps(res, ensure_ascii=False, indent=1))
     if args.out:
         out_path = Path(args.out)

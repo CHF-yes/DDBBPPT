@@ -256,6 +256,96 @@ class ExplicitCoarseIRInput(nn.Module):
         refined = (pseudo_target * (1 + correction)).clamp(0, 1)
         return refined, pseudo_target
 
+    def quality_only(self, raw, quality, canvas):
+        """Apply deterministic A0 sampling and a conservative quality gate.
+
+        This path retains the externally audited coarse transform, valid support,
+        thermal confidence, ghost evidence and exclusion masks.  It never calls
+        the learned global/local geometry heads and therefore cannot introduce a
+        second rotation, translation, scale or local-flow warp.
+        """
+        if quality is None or 'v52_ir_sampling' not in quality:
+            raise ValueError('quality-only V6.1 input requires explicit A0 sampling')
+        if 'availability' not in quality:
+            raise ValueError('quality-only V6.1 input requires modality availability')
+        sampling = quality['v52_ir_sampling'].float()
+        valid = quality['availability'][:, 1:2].float()
+        result = {}
+        trust_means, ghost_means, valid_means = [], [], []
+        for scale_name, feature in raw.items():
+            shape = feature.shape[-2:]
+            valid_scale = F.interpolate(valid, shape, mode='nearest').clamp(0, 1)
+            zero = torch.zeros_like(valid_scale)
+            one = torch.ones_like(valid_scale)
+            invalid = self._map(quality, 'v521_hard_mask', zero, shape).clamp(0, 1)
+            ghost = self._map(
+                quality, 'v521_ghost_probability', zero, shape).clamp(0, 1)
+            ghost_conf = self._map(
+                quality, 'v521_ghost_confidence', zero, shape).clamp(0, 1)
+            thermal = self._map(
+                quality, 'v521_thermal_confidence', one, shape).clamp(0, 1)
+            geometry = self._map(
+                quality, 'v521_geometry_mask', 1 - invalid, shape).clamp(0, 1)
+            exclude = self._map(
+                quality, 'v521_align_exclude', invalid, shape).clamp(0, 1)
+            coarse_available = self._map(
+                quality, 'v521_coarse_available', zero, shape).clamp(0, 1)
+            content_weight = self._map(
+                quality, 'v521_content_weight', one, shape).clamp(.05, 1)
+            fallback_raw = self._map(
+                quality, 'v521_fallback_raw', zero, shape).clamp(0, 1)
+
+            def coarse_map(value):
+                return resample(value * valid_scale, sampling, canvas).clamp(0, 1)
+
+            coarse_feature = resample(
+                feature * valid_scale.to(feature.dtype), sampling, canvas)
+            coarse_valid = coarse_map(valid_scale)
+            coarse_invalid = coarse_map(invalid)
+            coarse_ghost = calibrate_a0_ghost(coarse_map(ghost)) * coarse_map(ghost_conf)
+            coarse_thermal = coarse_map(thermal)
+            coarse_geometry = coarse_map(geometry)
+            coarse_exclude = coarse_map(exclude)
+            coarse_available = coarse_map(coarse_available)
+            detailed_trust = (coarse_valid * coarse_thermal * coarse_geometry *
+                              (1 - coarse_invalid) * (1 - coarse_exclude) *
+                              (1 - coarse_ghost)).clamp(0, 1)
+            trust = (coarse_available * detailed_trust +
+                     (1 - coarse_available) * coarse_valid).clamp(0, 1)
+            # Preserve the pretrained feature distribution: low-quality support
+            # is downweighted, never erased. Invalid support is already zeroed
+            # before the single deterministic A0 resampling operation.
+            # Content quality controls modality strength, while a weak A0 only
+            # changes the selected base grid to identity.  Do not discard usable
+            # raw thermal content merely because cross-modal alignment is weak.
+            gain = (content_weight * (.75 + .25 * trust)).to(feature.dtype)
+            result[scale_name] = coarse_feature * gain
+            trust_means.append(trust.detach().float().mean())
+            ghost_means.append(coarse_ghost.detach().float().mean())
+            valid_means.append(coarse_valid.detach().float().mean())
+
+        self.last_penalty = next(iter(raw.values())).new_zeros(())
+        self.last_global_normalized = None
+        self.last_global_logit = None
+        self.last_global_physical = None
+        self.last_local_delta = None
+        self.last_acceptance = None
+        self.last_stats = {
+            'mode': 'a0_quality_only',
+            'learned_geometry': False,
+            'quality_channels': 5,
+            'trust_mean': float(torch.stack(trust_means).mean()),
+            'ghost_mean': float(torch.stack(ghost_means).mean()),
+            'valid_mean': float(torch.stack(valid_means).mean()),
+            'content_weight_mean': float(self._map(
+                quality, 'v521_content_weight',
+                torch.ones_like(valid[:, :, :1, :1]), (1, 1)).detach().mean()),
+            'fallback_raw_fraction': float(self._map(
+                quality, 'v521_fallback_raw',
+                torch.zeros_like(valid[:, :, :1, :1]), (1, 1)).detach().mean()),
+        }
+        return result
+
     def forward(self, raw, quality, canvas, rgb=None, ir=None):
         if quality is None or 'v52_ir_sampling' not in quality:
             raise ValueError('V5.2.1 requires explicit A0 sampling at train and eval time')
@@ -282,6 +372,12 @@ class ExplicitCoarseIRInput(nn.Module):
             quality, 'v521_geometry_mask', 1 - raw_invalid, shape).clamp(0, 1)
         raw_exclude = self._map(
             quality, 'v521_align_exclude', raw_invalid, shape).clamp(0, 1)
+        content_weight = self._map(
+            quality, 'v521_content_weight', one, shape).clamp(.05, 1)
+        alignment_weight = self._map(
+            quality, 'v521_alignment_weight', one, shape).clamp(0, 1)
+        fallback_raw = self._map(
+            quality, 'v521_fallback_raw', zero, shape).clamp(0, 1)
 
         raw_ir_edge = _sobel_edge(ir)
         raw_ir_edge = (torch.zeros_like(raw_ghost) if raw_ir_edge is None else
@@ -333,7 +429,10 @@ class ExplicitCoarseIRInput(nn.Module):
                           masked_ir_edge, edge_signed, edge_difference, edge_overlap,
                           coord_x, coord_y, a0_condition), 1).to(coarse.dtype)
 
-        global_raw = self.global_head(self.global_features(maps))
+        # Geometry teachers are observations, not semantic training routes.
+        # Detaching here prevents alignment supervision from changing RGB/IR
+        # encoders through the adapter input branch.
+        global_raw = self.global_head(self.global_features(maps.detach()))
         normalized = global_raw[:, :4].tanh()
         global_conf = global_raw[:, 4:5].sigmoid()
         residual, physical = residual_sampling(
@@ -362,7 +461,8 @@ class ExplicitCoarseIRInput(nn.Module):
         acceptance = geometry_acceptance(
             rgb_edge, raw_ir_edge, ir_edge, candidate_ir_edge, common_weight)
         geometry_ok = acceptance['geometry_ok']
-        hard_accept = geometry_ok & (global_conf[:, 0] >= .5)
+        alignment_ok = alignment_weight.flatten(1).mean(1) >= .25
+        hard_accept = geometry_ok & alignment_ok & (global_conf[:, 0] >= .5)
 
         global_p4 = resample(p4 * valid_p4.to(p4.dtype), total_sampling, canvas)
         candidate_invalid = resample(raw_invalid * valid_p4, total_sampling, canvas).clamp(0, 1)
@@ -384,8 +484,9 @@ class ExplicitCoarseIRInput(nn.Module):
             candidate_masked_edge, candidate_signed, candidate_signed.abs(),
             rgb_edge * candidate_masked_edge, coord_x, coord_y, a0_condition),
             1).to(global_p4.dtype)
-        local_input = torch.cat((global_p4 * candidate_weight.to(global_p4.dtype),
-                                 local_maps), 1)
+        local_input = torch.cat((
+            global_p4.detach() * candidate_weight.detach().to(global_p4.dtype),
+            local_maps.detach()), 1)
         local_raw = self.local_head(local_input)
         unit = local_raw[:, :2].tanh()
         local_conf = local_raw[:, 2:3].sigmoid()
@@ -400,22 +501,28 @@ class ExplicitCoarseIRInput(nn.Module):
         # confidence scales the transform parameters and the source is warped
         # exactly once.  Evaluation uses a hard, evidence-validated decision:
         # either the full candidate is used or the A0 transform is retained.
-        global_gate = (global_conf if self.training else
-                       hard_accept.to(global_conf.dtype)[:, None])
-        local_gate = (local_conf if self.training else
-                      (local_conf >= .5).to(local_conf.dtype))
+        # Detection gradients must not teach the geometry head a semantic
+        # shortcut.  The adapter is trained by its explicit geometry loss; the
+        # detector consumes only evidence-validated, detached corrections.
+        global_gate = hard_accept.to(global_conf.dtype)[:, None]
+        local_gate = (local_conf >= .5).to(local_conf.dtype)
         used_normalized = normalized * global_gate
         used_residual, _ = residual_sampling(
             used_normalized, canvas, self.max_angle, self.max_shift, self.max_log_scale)
-        used_sampling = torch.bmm(s3, used_residual)[:, :2]
-        used_delta = delta * local_gate * global_gate[:, :, None, None]
+        used_sampling = torch.bmm(s3, used_residual)[:, :2].detach()
+        used_delta = (delta * local_gate *
+                      global_gate[:, :, None, None]).detach()
 
         result = {}
         for scale_name, feature in raw.items():
             v = F.interpolate(valid, feature.shape[-2:], mode='nearest').to(feature.dtype)
             safe_raw = feature * v
+            sample_gain = F.interpolate(
+                content_weight, feature.shape[-2:], mode='bilinear',
+                align_corners=False).to(feature.dtype)
             result[scale_name] = resample(
-                safe_raw, used_sampling, canvas, used_delta.to(feature.dtype))
+                safe_raw, used_sampling, canvas,
+                used_delta.to(feature.dtype)) * sample_gain
 
         self.last_global_normalized = normalized
         self.last_global_logit = global_raw[:, 4]
@@ -450,6 +557,9 @@ class ExplicitCoarseIRInput(nn.Module):
             'ghost_confidence': float(coarse_ghost_conf.detach().mean()),
             'geometry_support': float(coarse_geometry.detach().mean()),
             'thermal_weight_mean': float(coarse_weight.detach().mean()),
+            'content_weight_mean': float(content_weight.detach().mean()),
+            'alignment_weight_mean': float(alignment_weight.detach().mean()),
+            'fallback_raw_fraction': float(fallback_raw.detach().mean()),
         }
         return result
 
