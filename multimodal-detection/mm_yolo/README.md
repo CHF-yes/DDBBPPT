@@ -67,6 +67,22 @@ python mm_yolo/submit.py --ckpt /path/to/best.pt \
 其分数收益需要实测；V4.4 的 400 张留出图可用于此权重的 A/B，已加入全量训练的
 权重不能再把这 400 张当作独立验证集。
 
+球候选触发模式使用同一权重先跑整图。仅当整图预测含置信度至少 0.05 的球框时，
+才对该图再跑三模态同步切片；合并时只补充球框，保留所有整图框。它不需要重新训练。
+门控基于整图**预测**，无需测试集标签；如果整图完全没有球候选，该模式也无法找回该图的球。
+默认允许映射回整图画布后短边小于 64px 的球切片框。`--conf` 必须不高于门控阈值，
+否则整图解码时会先删掉用于触发的球候选。该模式和 `--tiled` 互斥。
+
+```bash
+python mm_yolo/submit.py --ckpt /path/to/best.pt \
+  --root /data/test_extracted --out /data/submission_ball_gated \
+  --conf 0.001 --ball-gated-tiles --ball-gate-conf 0.05 \
+  --ball-gate-max-short-side 64 --zip
+```
+
+`eval.py` 可用同样的 `--ball-gated-tiles` 参数与无切片基线对比。当前只是待验证的推理方案，
+不能把此前全图切片的负收益当成此模式的实测结果。
+
 ## 维护边界
 
 - 正确性回归位于 `tests/`；它们不是实验队列。

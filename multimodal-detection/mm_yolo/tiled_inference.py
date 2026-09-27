@@ -10,6 +10,15 @@ from data import MMDataset, boxes_norm_to_canvas, canvas_to_orig_norm, collate
 
 
 DEFAULT_TILE_CLASSES = "ball,bicycle,sign"
+BALL_CLASS_ID = COMPETITION_CLASS_NAMES.index("ball")
+
+
+def ball_gate_indices(full_dets: Sequence[np.ndarray], gate_conf: float = 0.05) -> list[int]:
+    """只根据整图球候选决定哪些图需要第二次切片推理。"""
+    if not (0 <= gate_conf <= 1):
+        raise ValueError("ball gate confidence must be in [0,1]")
+    return [i for i, det in enumerate(full_dets)
+            if len(det) and np.any((det[:, 5] == BALL_CLASS_ID) & (det[:, 4] >= gate_conf))]
 
 
 def parse_tile_classes(value: str) -> tuple[int, ...] | None:
@@ -152,17 +161,27 @@ def decode_full_and_tiles(model, dataset: MMDataset, samples: Sequence[dict],
                           off, imgsz, fraction: float = 0.6, overlap: float = 0.2,
                           merge_iou: float = 0.6, tile_batch: int = 2,
                           target_classes: Sequence[int] | None = (4, 5, 7),
-                          max_short_side: float = 32) -> list[np.ndarray]:
+                          max_short_side: float = 32,
+                          gate_class: int | None = None,
+                          gate_conf: float = 0.05) -> list[np.ndarray]:
     """复用 MMDataset 为每片重新生成三模态输入、质量图和深度先验。"""
     if tile_batch < 1 or len(samples) != len(full_dets):
         raise ValueError("invalid tile batch or mismatched full-image predictions")
+    if gate_class is not None and not (0 <= gate_conf <= 1):
+        raise ValueError("tile gate confidence must be in [0,1]")
     from eval import _decode
     tile_samples: list[dict] = []
     owners: list[int] = []
     for owner, (sample, hw) in enumerate(zip(samples, full_batch["orig_hw"])):
+        if gate_class is not None:
+            det = full_dets[owner]
+            if not len(det) or not np.any((det[:, 5] == gate_class) & (det[:, 4] >= gate_conf)):
+                continue
         for window in tile_windows(int(hw[0]), int(hw[1]), fraction, overlap):
             tile_samples.append({**sample, "crop_xyxy": window})
             owners.append(owner)
+    if not tile_samples:
+        return [np.asarray(d, np.float32).copy() for d in full_dets]
     tiles = MMDataset(dataset.root, tile_samples, imgsz=imgsz, train=False,
                       aug=dataset.aug, prior_stride=dataset.prior_stride,
                       enabled=dataset.enabled)

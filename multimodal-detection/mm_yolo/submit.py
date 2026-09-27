@@ -163,6 +163,12 @@ def main():
     ap.add_argument("--max-det", type=int, default=100)
     ap.add_argument("--tiled", action="store_true",
                     help="同一模型做全图+三模态同步切片推理")
+    ap.add_argument("--ball-gated-tiles", action="store_true",
+                    help="整图检出球候选时才做三模态同步切片，只补充球框")
+    ap.add_argument("--ball-gate-conf", type=float, default=0.05,
+                    help="触发球切片的整图候选置信度；默认 0.05")
+    ap.add_argument("--ball-gate-max-short-side", type=float, default=64,
+                    help="球切片框映射回全图画布后的最大短边像素；默认 64")
     ap.add_argument("--tile-fraction", type=float, default=0.6,
                     help="切片宽高占原图宽高的比例；默认 0.6（通常 2x2）")
     ap.add_argument("--tile-overlap", type=float, default=0.2,
@@ -181,15 +187,28 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--zip", action="store_true")
     args = ap.parse_args()
-    if args.tiled:
-        from tiled_inference import parse_tile_classes, tile_windows
+    if args.tiled and args.ball_gated_tiles:
+        ap.error("--tiled 与 --ball-gated-tiles 只能选一个")
+    if args.tiled or args.ball_gated_tiles:
+        from tiled_inference import BALL_CLASS_ID, parse_tile_classes, tile_windows
         tile_windows(100, 100, args.tile_fraction, args.tile_overlap)
-        if not (0 < args.tile_merge_iou < 1) or args.tile_batch < 1 or args.tile_max_short_side <= 0:
-            ap.error("tile-merge-iou 必须在 (0,1)，tile-batch 和 tile-max-short-side 必须 > 0")
-        try:
-            target_classes = parse_tile_classes(args.tile_classes)
-        except ValueError as exc:
-            ap.error(str(exc))
+        if not (0 < args.tile_merge_iou < 1) or args.tile_batch < 1:
+            ap.error("tile-merge-iou 必须在 (0,1)，tile-batch 必须 > 0")
+        if args.ball_gated_tiles:
+            if not (0 <= args.ball_gate_conf <= 1) or args.conf > args.ball_gate_conf:
+                ap.error("ball-gate-conf 必须在 [0,1]，且 --conf 不得高于它")
+            if args.ball_gate_max_short_side <= 0:
+                ap.error("ball-gate-max-short-side 必须 > 0")
+            target_classes = (BALL_CLASS_ID,)
+            max_short_side = args.ball_gate_max_short_side
+        else:
+            if args.tile_max_short_side <= 0:
+                ap.error("tile-max-short-side 必须 > 0")
+            try:
+                target_classes = parse_tile_classes(args.tile_classes)
+            except ValueError as exc:
+                ap.error(str(exc))
+            max_short_side = args.tile_max_short_side
 
     device_arg = ("cuda:0" if torch.cuda.is_available() else "cpu") \
         if args.device == "auto" else ("cuda:0" if args.device == "cuda" else args.device)
@@ -226,22 +245,26 @@ def main():
         if old:
             print(f"[submit] 已清空输出目录里 {len(old)} 个旧 TXT")
     off = [args.mask] if args.mask else None
-    total = wrote = skipped = 0
+    total = wrote = skipped = gated = 0
     for i in range(0, len(samples), args.batch):
         chunk = [ds[j] for j in range(i, min(i + args.batch, len(samples)))]
-        if args.tiled and any(item is None for item in chunk):
+        if (args.tiled or args.ball_gated_tiles) and any(item is None for item in chunk):
             raise RuntimeError("切片推理遇到无法读取的测试图；拒绝生成不完整结果")
         batch = collate(chunk)
         if batch is None:
             continue
         dec = _decode(model, batch, dev, args.conf, args.iou, args.max_det, modalities, off, imgsz)
-        if args.tiled:
-            from tiled_inference import decode_full_and_tiles
+        if args.tiled or args.ball_gated_tiles:
+            from tiled_inference import ball_gate_indices, decode_full_and_tiles
+            if args.ball_gated_tiles:
+                gated += len(ball_gate_indices(dec, args.ball_gate_conf))
             dec = decode_full_and_tiles(model, ds, samples[i:i + len(chunk)], batch, dec,
                                         dev, args.conf, args.iou, args.max_det, modalities,
                                         off, imgsz, args.tile_fraction, args.tile_overlap,
                                         args.tile_merge_iou, args.tile_batch,
-                                        target_classes, args.tile_max_short_side)
+                                        target_classes, max_short_side,
+                                        BALL_CLASS_ID if args.ball_gated_tiles else None,
+                                        args.ball_gate_conf)
         for k, (det, s) in enumerate(zip(dec, chunk)):
             total += write_txt(out_dir / f"{s['stem']}.txt", det, batch["M"][k].numpy(),
                                batch["orig_hw"][k].numpy(), imgsz, args.max_det)
@@ -256,6 +279,8 @@ def main():
             p.write_text("", encoding="utf-8")
     print(f"[submit] 写出 {wrote}/{len(samples)} 个 txt，共 {total} 框"
           + (f"（{skipped} 张读图失败，已补空文件）" if skipped else "") + f" → {out_dir}")
+    if args.ball_gated_tiles:
+        print(f"[submit] 球候选触发切片：{gated}/{len(samples)} 张")
     rep = validate(out_dir, [s["stem"] for s in samples], nc=model.nc, max_det=args.max_det)
     print(f"[submit] 校验：文件 {rep['files']}/{rep['expect']}，框 {rep['boxes']}，"
           f"缺失 {rep['n_missing']}，多余 {rep['n_extra']}，超限 {rep['over_max_det']}，"

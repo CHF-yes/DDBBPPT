@@ -218,7 +218,9 @@ def evaluate_model(model: MMYOLO, root: Path, samples: List[dict], imgsz=960,
                    tiled: bool = False, tile_fraction: float = 0.6,
                    tile_overlap: float = 0.2, tile_merge_iou: float = 0.6,
                    tile_batch: int = 2, tile_classes: str = "ball,bicycle,sign",
-                   tile_max_short_side: float = 32) -> dict:
+                   tile_max_short_side: float = 32, ball_gated_tiles: bool = False,
+                   ball_gate_conf: float = 0.05,
+                   ball_gate_max_short_side: float = 64) -> dict:
     """在给定样本上按赛题口径评测；可选模态屏蔽剖面与条件切片。
 
     ⚠️ 坐标必须走**同一套 letterbox 映射**：GT 取 dataset 内部已变换到画布的框
@@ -228,12 +230,23 @@ def evaluate_model(model: MMYOLO, root: Path, samples: List[dict], imgsz=960,
 
     `imgsz` 支持 int（正方形）或 (H, W)（如 (544,960)）—— 非正方形画布是本项目的默认配置。
     """
-    if tiled:
-        from tiled_inference import parse_tile_classes, tile_windows
+    if tiled and ball_gated_tiles:
+        raise ValueError("tiled and ball_gated_tiles are mutually exclusive")
+    if tiled or ball_gated_tiles:
+        from tiled_inference import BALL_CLASS_ID, parse_tile_classes, tile_windows
         tile_windows(100, 100, tile_fraction, tile_overlap)
-        if not (0 < tile_merge_iou < 1) or tile_batch < 1 or tile_max_short_side <= 0:
+        if not (0 < tile_merge_iou < 1) or tile_batch < 1:
             raise ValueError("invalid tile inference settings")
-        target_classes = parse_tile_classes(tile_classes)
+        if ball_gated_tiles:
+            if not (0 <= ball_gate_conf <= 1) or conf > ball_gate_conf or ball_gate_max_short_side <= 0:
+                raise ValueError("invalid ball gate settings: require conf <= gate_conf and max_short_side > 0")
+            target_classes = (BALL_CLASS_ID,)
+            max_short_side = ball_gate_max_short_side
+        else:
+            if tile_max_short_side <= 0:
+                raise ValueError("invalid tile max short side")
+            target_classes = parse_tile_classes(tile_classes)
+            max_short_side = tile_max_short_side
     ds = MMDataset(Path(root), samples, imgsz=imgsz, train=False,
                    aug=AugCfg(imgsz=imgsz,
                               depth_resampling=getattr(getattr(model, "cfg", None), "depth_resampling", "legacy_bilinear_v1"),
@@ -289,13 +302,15 @@ def evaluate_model(model: MMYOLO, root: Path, samples: List[dict], imgsz=960,
                 batch["depth"] = batch["depth"].clone()
                 batch["depth"][:, 1] = 0.0
             dec = _decode(model, batch, device, conf, iou, max_det, modalities, off, imgsz)
-            if tiled:
+            if tiled or ball_gated_tiles:
                 from tiled_inference import decode_full_and_tiles
                 dec = decode_full_and_tiles(model, ds, samples[i:i + len(chunk)], batch,
                                             dec, device, conf, iou, max_det, modalities,
                                             off, imgsz, tile_fraction, tile_overlap,
                                             tile_merge_iou, tile_batch,
-                                            target_classes, tile_max_short_side)
+                                            target_classes, max_short_side,
+                                            BALL_CLASS_ID if ball_gated_tiles else None,
+                                            ball_gate_conf)
             for d, item in zip(dec, chunk):
                 out.append({"boxes": d[:, :4], "conf": d[:, 4], "cls": d[:, 5].astype(int)})
                 gts.append(_gt_canvas(item))
@@ -388,6 +403,10 @@ def main():
     ap.add_argument("--no-slices", action="store_true", help="不算条件切片")
     ap.add_argument("--conf", type=float, default=0.001)
     ap.add_argument("--tiled", action="store_true", help="全图+三模态同步切片推理")
+    ap.add_argument("--ball-gated-tiles", action="store_true",
+                    help="整图检出球候选时才切片，只补充球框")
+    ap.add_argument("--ball-gate-conf", type=float, default=0.05)
+    ap.add_argument("--ball-gate-max-short-side", type=float, default=64)
     ap.add_argument("--tile-fraction", type=float, default=0.6)
     ap.add_argument("--tile-overlap", type=float, default=0.2)
     ap.add_argument("--tile-merge-iou", type=float, default=0.6)
@@ -401,6 +420,8 @@ def main():
                     help="空=按 checkpoint 记录的模态（RGB-only 权重不会被误开三模态）")
     ap.add_argument("--out", default="")
     args = ap.parse_args()
+    if args.tiled and args.ball_gated_tiles:
+        ap.error("--tiled 与 --ball-gated-tiles 只能选一个")
 
     device_arg = ("cuda:0" if torch.cuda.is_available() else "cpu") \
         if args.device == "auto" else ("cuda:0" if args.device == "cuda" else args.device)
@@ -441,15 +462,21 @@ def main():
                          tile_fraction=args.tile_fraction, tile_overlap=args.tile_overlap,
                          tile_merge_iou=args.tile_merge_iou, tile_batch=args.tile_batch,
                          tile_classes=args.tile_classes,
-                         tile_max_short_side=args.tile_max_short_side)
-    res["tiled"] = args.tiled
-    if args.tiled:
+                         tile_max_short_side=args.tile_max_short_side,
+                         ball_gated_tiles=args.ball_gated_tiles,
+                         ball_gate_conf=args.ball_gate_conf,
+                         ball_gate_max_short_side=args.ball_gate_max_short_side)
+    res["tiled"] = args.tiled or args.ball_gated_tiles
+    if args.tiled or args.ball_gated_tiles:
         res["tile_config"] = {"fraction": args.tile_fraction,
                               "overlap": args.tile_overlap,
                               "merge_iou": args.tile_merge_iou,
                               "batch": args.tile_batch,
-                              "classes": args.tile_classes,
-                              "max_short_side": args.tile_max_short_side}
+                              "classes": "ball" if args.ball_gated_tiles else args.tile_classes,
+                              "max_short_side": (args.ball_gate_max_short_side if args.ball_gated_tiles
+                                                 else args.tile_max_short_side),
+                              "mode": "ball_gated" if args.ball_gated_tiles else "all_images",
+                              "gate_conf": args.ball_gate_conf if args.ball_gated_tiles else None}
     res["ckpt"] = str(args.ckpt)
     res["epoch"] = int(ck.get("epoch", 0))
     print(json.dumps(res, ensure_ascii=False, indent=1))

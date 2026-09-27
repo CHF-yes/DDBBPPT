@@ -12,7 +12,7 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 import data  # noqa: E402
-from tiled_inference import (decode_full_and_tiles, merge_detections,
+from tiled_inference import (ball_gate_indices, decode_full_and_tiles, merge_detections,
                              merge_targeted_detections, parse_tile_classes,
                              tile_to_full_canvas, tile_windows)  # noqa: E402
 
@@ -99,6 +99,13 @@ def test_tile_class_selection_accepts_names_and_legacy_all():
     assert parse_tile_classes("all") is None
 
 
+def test_ball_gate_uses_full_image_ball_confidence_only():
+    dets = [np.array([[0, 0, 5, 5, .04, 7]], np.float32),
+            np.array([[0, 0, 5, 5, .99, 0]], np.float32),
+            np.array([[0, 0, 5, 5, .05, 7]], np.float32)]
+    assert ball_gate_indices(dets, .05) == [2]
+
+
 def test_full_and_tiles_run_through_same_dataset(monkeypatch):
     h, w = 96, 128
     rgb = np.full((h, w, 3), 80, np.uint8)
@@ -129,6 +136,45 @@ def test_full_and_tiles_run_through_same_dataset(monkeypatch):
     assert len(result) == 1
     assert len(result[0]) == 4
     assert np.all(result[0][:, :4] >= 0)
+
+
+def test_ball_gated_tiles_process_only_triggered_image(monkeypatch):
+    h, w = 96, 128
+    monkeypatch.setattr(data, "read_rgb", lambda _: np.full((h, w, 3), 80, np.uint8))
+    monkeypatch.setattr(data, "read_ir", lambda *args, **kwargs: np.full((h, w), 120, np.uint8))
+    monkeypatch.setattr(data, "read_depth", lambda *args, **kwargs:
+                        (np.full((h, w), 1000, np.float32), np.ones((h, w), bool), True))
+    samples = [{"stem": name, "files": {"visible": name, "infrared": name,
+                                         "depth": name}, "boxes": None}
+               for name in ("trigger", "skip")]
+    ds = data.MMDataset(Path("/unused"), samples, imgsz=(64, 64), train=False)
+    full_batch = data.collate([ds[0], ds[1]])
+    full = [np.array([[0, 0, 8, 8, .06, 7]], np.float32),
+            np.array([[0, 0, 8, 8, .9, 0]], np.float32)]
+    calls = []
+
+    def fake_decode(model, batch, *args):
+        calls.append(batch["rgb"].shape[0])
+        return [np.array([[20, 20, 30, 30, .8, 7],
+                          [40, 40, 50, 50, .99, 0]], np.float32)
+                for _ in range(batch["rgb"].shape[0])]
+
+    monkeypatch.setitem(sys.modules, "eval", types.SimpleNamespace(_decode=fake_decode))
+    result = decode_full_and_tiles(None, ds, samples, full_batch, full, "cpu",
+                                   .001, .7, 100, "all", None, (64, 64),
+                                   tile_batch=2, target_classes=(7,),
+                                   max_short_side=64, gate_class=7, gate_conf=.05)
+    assert calls == [2, 2]  # 只有触发图的 4 张切片
+    assert np.array_equal(result[1], full[1])
+    assert len(result[0]) > 1
+    assert set(result[0][:, 5]) == {7}
+
+    calls.clear()
+    result = decode_full_and_tiles(None, ds, samples, full_batch, full, "cpu",
+                                   .001, .7, 100, "all", None, (64, 64),
+                                   gate_class=7, gate_conf=.07)
+    assert calls == []
+    assert all(np.array_equal(a, b) for a, b in zip(result, full))
 
 
 def test_ordinary_training_affine_still_tracks_rotation(monkeypatch):
