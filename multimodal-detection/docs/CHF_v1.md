@@ -90,4 +90,11 @@ SHA256 b61fde10ea69bc7dcf5dc8e5d0954e2521ed2205ccc3768dc75026eb2aa7db45
 
 最后一轮权重为同目录下的 `last.pt`（checkpoint epoch=24）。Stage B 起点合并权重为 `/root/autodl-tmp/weights/chf_rgb34_stagea18_merged.pt`，SHA256 为 `3c00afa4987aeb09d8326f49477ab69d2dcdb5659a84dce00457cda173408488`。运行参数与日志位于 `/root/autodl-tmp/runs/CHF_v1_stageB_b2_20261002/command.json` 和 `console.log`。
 
-`.pt` 文件被仓库 `.gitignore` 排除，最佳权重目前保留在 AutoDL 数据盘；本记录只将结果与校验信息纳入 Git。**0.433629 是本地 400 张的验证 mAP，不能换算成官方比赛分数。**下一步应先用与 V4.4 完全一致的验证协议做对照，再决定是否进行全量训练或提交。
+仓库继续将 `.pt` 排除在普通 Git 历史之外，两份最佳权重作为 [CHF v1 GitHub Release](https://github.com/CHF-yes/DDBBPPT/releases/tag/CHF_v1_20261003) 附件分发：
+
+| 权重 | 下载 | 大小 | SHA256 |
+| --- | --- | ---: | --- |
+| RGB 追加训练最佳，累计第 34 轮 | [CHF_v1_RGB_epoch34_best.pt](https://github.com/CHF-yes/DDBBPPT/releases/download/CHF_v1_20261003/CHF_v1_RGB_epoch34_best.pt) | 751335730 字节 | `1369464ec132486317ddfc2aa1bc01ac4e54e260cc344352a4dce98c8ad12da1` |
+| Stage B 最佳，第 21 轮 | [CHF_v1_StageB_epoch21_best.pt](https://github.com/CHF-yes/DDBBPPT/releases/download/CHF_v1_20261003/CHF_v1_StageB_epoch21_best.pt) | 839488776 字节 | `b61fde10ea69bc7dcf5dc8e5d0954e2521ed2205ccc3768dc75026eb2aa7db45` |
+
+服务器原件仍保留在 AutoDL 数据盘。**0.433629 是本地 400 张的验证 mAP，不能换算成官方比赛分数。**下一步应先用与 V4.4 完全一致的验证协议做对照，再决定是否进行全量训练或提交。
