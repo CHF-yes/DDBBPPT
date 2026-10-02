@@ -50,7 +50,7 @@ for _p in (str(_CODE), str(_CODE / "vendor"), str(_HERE)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from ultralytics.utils.loss import v8DetectionLoss          # noqa: E402
+from ultralytics.utils.loss import E2ELoss, v8DetectionLoss  # noqa: E402
 from ultralytics.utils.torch_utils import ModelEMA          # noqa: E402
 
 from config import default_config                            # noqa: E402
@@ -62,9 +62,12 @@ from model import MMYOLO, save_mm_checkpoint                 # noqa: E402
 BN_TYPES = nn.modules.batchnorm._BatchNorm
 TRAINER_RECIPE = "optfix_v2"
 MEMORY_RECIPE = "coverage_spatial_memory_v1"
+P2_ARCHITECTURES = ("independent_p2_memory_v3", "independent_p2_memory_yolo26m")
 
 
 def recipe_for(args):
+    if getattr(args, "architecture", "") == "independent_p2_memory_yolo26m":
+        return "yolo26m_p2_v44_fusion_native_dual_head_v1"
     if getattr(args, "architecture", "") == "independent_p2_memory_v3":
         if getattr(args, "fusion_strategy", "legacy_residual_v2") == "v48_embedding_complement_v1":
             return "v48_v44_base_rotation_embedding_complement"
@@ -590,10 +593,13 @@ def set_anchored_joint_mode(model: MMYOLO, detector_frozen: bool) -> None:
         if value is not None:
             value.requires_grad_(True)
     detector = model.model[-1]
-    for branch_name in ("cv2", "cv3"):
+    for branch_name in ("cv2", "cv3", "one2one_cv2", "one2one_cv3"):
         branches = getattr(detector, branch_name, None)
         if branches is not None and len(branches):
             enable(branches[0])
+    if model.cfg.fusion.architecture == "independent_p2_memory_yolo26m":
+        # The native P2 path is layers 17..22, unlike V4.4's custom modules.
+        enable(model.backbone.model[17:23])
 
     enable(getattr(model, "semantic_adapters", None))
     enable(getattr(model, "semantic_detect", None))
@@ -685,10 +691,12 @@ def build_optimizer(model: MMYOLO, lr: float, backbone_mult: float, wd: float = 
             if value is not None and "p2" in role_ids:
                 role_ids["p2"].add(id(value))
         detector = model.model[-1]
-        for branch_name in ("cv2", "cv3"):
+        for branch_name in ("cv2", "cv3", "one2one_cv2", "one2one_cv3"):
             branches = getattr(detector, branch_name, None)
             if branches is not None and len(branches):
                 add("p2", branches[0])
+        if model.cfg.fusion.architecture == "independent_p2_memory_yolo26m":
+            add("p2", model.backbone.model[17:23])
         add("detector", model.backbone.model[11:])
         add("semantic", getattr(model, "semantic_adapters", None))
         add("semantic", getattr(model, "semantic_detect", None))
@@ -771,11 +779,17 @@ def subset_detection_batch(preds: dict, targets: dict, active: torch.Tensor) -> 
         "imgsz": targets["imgsz"],
         "batch_size": int(ids.numel()),
     }
-    sub_preds = {
-        "boxes": preds["boxes"].index_select(0, ids),
-        "scores": preds["scores"].index_select(0, ids),
-        "feats": [x.index_select(0, ids) for x in preds["feats"]],
-    }
+    def select_head(head):
+        return {
+            "boxes": head["boxes"].index_select(0, ids),
+            "scores": head["scores"].index_select(0, ids),
+            "feats": [x.index_select(0, ids) for x in head["feats"]],
+        }
+
+    if "one2many" in preds and "one2one" in preds:
+        sub_preds = {name: select_head(preds[name]) for name in ("one2many", "one2one")}
+    else:
+        sub_preds = select_head(preds)
     return sub_preds, sub_targets
 
 
@@ -889,7 +903,12 @@ def validate_checkpoint(ck: dict, model: MMYOLO, enabled, canvas, exact: bool = 
     if saved_structure != current_structure:
         raise ValueError("checkpoint 结构与当前模型不一致（fusion/share/late-bus 等）")
     meta = ck.get("meta") or {}
-    if tuple(meta.get("modalities", ())) != tuple(enabled):
+    bootstrap_handoff = (not exact and args is not None and
+                         args.architecture == "independent_p2_memory_yolo26m" and
+                         args.train_stage == "aux_independent" and
+                         tuple(meta.get("modalities", ())) == ("rgb",) and
+                         tuple(enabled) == ("rgb", "ir", "dep"))
+    if tuple(meta.get("modalities", ())) != tuple(enabled) and not bootstrap_handoff:
         raise ValueError(f"checkpoint 训练模态 {meta.get('modalities')} 与当前 {enabled} 不一致")
     if exact and tuple(meta.get("canvas", ())) != tuple(canvas):
         raise ValueError(f"checkpoint 画布 {meta.get('canvas')} 与当前 {canvas} 不一致")
@@ -1101,7 +1120,7 @@ def main():
     ap.add_argument("--epochs", type=int, default=300)
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--rgb-batch", type=int, default=0, help="仅 RGB 模式的物理 batch 覆盖；累积另设")
-    ap.add_argument("--architecture", default="legacy_hook_v1", choices=["legacy_hook_v1", "spatial_memory_v1", "independent_p2_memory_v3"])
+    ap.add_argument("--architecture", default="legacy_hook_v1", choices=["legacy_hook_v1", "spatial_memory_v1", *P2_ARCHITECTURES])
     ap.add_argument("--precision", choices=["fp16", "bf16"], default="fp16")
     ap.add_argument("--checkpoint-encoder", action="store_true")
     ap.add_argument("--mosaic", type=float, default=0.)
@@ -1292,7 +1311,7 @@ def main():
     if args.preserve_init_fusion and (
             args.resume or not args.init_checkpoint or args.train_stage != "residual_fusion"):
         raise ValueError("--preserve-init-fusion only supports a new residual_fusion run with --init-checkpoint")
-    if args.memory_control != "unbounded_v1" and args.architecture not in ("spatial_memory_v1", "independent_p2_memory_v3"):
+    if args.memory_control != "unbounded_v1" and args.architecture not in ("spatial_memory_v1", *P2_ARCHITECTURES):
         raise ValueError("memory-control applies only to spatial memory")
     if args.bn_policy == "adaptive_no_tail" and args.sampler != "coverage":
         raise ValueError("no-tail BN requires coverage sampler")
@@ -1324,10 +1343,10 @@ def main():
         raise ValueError("semantic loss weights must be nonnegative and temperature positive")
     if args.calibrate_clip_steps and args.grad_clip <= 0:
         raise ValueError("clip calibration requires a positive initial safety threshold")
-    if args.architecture in ("spatial_memory_v1", "independent_p2_memory_v3") and args.sampler != "coverage":
+    if args.architecture in ("spatial_memory_v1", *P2_ARCHITECTURES) and args.sampler != "coverage":
         raise ValueError("new recipe requires --sampler coverage")
     if args.train_stage in ("aux_adapt", "anchored_joint", "aux_independent",
-                            "residual_fusion") and args.architecture != "independent_p2_memory_v3":
+                            "residual_fusion") and args.architecture not in P2_ARCHITECTURES:
         raise ValueError("multimodal staged policies 仅支持 independent_p2_memory_v3")
     if args.alignment_mode == "identity_residual_v2" and args.match_floor != 0:
         raise ValueError("identity_residual_v2 不使用 match-floor；请保持 0")
@@ -1573,7 +1592,7 @@ def main():
     cfg.ir_read_mode = args.ir_read_mode
     cfg.encoder.metric_branch = args.metric_branch
     cfg.encoder.checkpoint_encoder = args.checkpoint_encoder
-    if args.architecture == "independent_p2_memory_v3":
+    if args.architecture in P2_ARCHITECTURES:
         cfg.fusion.bus_dim = 128
         cfg.fusion.memory_tokens_per_modality = 4
     cfg.imgsz = int(canvas[0])   # 记录用；真实画布由数据侧 (H,W) 决定
@@ -1582,7 +1601,8 @@ def main():
     cfg.encoder.depth_input_channels = int(args.depth_channels)
     cfg.encoder.depth_view = args.depth_view
     cfg.encoder.depth_init = args.depth_init
-    cfg.fusion.use_bus = bool(args.register_bus and (args.modalities != "rgb" or args.architecture == "spatial_memory_v1"))
+    cfg.fusion.use_bus = bool(args.register_bus and (args.modalities != "rgb" or
+                        args.architecture in ("spatial_memory_v1", "independent_p2_memory_yolo26m")))
     cfg.fusion.late_bus = bool(args.late_bus)
     cfg.fusion.quality_gate = not args.no_quality
     cfg.fusion.prior_film = not args.no_prior
@@ -1599,7 +1619,8 @@ def main():
     log(f"[train] 参数 总 {pr['total']/1e6:.2f}M（预训练 {pr['pretrained']/1e6:.2f}M + 新增 {pr['new']/1e6:.3f}M）"
         f" | 模态 {args.modalities}")
 
-    crit = v8DetectionLoss(model)
+    model.args.epochs = args.epochs
+    crit = E2ELoss(model) if args.architecture == "independent_p2_memory_yolo26m" else v8DetectionLoss(model)
     effective_batch = args.batch * args.accum
     scaled_wd = args.weight_decay * effective_batch / args.nominal_batch
     role_mults = None
@@ -1681,6 +1702,10 @@ def main():
             torch.cuda.set_rng_state_all(ts["rng"]["cuda"])
         np.random.set_state(ts["rng"]["numpy"])
         g.set_state(ts["rng"]["loader"])
+        if isinstance(crit, E2ELoss):
+            crit.updates = int(ts.get("criterion_updates", 0))
+            crit.o2m = crit.decay(crit.updates)
+            crit.o2o = max(crit.total - crit.o2m, 0)
         log(f"[train] optimizer/scaler/EMA/RNG 已严格恢复；ema_updates={ema.updates}")
 
     meta_base = {"modalities": list(enabled), "canvas": list(canvas), "imgsz": list(canvas),
@@ -1700,7 +1725,7 @@ def main():
     elif args.resume and ck.get("meta", {}).get("initialization"):
         meta_base["initialization"] = ck["meta"]["initialization"]
     deployment = _CODE / "v3_deployment.json"
-    if args.architecture == "independent_p2_memory_v3" and deployment.is_file():
+    if args.architecture in P2_ARCHITECTURES and deployment.is_file():
         source_manifest = json.loads(deployment.read_text(encoding="utf-8"))["files"]
         meta_base["source_manifest_sha256"] = hashlib.sha256(json.dumps(source_manifest,sort_keys=True).encode()).hexdigest()
 
@@ -1716,6 +1741,7 @@ def main():
                                         "raw_model_state": model.state_dict(),
                                         "ema_state": ema.ema.state_dict(),
                                         "ema_updates": ema.updates,
+                                        "criterion_updates": crit.updates if isinstance(crit, E2ELoss) else None,
                                         "rng": {"torch": torch.get_rng_state(),
                                                 "cuda": (torch.cuda.get_rng_state_all()
                                                          if dev.type == "cuda" else None),
@@ -1882,7 +1908,7 @@ def main():
                     clip_state["norms"].append(grad_norm)
                     if len(clip_state["norms"]) >= args.calibrate_clip_steps:
                         p90 = float(np.percentile(clip_state["norms"], 90))
-                        clip_state["threshold"] = float(np.clip(1.5*p90, 20, 1000 if args.architecture == "independent_p2_memory_v3" else 200))
+                        clip_state["threshold"] = float(np.clip(1.5*p90, 20, 1000 if args.architecture in P2_ARCHITECTURES else 200))
                         clip_state["calibrated"] = True
                         log(f"[train] 梯度校准 N={len(clip_state['norms'])} P90={p90:.2f} "
                             f"threshold={clip_state['threshold']:.2f}（仅限尖峰保护，不代表最优分数）")
@@ -1899,6 +1925,8 @@ def main():
             # 假装发生过一次参数更新。首轮自动回退 scale 属正常 AMP 校准，单独记数。
             if not overflow:
                 ema.update(model)
+                if isinstance(crit, E2ELoss):
+                    crit.update()
 
         # 后台预取 + worker 起不来时自动退回单进程
         # ⚠️ `iter(loader)` 本身就会创建 worker 进程与队列并抛异常，所以预取线程内部才建迭代器。
@@ -1987,7 +2015,7 @@ def main():
                     # 本版 ultralytics 的 v8DetectionLoss 返回 (loss*bs 的三分量向量, 分量字典)
                     loss_vec, loss_items = crit(preds, tgt)
                     loss = accumulation_loss(loss_vec, nominal_samples)
-                if (args.architecture == "independent_p2_memory_v3" and
+                if (args.architecture in P2_ARCHITECTURES and
                         args.train_stage != "aux_independent"):
                     embedding_aux = model.embedding_aux_losses
                     loss = loss + (recon_weight * embedding_aux["reconstruction"] +
@@ -2075,7 +2103,7 @@ def main():
             # 日志使用 criterion 自身的标度；不要记录为了梯度累积额外缩小后的
             # backward loss，否则只改 accum 也会让曲线失去可比性。
             agg["loss"] += sum(float(v) for v in loss_items.values())
-            if args.architecture == "independent_p2_memory_v3":
+            if args.architecture in P2_ARCHITECTURES:
                 agg["branch_aux"] += float(branch_total.detach()) / max(1, rgb.shape[0] * max(1, branch_count))
                 agg["flow_aux"] += float(semantic["flow"].detach())
                 agg["nce_aux"] += float(semantic["nce"].detach())
@@ -2083,8 +2111,9 @@ def main():
                 agg["evidence_aux"] += float(semantic["evidence"].detach())
                 agg["embedding_recon"] += float(embedding_aux["reconstruction"].detach())
                 agg["embedding_alignment"] += float(embedding_aux["alignment"].detach())
-            for k in ("box_loss", "cls_loss", "dfl_loss"):
-                agg[k] = agg.get(k, 0.0) + float(loss_items[k])
+            for k in ("box_loss", "cls_loss", "dfl_loss", "l1_loss"):
+                if k in loss_items:
+                    agg[k] = agg.get(k, 0.0) + float(loss_items[k])
             agg["n"] += 1
             agg["micro"] += 1
             agg["group_samples"] += int(rgb.shape[0])
@@ -2114,7 +2143,9 @@ def main():
         msg = (f"[train] ep {ep+1}/{args.epochs} lr={lr:.2e} "
                f"encoder_lr={lr*args.backbone_lr_mult:.2e} frozen={int(frozen)} "
                f"loss={agg['loss']/n:.4f} box={agg.get('box_loss',0)/n:.3f} "
-               f"cls={agg.get('cls_loss',0)/n:.3f} dfl={agg.get('dfl_loss',0)/n:.3f}"
+               f"cls={agg.get('cls_loss',0)/n:.3f} "
+               f"{'l1' if args.architecture == 'independent_p2_memory_yolo26m' else 'dfl'}="
+               f"{agg.get('l1_loss' if args.architecture == 'independent_p2_memory_yolo26m' else 'dfl_loss',0)/n:.3f}"
                f" grad={agg['grad_norm_sum']/max(1,finite_steps):.2f}/"
                f"{agg['grad_norm_max']:.2f} clip={agg['grad_clipped']}/{finite_steps}"
                f" amp_skip={agg['amp_overflow']}"
@@ -2122,7 +2153,7 @@ def main():
                f" grad_p90={float(np.percentile(agg['norms'],90)) if agg['norms'] else 0:.2f}"
                f" clip_limit={clip_state['threshold']:.2f}"
                f"{mem} 用时 {(time.time()-t_ep)/60:.1f}min/轮 累计 {(time.time()-t0)/60:.1f}min")
-        if args.architecture == "independent_p2_memory_v3" and (
+        if args.architecture in P2_ARCHITECTURES and (
                 args.branch_aux_weight or args.branch_aux_weights
                 or args.branch_aux_end_weights or args.flow_supervision_weight
                 or args.cross_modal_nce_weight or args.flow_supervision_end_weight

@@ -606,6 +606,10 @@ class IndependentMMYOLO(nn.Module):
             if hasattr(block, "last_evidence_logits")
         }
         self._last_register_state = state.detach()
+        return self._run_detection(fused, geometry, state, present)
+
+    def _run_detection(self, fused, geometry, state, present):
+        """Run the YOLO11 P2 neck and detector after multimodal fusion."""
         layers = self.backbone.model
         p5 = fused["p5"]
         p4_td = layers[13](torch.cat((F.interpolate(p5,scale_factor=2,mode="nearest"),fused["p4"]),1))

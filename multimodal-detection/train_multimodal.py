@@ -65,7 +65,7 @@ def main():
     env = dict(os.environ,PYTHONUTF8="1",PYTHONIOENCODING="utf-8",OMP_NUM_THREADS="4",MKL_NUM_THREADS="4")
     common = [sys.executable,"-u",str(ROOT/"mm_yolo/train.py"),"--root",str(Path(a.root).resolve()),
               "--labels",str(Path(a.labels).resolve()),"--weights",str(Path(a.weights).resolve()),
-              "--out",str(run),"--modalities","all","--share-tier","a","--depth-channels","4",
+              "--out",str(run),"--share-tier","a","--depth-channels","4",
               "--depth-resampling","nearest_valid_v2","--metric-branch","--register-bus",
               "--depth-scales","all","--sampler","coverage","--rare-extra-frac","0.10",
               "--memory-control","bounded_v2","--no-prior",
@@ -107,9 +107,11 @@ def main():
     # warm-starts from Stage A's best validation checkpoint and jointly fine-tunes
     # at a low LR.  Stage A can regress after its peak, so last.pt is not a safe
     # hand-off checkpoint for model selection pipelines.
-    if cfg.get("pipeline") == "v42_two_stage":
-        phases = ["stage_a", "stage_b"]
-        if not a.init_checkpoint and not a.resume:
+    pipeline = cfg.get("pipeline")
+    if pipeline in ("v42_two_stage", "yolo26_bootstrap_two_stage"):
+        bootstrap = pipeline == "yolo26_bootstrap_two_stage"
+        phases = (["rgb_bootstrap"] if bootstrap else []) + ["stage_a", "stage_b"]
+        if not bootstrap and not a.init_checkpoint and not a.resume:
             raise ValueError("V4.2 首次启动必须提供 --init-checkpoint")
         for phase_name in phases:
             if state.get(phase_name+"_complete"):
@@ -120,7 +122,8 @@ def main():
                 phase.update(epochs=1, warmup=0, freeze_epochs=0,
                              calibrate_clip_steps=1, val_every=1)
             options = {k:phase[k] for k in keys if k in phase}
-            cmd = add_options(common + ["--name",phase_name], options)
+            cmd = add_options(common + ["--name",phase_name,"--modalities",
+                                        phase.get("modalities", "all")], options)
             if phase.get("p2_match_refine", False):
                 cmd += ["--p2-match-refine"]
             if phase.get("ir_coarse_align", False):
@@ -136,10 +139,17 @@ def main():
             last = run/phase_name/"weights/last.pt"
             if a.resume and last.exists():
                 cmd += ["--resume"]
+            elif phase_name == "rgb_bootstrap":
+                if a.init_checkpoint:
+                    cmd += ["--init-checkpoint",str(Path(a.init_checkpoint).resolve())]
             elif phase_name == "stage_a":
-                if not a.init_checkpoint:
+                source = (run/"rgb_bootstrap"/"weights"/"best.pt" if bootstrap
+                          else Path(a.init_checkpoint).resolve() if a.init_checkpoint else None)
+                if source is None:
                     raise FileNotFoundError("Stage A 没有 checkpoint 可恢复，也未提供 --init-checkpoint")
-                cmd += ["--init-checkpoint",str(Path(a.init_checkpoint).resolve())]
+                if not a.dry_run and not source.is_file():
+                    raise FileNotFoundError(f"Stage A 初始化权重不存在: {source}")
+                cmd += ["--init-checkpoint",str(source)]
             else:
                 source = run/"stage_a"/"weights"/"best.pt"
                 if not a.dry_run and not source.is_file():
@@ -187,7 +197,7 @@ def main():
                            rgb_color_p=.10,ir_noise_p=.02,ir_gain_p=.05,
                            rgb_dropout=0,aux_dropout=0,calibrate_clip_steps=32,val_every=0)
             extra += ["--full-data"]
-        cmd = common + ["--name",stage]
+        cmd = common + ["--name",stage,"--modalities","all"]
         cmd = add_options(cmd, options)
         if cfg.get("p2_match_refine", False):
             cmd += ["--p2-match-refine"]

@@ -69,6 +69,9 @@ class MMYOLO(nn.Module):
         if cls is MMYOLO and cfg is not None and cfg.fusion.architecture == "independent_p2_memory_v3":
             from independent_model import IndependentMMYOLO
             return IndependentMMYOLO(cfg)
+        if cls is MMYOLO and cfg is not None and cfg.fusion.architecture == "independent_p2_memory_yolo26m":
+            from independent_model26 import IndependentMMYOLO26
+            return IndependentMMYOLO26(cfg)
         return super().__new__(cls)
 
     def __init__(self, cfg: Optional[MMConfig] = None, class_names=None, nc: Optional[int] = None,
