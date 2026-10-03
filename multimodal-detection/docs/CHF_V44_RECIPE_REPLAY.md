@@ -32,3 +32,16 @@ cd /root/autodl-tmp/DDBBPPT_CHF_test/multimodal-detection
 ```
 
 `pipeline_status.json` 和 `console.log` 记录实际阶段、命令及训练进度；每阶段的 `weights/best.pt`、`last.pt` 均保存在该实验目录。Stage B 从本实验 Stage A 的 `best.pt` 初始化。比较结果时使用同一 400 张和相同推理设置，并报告整体与逐类 AP；本地 mAP 不能直接换算为官方分数。
+
+## 实际结果（2026-10-03）
+
+流水线状态为 `completed`，Stage A/B 都完成 36/36 轮，返回码为 0。验证固定使用 400 张、`conf=0.001`。`best.pt` 元数据如下：
+
+| 阶段 | 最佳轮次 | mAP50–95 | mAP50 | 最佳权重 SHA256 |
+| --- | ---: | ---: | ---: | --- |
+| Stage A 辅助 IR/Depth 分支 | 36 | 0.183170 | 0.3464 | `6572884b90c9b49c12209fce0e46c9df63672821166d444469daa174c4d9f32c` |
+| Stage B 三模态融合 | 34 | **0.440116** | 0.7200 | `e1a990ed247c95501c6837fff43cfe40b0b294ab447f3642b90e2d748782ff3d` |
+
+Stage B 第 36 轮为 0.4397；交付/比较应使用第 34 轮 `stage_b/weights/best.pt`。它比 CHF v1 在同一 400 张上的最佳 0.433629 高 **0.006487 mAP**（约 0.65 个百分点），但仍低于历史 V4.4 本地约 0.4567。两次 YOLO26m 实验同时改变了画布和训练轮数/日程，不能把差值归因于单一因素；Stage A 辅助分支与 Stage B 融合结果也不能直接比较。上述均为本地验证，不代表官方提交分数。
+
+权重原件保留在服务器的 `/root/autodl-tmp/runs/CHF_v44_recipe_YOLO26m_20261003/{stage_a,stage_b}/weights/best.pt`，未放进普通 Git 历史。
