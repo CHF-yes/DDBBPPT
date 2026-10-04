@@ -1,0 +1,8 @@
+# Observed server versions; install CUDA torch separately, then runtime snapshot.
+numpy==2.2.6
+Pillow==11.2.1
+pycocotools==2.0.11
+pytorch-lightning==2.6.6
+transformers==5.18.0
+# torch==2.7.0+cu128 torchvision==0.22.0+cu128
+# rfdetr==1.12.0.dev0 from accompanying snapshot
