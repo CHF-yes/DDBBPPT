@@ -135,7 +135,7 @@ conf≥0.25过滤包是单独交付版本：1000文件、7589框、10个空TXT�
 | V2 | `/root/autodl-tmp/weights/CHF_v2/CHF_v2.pth` | `29c80a33803ddfc0ceeaa1d14a55c56e85bc2b26f95ad4cdf2be8ac6ba10befa` |
 | V3 | `/root/autodl-tmp/weights/CHF_v3/CHF_v3.pth` | `936755d6f850ce7b19b12deb27b3af52df804ef4559f93cdabe1719b8ca7e977` |
 
-服务器实现根为 `/root/autodl-tmp/chf_arch_baselines_20261003`。V2入口 `run_rf_trimodal_chf.py`；V3入口 `run_rf_dynamic_trimodal_chf.py`；RGB高分辨率入口 `run_rf_highres_chf.py`。运行前校验split和权重哈希，读取对应manifest/metrics/ablations；不能仅凭文件名辨认模型。以上服务器入口也是本工作区tools目录的审计依据，本次提交仅添加技术文档，不自动将所有未提交实验脚本纳入分支。
+服务器实现根为 `/root/autodl-tmp/chf_arch_baselines_20261003`。V2入口 `run_rf_trimodal_chf.py`；V3入口 `run_rf_dynamic_trimodal_chf.py`；RGB高分辨率入口 `run_rf_highres_chf.py`。运行前校验split和权重哈希，读取对应manifest/metrics/ablations；不能仅凭文件名辨认模型。以上服务器入口也是本工作区tools目录的审计依据，首次提交仅添加技术文档；本次实现细节补充另纳入V2、V3及RGB高分辨率三个直接相关脚本，其他实验文件不纳入。
 
 ## 9. 不属于原V2/V3的后续实验
 
@@ -145,3 +145,179 @@ conf≥0.25过滤包是单独交付版本：1000文件、7589框、10个空TXT�
 - 空间局部门控＋RGB最后两层解冻6轮：训练后未超过起点，最后0.5067248678；保留最佳为epoch0。
 - 上述新结构没有证明有效增益，不将其改名为正式CHF_v3或覆盖提交包。
 - 本报告都是固定留出集实验结果，不能保证官方隐藏测试集成绩；测试集只用于推理，未用于训练、选权重或调参。
+
+## 10. 可定位的代码入口和模块职责
+
+本次补充将固定V2/V3的实现源码一并纳入分支，便于逐行核对：
+
+| 源文件/对象 | 职责 |
+|---|---|
+| [run_rf_trimodal_chf.py](../tools/run_rf_trimodal_chf.py) | V2数据集、静态融合、训练、验证、检查点和消融 |
+| [run_rf_dynamic_trimodal_chf.py](../tools/run_rf_dynamic_trimodal_chf.py) | V3，增加 `ResidualFusion.dynamic`；头部阶段无条件执行 |
+| [run_rf_highres_chf.py](../tools/run_rf_highres_chf.py) | RGB高分辨率起点，替换resize变换并断言真实画布 |
+| `Triples.__getitem__` / `collate` | 三模态预处理和COCO标签归一化；堆叠图像并保留目标列表 |
+| `AuxEncoder` / `ResidualFusion` | 辅助证据提取、通道投影和门控残差 |
+| `TriModel.hook` / `forward` | 在backbone返回值上注入融合，不改变位置编码和其他返回项 |
+| `evaluate` | 原图像素坐标预测、过滤、top100、COCO评估 |
+
+这些脚本依赖服务器安装的RF-DETR、PyTorch、torchvision、PIL、numpy和pycocotools。它们使用服务器绝对路径，不是脱离数据/权重/依赖即可运行的完整分发包。预训练文件和赛事数据不加入Git。
+
+## 11. 输入、特征与检测输出张量
+
+以下维度针对当前单层256通道检查点；B是物理batch，正式融合训练B=1。
+
+| 数据 | 张量尺寸/类型 | 细节 |
+|---|---|---|
+| RGB | `[B,3,864,1536]` FP32 | ImageNet归一化 |
+| IR | `[B,1,864,1536]` FP32 | 单通道独立归一化 |
+| Depth | `[B,2,864,1536]` FP32 | 第0通道归一化深度，第1通道有效掩码 |
+| 辅助编码器第1层 | `[B,16,432,768]` | Conv3×3/s2/p1 |
+| 第2层 | `[B,32,216,384]` | 同上 |
+| 第3层 | `[B,64,108,192]` | 同上 |
+| 第4层 | `[B,96,54,96]` | 同上 |
+| IR/Depth投影 | `[B,256,Hf,Wf]` | 1×1投影后插值至实际RGB特征Hf/Wf |
+| V3池化描述子 | `[B,768]` | 三种256维空间均值拼接 |
+| V3动态门控 | `[B,2]` | 广播至 `[B,1,1,1]` 后分别乘辅助投影 |
+| 标签boxes | `[Ni,4]` FP32 | 原图归一化cx/cy/w/h |
+| 标签labels | `[Ni]` int64 | 0–11 |
+| 检测boxes/logits | `[B,Q,4]` / `[B,Q,C]` | Q/C由实际RF-DETR检查点及配置决定，不能假设后处理所有标签都合法 |
+
+RGB特征空间尺寸由backbone运行时决定。源码通过一次真实前向记录 `channels=[f.tensors.shape[1] ...]`，融合按 `x.shape[-2:]` 插值；不硬编码RGB特征分辨率。辅助投影使用 `align_corners=False`。
+
+每个样本的COCO xywh标签转换为：
+
+```python
+boxes = [(x + bw / 2) / original_w,
+         (y + bh / 2) / original_h,
+         bw / original_w,
+         bh / original_h]
+# 三模态同步水平翻转时
+boxes[:, 0] = 1 - boxes[:, 0]
+```
+
+直接resize的几何变换下，归一化cxcywh保持对应关系。`orig_size=[original_h, original_w]`保留至验证，供RF-DETR后处理还原像素坐标。
+
+## 12. Hook注入和位置编码处理
+
+```python
+# net = detector.model.model
+handle = net.backbone.register_forward_hook(hook)
+
+def hook(module, inputs, outputs):
+    if current is None:
+        return outputs
+    ir, depth = current
+    features, pos, cross = outputs
+    fused = fusion(features, ir, depth, use_ir, use_depth)
+    return fused, pos, cross
+```
+
+融合结果重新包装为 `NestedTensor(x, f.mask, f.no_padding)`，沿用RGB的mask和no_padding；pos和cross原样传递。辅助图像的几何网格必须与RGB一致，否则此注入并不会自动纠正跨模态错位。
+
+`TriModel.forward`断言RGB尺寸，设置当前辅助输入，在 `try/finally` 中调用net并清空current，避免异常后遗留上批辅助输入。实现依赖可变实例状态，适用于当前串行前向；不能不经修改就视为同一模型实例多线程并发安全。
+
+## 13. 零初始化为什么不阻断训练
+
+V2令 `g=0`；V3另令MLP最后一层权重和bias为0。此时辅助残差恰为0，预测logits和boxes的最大绝对误差必须为0，而不只是“接近”。
+
+初始时门控导数 `d(0.2*tanh(g))/dg=0.2`，所以门控可以立即收到梯度。由于辅助特征乘以零门控，辅助编码器的第一步梯度可能为零；门控更新非零后，梯度才进入编码器和投影。V3同理：MLP末层可先更新，上游MLP层的梯度随之建立。
+
+冒烟检查先验证门控有限非零梯度，再执行一次优化、清梯度、重新前向反向，确认IR和Depth编码器至少一项梯度有限非零。仅检查 `requires_grad=True` 或门控数值变化不足以证明模态网络被有效训练。
+
+## 14. 训练模式、损失和优化器的逐步逻辑
+
+### 14.1 冻结范围
+
+辅助阶段将 `net.parameters()` 全部 `requires_grad_(False)`，只将 `fusion` 参数交给AdamW。前向中RGB及检测器 `net.eval()`，辅助模块 `fusion.train()`。`eval()`不会关闭autograd：检测器虽然不更新参数，仍需对融合输入求导，才能训练辅助网络。
+
+头部阶段仅解冻以下参数名前缀：
+
+```python
+('class_embed.', 'bbox_embed.',
+ 'transformer.enc_out_class_embed.',
+ 'transformer.enc_out_bbox_embed.')
+```
+
+RGB主干、其他Transformer参数继续冻结。重新建立AdamW参数组，不是恢复旧阶段的优化器动量。
+
+### 14.2 损失与梯度累积
+
+`TrainConfig(batch_size=1, grad_accum_steps=8, seed=42)`用于构建官方criterion/postprocessor；自定义循环使用官方criterion返回的损失及其 `weight_dict`，没有新加YOLO的DFL、旧分支检测监督或记忆约束：
+
+```python
+loss_dict = criterion(model(rgb, ir, depth), targets)
+loss = sum(value * criterion.weight_dict[key]
+           for key, value in loss_dict.items()
+           if key in criterion.weight_dict)
+assert torch.isfinite(loss)
+(loss / 8).backward()
+if (step + 1) % 8 == 0:
+    torch.nn.utils.clip_grad_norm_(trainable_params, 0.1,
+                                  error_if_nonfinite=True)
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+```
+
+1600样本可整除8，每轮200次优化更新，不存在本实验的尾批累积遗漏。融合训练FP32，不使用autocast/GradScaler。AdamW weight decay为1e-4；融合阶段lr1e-4，头部阶段辅助5e-5、头1e-5，无该循环自定义学习率调度器。
+
+每轮训练损失是1600个未除8的原始总损失均值。官方criterion可含主检测和辅助输出损失，数值不可直接与YOLO损失或RGB原生日志比较。
+
+### 14.3 最佳选择
+
+先完整验证零门控RGB基线并保存epoch0 best；各轮保存last，只有AP95严格超过当前best才更新best。V2完成辅助4轮后，若 `best-baseline <= 0.002`，直接跳过头部阶段；V3移除了这一条件，加载辅助最佳后执行2轮头部训练。结束加载整体最佳再做四种消融，不用last代替best。
+
+## 15. 验证/导出解码细节
+
+RF-DETR `post(outputs, sizes)` 此处sizes是 `[H,W]`，不是之前DEIM/D-FINE链路所需的 `[W,H]`；两种后处理不可共用坐标顺序。
+
+后处理返回scores/labels/xyxy boxes，每图按score降序遍历：
+
+1. 将x1/x2截断到 `[0, original_w]`，y1/y2截断到 `[0, original_h]`。
+2. 排除类别不在0–11、坐标不有限、宽或高不为正的候选。
+3. 每个合法候选转换成原图像素xywh；满100个合法框后停止。
+4. 预测与COCO原图GT一起送pycocotools，使用该批实际image_id集合。
+5. 提交时xyxy转原图归一化cxcywh，写入6列TXT。
+
+不额外加入NMS，不在报告AP的这条路径设置conf0.25。非法类别过滤规则同样用于验证和导出；不能在看到测试内容后单独更改类别规则。
+
+模态消融会在辅助模块中关闭相应编码器，并用零特征填充该模态投影；V3描述子也随之改变，所以“去IR”不仅删除IR残差，还改变动态门控条件。这是实现层面的模态删除实验，不等价于固定两门控、仅把某个残差事后设零。
+
+## 16. 检查点加载和版本恢复
+
+保存以RGB基底字典为基础，替换完整检测器参数并加入辅助参数：
+
+```text
+model            -> net.state_dict()，包含实际更新后的检测头
+chf_aux          -> fusion.state_dict()
+chf_channels     -> 运行时测得的融合层通道
+chf_fusion_type  -> V2静态 / V3 dynamic_v1 的类型标识
+chf_manifest     -> 起点、画布、split、预处理与训练配置
+chf_epoch        -> 最佳或当前轮次
+chf_metrics      -> 对应验证分数
+```
+
+恢复V3推理应先建立RFDETRMedium，再严格加载 `model`，创建动态 `TriModel`，严格加载 `chf_aux`，转eval。不能只调用原生RFDETRMedium而忽略chf_aux，否则得到的是缺少辅助融合的不同模型。静态V2融合类也不能拿来加载V3动态参数而忽略missing/unexpected keys。
+
+初始RGB阶段使用EMA最佳权重；V2/V3自定义融合循环保存当前集成网络，没有另建融合EMA。V2/V3 best/last未保存自定义循环optimizer与完整随机状态，因此它们能用于推理/权重初始化，不能声称支持逐位等价的优化器断点续训。
+
+复现命令（执行前准备数据和原RGB权重，输出目录必须不存在）：
+
+```bash
+cd /root/autodl-tmp/chf_arch_baselines_20261003
+python run_rf_trimodal_chf.py \
+  --weights runs/rfdetr_m_highres_864x1536_20261003/checkpoint_best_ema.pth \
+  --out runs/reproduce_v2
+python run_rf_dynamic_trimodal_chf.py \
+  --weights runs/rfdetr_m_highres_864x1536_20261003/checkpoint_best_ema.pth \
+  --out runs/reproduce_v3
+```
+
+两命令是分别从相同RGB起点训练V2/V3，不是V2接着训练变成V3。可先添加 `--smoke` 执行等价与梯度检查，但冒烟也占用输出目录，应使用单独smoke目录。
+
+## 17. 旧YOLO代码与新实现的具体区别
+
+旧 `IndependentMMYOLO` 从YOLO主干前11层复制IR和Depth证据编码器，将辅助stem输入变成单通道，初始化卷积权重为原RGB输入通道权重之和。另有四通道metric分支注入深度尺度特征。这与RF版本的小型随机初始化辅助卷积网络不同。
+
+`IndependentBranchDetector` 为训练阶段提供各辅助模态的P2–P5 neck和检测器监督，部署时不通过这些训练用分支输出投票。融合实现包含common/private证据、有效性/可靠性、匹配及跨尺度memory；`ComplementaryFusion`将记忆上下文、模态身份和门控用于多轮读取。其余后续router类属于其他版本，不能因为同文件中存在就说V4.4都用了。
+
+RF版移除了这些训练用分支检测头、metric独立编码及共用/私有记忆机制，把辅助模态作用集中在检测Transformer之前的一个残差注入位置。因此“V3动态门控”并非把旧YOLO空间记忆完整移植到RF-DETR：计算更轻，设计更简单，但缺少旧方案的显式局部匹配和跨尺度证据管理。
